@@ -1,0 +1,6 @@
+{
+  "include": ["src", "cleaner.py"],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportPrivateImportUsage": "none"
+}
