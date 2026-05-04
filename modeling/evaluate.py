@@ -23,7 +23,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from modeling.dataset import EpisodeDataset, collate
-from modeling.loss import giou
+from modeling.loss import giou  # noqa: F401
 from modeling.model import FewShotLocalizer, decode
 
 
@@ -168,6 +168,12 @@ def run(
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"\nreport written to {out_path}")
+
+    from modeling.plot import plot_eval_report
+    analysis_dir = Path("analysis")
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    plot_eval_report(result, analysis_dir)
+
     return result
 
 

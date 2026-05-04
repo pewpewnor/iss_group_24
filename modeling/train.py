@@ -152,8 +152,8 @@ def validate(
         is_present = batch["is_present"].to(device)
 
         out = model(support_imgs, support_bboxes, query_img)
-        l = total_loss(out, gt_bbox, is_present)
-        losses += l["loss"].item() * gt_bbox.shape[0]
+        loss_dict = total_loss(out, gt_bbox, is_present)
+        losses += loss_dict["loss"].item() * gt_bbox.shape[0]
 
         pred_box, pred_score = decode(out["reg"], out["conf"])
         pred_present = pred_score > 0.5
@@ -190,13 +190,21 @@ def train_stage(
     vicreg: bool = True,
     vicreg_weight: float = 0.05,
     hard_neg_mining: bool = True,
-) -> float:
+) -> tuple[float, list[dict]]:
+    """Train for ``epochs`` epochs and return ``(best_val_iou, epoch_history)``.
+
+    ``epoch_history`` is a list of per-epoch metric dicts with keys:
+    stage, epoch, loss, focal, box, nt_xent, vicreg, val_loss, val_iou,
+    val_presence_acc.
+    """
     # Cosine LR decay over all steps in this stage — smoother than step decay,
     # prevents oscillation at the end of long stages.
     total_steps = epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1), eta_min=1e-7
     )
+
+    epoch_history: list[dict] = []
 
     for epoch in range(1, epochs + 1):
         # Build prototype cache for hard-negative mining at the start of each epoch.
@@ -265,6 +273,19 @@ def train_stage(
             f"time={elapsed:.1f}s"
         )
 
+        epoch_history.append({
+            "stage": stage_name,
+            "epoch": epoch,
+            "loss": avg["loss"],
+            "focal": avg["focal"],
+            "box": avg["box"],
+            "nt_xent": avg["nt_xent"],
+            "vicreg": avg["vicreg"],
+            "val_loss": metrics["val_loss"],
+            "val_iou": metrics["val_iou"],
+            "val_presence_acc": metrics["val_presence_acc"],
+        })
+
         if metrics["val_iou"] > best_val_iou:
             best_val_iou = metrics["val_iou"]
             ckpt = {
@@ -281,7 +302,7 @@ def train_stage(
             out_dir / "last.pt",
         )
 
-    return best_val_iou
+    return best_val_iou, epoch_history
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +342,10 @@ def train(
     torch.manual_seed(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    analysis_dir = Path("analysis")
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
     config = {
         "manifest": str(manifest),
         "train_split": train_split,
@@ -397,12 +422,23 @@ def train(
     print(f"params: total={n_total/1e6:.2f}M trainable(initial)={n_train/1e6:.2f}M")
     print(f"train instances: {len(train_ds.instances)}  val instances: {len(val_ds.instances)}")
 
+    steps_per_epoch = max(episodes_per_epoch // batch_size, 1)
+
     best = 0.0
+    full_history: list[dict] = []
+
+    stage_configs_for_lr: list[dict] = []
 
     if stage1_epochs > 0:
         print("=== Stage 1: warmup (backbone frozen) ===")
         opt = stage1_optimizer(model)
-        best = train_stage(
+        stage_configs_for_lr.append({
+            "name": "stage1",
+            "epochs": stage1_epochs,
+            "steps_per_epoch": steps_per_epoch,
+            "param_groups": [{"label": "heads", "lr": 1e-3}],
+        })
+        best, hist = train_stage(
             model, opt, train_loader, val_loader, device_t,
             stage1_epochs, "stage1", out_dir, best,
             contrastive=contrastive,
@@ -412,11 +448,21 @@ def train(
             vicreg_weight=vicreg_weight,
             hard_neg_mining=hard_neg_mining,
         )
+        full_history.extend(hist)
 
     if stage2_epochs > 0:
         print("=== Stage 2: partial unfreeze (features[7:] @ 1e-5) ===")
         opt = stage2_optimizer(model)
-        best = train_stage(
+        stage_configs_for_lr.append({
+            "name": "stage2",
+            "epochs": stage2_epochs,
+            "steps_per_epoch": steps_per_epoch,
+            "param_groups": [
+                {"label": "backbone upper", "lr": 1e-5},
+                {"label": "heads", "lr": 5e-4},
+            ],
+        })
+        best, hist = train_stage(
             model, opt, train_loader, val_loader, device_t,
             stage2_epochs, "stage2", out_dir, best,
             contrastive=contrastive,
@@ -426,11 +472,22 @@ def train(
             vicreg_weight=vicreg_weight,
             hard_neg_mining=hard_neg_mining,
         )
+        full_history.extend(hist)
 
     if stage3 and stage3_epochs > 0:
         print("=== Stage 3: full unfreeze (all backbone @ 5e-6) ===")
         opt = stage3_optimizer(model)
-        best = train_stage(
+        stage_configs_for_lr.append({
+            "name": "stage3",
+            "epochs": stage3_epochs,
+            "steps_per_epoch": steps_per_epoch,
+            "param_groups": [
+                {"label": "backbone lower", "lr": 5e-6},
+                {"label": "backbone upper", "lr": 5e-6},
+                {"label": "heads", "lr": 1e-4},
+            ],
+        })
+        best, hist = train_stage(
             model, opt, train_loader, val_loader, device_t,
             stage3_epochs, "stage3", out_dir, best,
             contrastive=contrastive,
@@ -440,9 +497,59 @@ def train(
             vicreg_weight=vicreg_weight,
             hard_neg_mining=hard_neg_mining,
         )
+        full_history.extend(hist)
 
     print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")
+
+    history_path = analysis_dir / "train_history.json"
+    with open(history_path, "w") as f:
+        json.dump(full_history, f, indent=2)
+    print(f"train history written to {history_path}")
+
+    _generate_plots(
+        full_history=full_history,
+        stage_configs_for_lr=stage_configs_for_lr,
+        model=model,
+        train_ds=train_ds,
+        device_t=device_t,
+        manifest=Path(manifest),
+        analysis_dir=analysis_dir,
+    )
+
     return best
+
+
+def _generate_plots(
+    full_history: list[dict],
+    stage_configs_for_lr: list[dict],
+    model: FewShotLocalizer,
+    train_ds: EpisodeDataset,
+    device_t: torch.device,
+    manifest: Path,
+    analysis_dir: Path,
+) -> None:
+    """Generate all matplotlib plots after training completes."""
+    from modeling.plot import (
+        plot_contrastive_learning,
+        plot_dataset_stats,
+        plot_lr_schedule,
+        plot_prototype_similarity,
+        plot_training_curves,
+    )
+
+    if full_history:
+        plot_training_curves(full_history, analysis_dir)
+        plot_contrastive_learning(full_history, analysis_dir)
+
+    if stage_configs_for_lr:
+        plot_lr_schedule(stage_configs_for_lr, analysis_dir)
+
+    stats_path = manifest.parent / "stats.json"
+    plot_dataset_stats(stats_path, analysis_dir)
+
+    print("building prototype cache for similarity heatmap…")
+    proto_cache = build_proto_cache(model, train_ds, device_t)
+    plot_prototype_similarity(proto_cache, analysis_dir)
 
 
 def main() -> None:
