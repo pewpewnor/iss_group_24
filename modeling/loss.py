@@ -325,7 +325,7 @@ def total_loss(
     grid: int = 14,
     stride: int = 16,
     support_bboxes: torch.Tensor | None = None,
-    attn_loss_weight: float = 1.0,
+    attn_loss_weight: float = 0.5,
 ) -> dict[str, torch.Tensor]:
     """Weighted sum of focal + box + presence + attention losses.
 
@@ -333,11 +333,12 @@ def total_loss(
       focal:    1.0 (hard-target focal, sum normalised by num_pos)
       box:      1.0 (area-weighted GIoU on positive cells only)
       presence: 1.0 (BCE on (B,) presence_logit)
-      attn:     1.0 (KL between aggregated support attention and bbox region) —
-                bumped from 0.1 because the auxiliary signal is what teaches the
-                SupportTokenizer where the foreground is. Without it the M
-                region queries drift toward whatever minimises the dense detection
-                loss, which is uninformative gradient through cross-attention.
+      attn:     0.5 (KL between aggregated support attention and bbox region).
+                Tuned down from 1.0 because FSOD episodes feed crop-around-the-
+                object support images where the bbox covers most of the input,
+                making the KL target nearly uniform and the loss has less to
+                teach. HOTS/InsDet supports still benefit but the auxiliary
+                doesn't need to dominate the matcher gradient.
     """
     reg_pred = pred["reg"]
     conf_logits = pred["conf"]

@@ -51,6 +51,17 @@ def _heads(model: FewShotLocalizer) -> list:
     )
 
 
+def stage0_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
+    """Stage 0 = FSOD pretrain on a frozen backbone — same shape as stage 1
+    but invoked on a different data source. Kept as a separate function so
+    the param-group log line in train_stage clearly identifies it.
+    """
+    model.backbone.freeze_all()
+    return torch.optim.AdamW(
+        [{"params": _heads(model), "lr": 1e-3, "weight_decay": 1e-4}]
+    )
+
+
 def stage1_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
     model.backbone.freeze_all()
     return torch.optim.AdamW(
@@ -150,7 +161,7 @@ def build_proto_cache(
 # ---------------------------------------------------------------------------
 
 
-STAGE_ORDER: tuple[str, ...] = ("stage1", "stage2", "stage3")
+STAGE_ORDER: tuple[str, ...] = ("stage0", "stage1", "stage2", "stage3")
 
 
 def _make_full_ckpt(
@@ -242,12 +253,33 @@ def validate(
         )
         for tau in IOU_THRESHOLDS
     ]
-    # IOU_THRESHOLDS[0] is 0.5 → ap_vals[0] is mAP@0.5
+    # IOU_THRESHOLDS[0] is 0.5 → ap_vals[0] is AP@0.5
     val_map_50 = ap_vals[0] if ap_vals else 0.0
-    val_map = sum(ap_vals) / len(ap_vals) if ap_vals else 0.0
+    val_map_5095 = sum(ap_vals) / len(ap_vals) if ap_vals else 0.0
     # Persist the full per-IoU breakdown so plot.py can render the COCO-style
     # AP@τ curve over epochs (one line per τ in IOU_THRESHOLDS).
     val_ap_per_iou = {f"{tau:.2f}": ap for tau, ap in zip(IOU_THRESHOLDS, ap_vals)}
+
+    # F1@(IoU≥0.5, score≥0.5): summarises the joint quality of presence +
+    # localisation in a single number. TP = positive episode AND iou ≥ 0.5
+    # AND score ≥ 0.5; FP = predicted-present but either is_present is False
+    # or iou < 0.5; FN = is_present True but missed (low score or low iou).
+    score_thr, iou_thr = 0.5, 0.5
+    tp = fp = fn = 0
+    for present, iou_v, score in zip(all_present, all_ious, all_scores):
+        pred_present = score >= score_thr
+        if present and pred_present and iou_v >= iou_thr:
+            tp += 1
+        elif pred_present:
+            fp += 1
+        elif present:
+            fn += 1
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    val_f1_50 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0 else 0.0
+    )
 
     model.train()
     return {
@@ -255,8 +287,11 @@ def validate(
         "val_iou": ious / max(n_pos, 1),
         "val_contain": contain / max(n_pos, 1),
         "val_map_50": val_map_50,
-        "val_map": val_map,
+        "val_map_5095": val_map_5095,
         "val_ap_per_iou": val_ap_per_iou,
+        "val_f1_50": val_f1_50,
+        "val_precision_50": precision,
+        "val_recall_50": recall,
         "val_presence_acc": present_correct / max(n, 1),
     }
 
@@ -296,11 +331,21 @@ def train_stage(
     and ``prior_history`` is the across-stage history from before this stage
     so checkpoints can persist the full plotting record.
     """
-    # Cosine LR decay over all steps in this stage — smoother than step decay,
-    # prevents oscillation at the end of long stages.
-    total_steps = epochs * len(train_loader)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(total_steps, 1), eta_min=1e-7
+    # LR schedule: linear warmup over the first ~5% of steps (capped at 200)
+    # → cosine decay to 1e-7 for the rest. Warmup softens the LR transition
+    # at the start of every stage, particularly helpful right after stage 0
+    # where the matcher heads suddenly see new domain data and the optimiser
+    # would otherwise spike at full LR with stale momentum.
+    total_steps = max(epochs * len(train_loader), 1)
+    warmup_steps = max(1, min(200, total_steps // 20))
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-7
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
     )
     if scheduler_state is not None:
         scheduler.load_state_dict(scheduler_state)
@@ -388,7 +433,8 @@ def train_stage(
             f"val_iou={metrics['val_iou']:.4f} "
             f"val_contain={metrics['val_contain']:.4f} "
             f"val_map50={metrics['val_map_50']:.4f} "
-            f"val_map={metrics['val_map']:.4f} "
+            f"val_map5095={metrics['val_map_5095']:.4f} "
+            f"val_f1_50={metrics['val_f1_50']:.4f} "
             f"val_presence={metrics['val_presence_acc']:.4f} "
             f"time={elapsed:.1f}s"
         )
@@ -408,8 +454,11 @@ def train_stage(
             "val_iou": metrics["val_iou"],
             "val_contain": metrics["val_contain"],
             "val_map_50": metrics["val_map_50"],
-            "val_map": metrics["val_map"],
+            "val_map_5095": metrics["val_map_5095"],
             "val_ap_per_iou": metrics["val_ap_per_iou"],
+            "val_f1_50": metrics["val_f1_50"],
+            "val_precision_50": metrics["val_precision_50"],
+            "val_recall_50": metrics["val_recall_50"],
             "val_presence_acc": metrics["val_presence_acc"],
         })
 
@@ -421,14 +470,19 @@ def train_stage(
                     "val_iou": best_val_iou,
                     "val_contain": metrics["val_contain"],
                     "val_map_50": metrics["val_map_50"],
-                    "val_map": metrics["val_map"],
+                    "val_map_5095": metrics["val_map_5095"],
                     "val_ap_per_iou": metrics["val_ap_per_iou"],
+                    "val_f1_50": metrics["val_f1_50"],
                     "stage": stage_name,
                     "epoch": epoch,
                 },
                 out_dir / "best.pt",
             )
-            print(f"  saved best.pt (val_iou={best_val_iou:.4f} val_map={metrics['val_map']:.4f})")
+            print(
+                f"  saved best.pt (val_iou={best_val_iou:.4f} "
+                f"val_map5095={metrics['val_map_5095']:.4f} "
+                f"val_f1_50={metrics['val_f1_50']:.4f})"
+            )
 
         torch.save(
             _make_full_ckpt(
@@ -450,8 +504,9 @@ def train_stage(
                 "val_iou": last_metrics["val_iou"],
                 "val_contain": last_metrics["val_contain"],
                 "val_map_50": last_metrics["val_map_50"],
-                "val_map": last_metrics["val_map"],
+                "val_map_5095": last_metrics["val_map_5095"],
                 "val_ap_per_iou": last_metrics["val_ap_per_iou"],
+                "val_f1_50": last_metrics["val_f1_50"],
             },
             stage_path,
         )
@@ -476,9 +531,11 @@ def train(
     val_episodes: int = 500,
     batch_size: int = 16,
     num_workers: int = 4,
-    stage1_epochs: int = 10,
+    stage0_epochs: int = 25,
+    stage1_epochs: int = 15,
     stage2_epochs: int = 30,
     stage3_epochs: int = 10,
+    stage0: bool = False,
     stage2: bool = False,
     stage3: bool = False,
     contrastive: bool = True,
@@ -518,9 +575,11 @@ def train(
         "val_episodes": val_episodes,
         "batch_size": batch_size,
         "num_workers": num_workers,
+        "stage0_epochs": stage0_epochs,
         "stage1_epochs": stage1_epochs,
         "stage2_epochs": stage2_epochs,
         "stage3_epochs": stage3_epochs,
+        "stage0": stage0,
         "stage3": stage3,
         "contrastive": contrastive,
         "contrastive_weight_s1": contrastive_weight_s1,
@@ -538,13 +597,13 @@ def train(
 
     device_t = torch.device(device)
 
-    train_ds = EpisodeDataset(
-        manifest_path=str(manifest),
-        split=train_split,
-        data_root=str(data_root) if data_root else None,
-        episodes_per_epoch=episodes_per_epoch,
-        train=True,
-    )
+    # Val loader is built once and reused across stages — val/test are always
+    # HOTS+InsDet (the deployment domain). The train loader is rebuilt per
+    # stage because stage 0 (FSOD pretrain) and stages 1+ (target domain)
+    # need disjoint instance pools, and EpisodeDataset filters the pool at
+    # construction time.
+    TARGET_SOURCES = ["hots", "insdet"]
+
     val_ds = EpisodeDataset(
         manifest_path=str(manifest),
         split=val_split,
@@ -555,15 +614,7 @@ def train(
         neg_prob=0.3,
         train=False,
         seed=seed,
-    )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate,
-        pin_memory=(device_t.type == "cuda"),
-        drop_last=True,
+        sources=TARGET_SOURCES,
     )
     val_loader = DataLoader(
         val_ds,
@@ -573,6 +624,32 @@ def train(
         collate_fn=collate,
         pin_memory=(device_t.type == "cuda"),
     )
+
+    def _build_train_loader(
+        sources: list[str],
+    ) -> tuple[EpisodeDataset, DataLoader]:
+        ds = EpisodeDataset(
+            manifest_path=str(manifest),
+            split=train_split,
+            data_root=str(data_root) if data_root else None,
+            episodes_per_epoch=episodes_per_epoch,
+            train=True,
+            sources=sources,
+        )
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate,
+            pin_memory=(device_t.type == "cuda"),
+            drop_last=True,
+        )
+        return ds, loader
+
+    # Default train pool is the target domain. Stage 0 swaps to FSOD-only
+    # before training begins.
+    train_ds, train_loader = _build_train_loader(TARGET_SOURCES)
 
     model = FewShotLocalizer(pretrained=pretrained).to(device_t)
 
@@ -665,6 +742,49 @@ def train(
             if STAGE_ORDER.index(saved_stage) > STAGE_ORDER.index(stage_name):
                 return True, 1, None, None
         return False, 1, None, None
+
+    if stage0 and stage0_epochs > 0:
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage0", stage0_epochs)
+        stage_configs_for_lr.append({
+            "name": "stage0",
+            "epochs": stage0_epochs,
+            "steps_per_epoch": steps_per_epoch,
+            "param_groups": [{"label": "heads", "lr": 1e-3}],
+        })
+        if skip:
+            print("=== Stage 0: skipped (already complete in checkpoint) ===")
+        else:
+            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+            print(f"=== Stage 0: FSOD pretrain (backbone frozen){resume_str} ===")
+            # Stage 0 trains the matcher heads on FSOD's broad category-level
+            # data. Hard-neg mining off (FSOD-internal hard negs are category
+            # confusion which is the wrong objective). Easy negatives only via
+            # neg_prob=0.1.
+            train_ds, train_loader = _build_train_loader(["fsod"])
+            train_ds.set_hard_neg_ratio(0.0)
+            opt = stage0_optimizer(model)
+            _log_trainable("stage0")
+            if opt_state is not None:
+                opt.load_state_dict(opt_state)
+            best, hist = train_stage(
+                model, opt, train_loader, val_loader, device_t,
+                stage0_epochs, "stage0", out_dir, best,
+                contrastive=contrastive,
+                contrastive_weight=contrastive_weight_s1,
+                contrastive_temp=contrastive_temp,
+                vicreg=vicreg,
+                vicreg_weight=vicreg_weight,
+                triplet=triplet,
+                triplet_weight=triplet_weight,
+                hard_neg_mining=False,
+                neg_prob_schedule={1: 0.1},
+                start_epoch=start_epoch,
+                scheduler_state=sched_state,
+                prior_history=full_history,
+            )
+            full_history.extend(hist)
+            # Switch back to target domain for the remaining stages.
+            train_ds, train_loader = _build_train_loader(TARGET_SOURCES)
 
     if stage1_epochs > 0:
         skip, start_epoch, opt_state, sched_state = _resume_for("stage1", stage1_epochs)
@@ -816,6 +936,7 @@ def _generate_plots(
 ) -> None:
     """Generate all matplotlib plots after training completes."""
     from modeling.plot import (
+        plot_ap_per_iou,
         plot_contrastive_learning,
         plot_dataset_stats,
         plot_lr_schedule,
@@ -826,6 +947,7 @@ def _generate_plots(
     if full_history:
         plot_training_curves(full_history, analysis_dir)
         plot_contrastive_learning(full_history, analysis_dir)
+        plot_ap_per_iou(full_history, analysis_dir)
 
     if stage_configs_for_lr:
         plot_lr_schedule(stage_configs_for_lr, analysis_dir)
@@ -863,19 +985,21 @@ def main() -> None:
     p.add_argument("--val-episodes", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--stage1-epochs", type=int, default=10)
+    p.add_argument("--stage0-epochs", type=int, default=25)
+    p.add_argument("--stage1-epochs", type=int, default=15)
     p.add_argument("--stage2-epochs", type=int, default=30)
     p.add_argument("--stage3-epochs", type=int, default=10)
     p.add_argument(
         "--start-stage",
-        choices=["stage1", "stage2", "stage3"],
+        choices=["stage0", "stage1", "stage2", "stage3"],
         default=None,
         help=(
             "skip earlier stages and start fresh from this one. "
-            "Pair with --resume model/stage1.pt to continue a prior run "
-            "into stage 2 with new optimizer/scheduler state."
+            "Pair with --resume model/stage0.pt to continue a prior run "
+            "into stage 1 with new optimizer/scheduler state."
         ),
     )
+    p.add_argument("--stage0", action="store_true", help="run optional Stage 0 FSOD pretrain (heads only, FSOD-only data)")
     p.add_argument("--stage2", action="store_true", help="run optional Stage 2 partial unfreeze")
     p.add_argument("--stage3", action="store_true", help="run optional Stage 3 full unfreeze")
     p.add_argument("--no-contrastive", action="store_true", help="disable NT-Xent prototype loss")
@@ -906,9 +1030,11 @@ def main() -> None:
         val_episodes=args.val_episodes,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        stage0_epochs=args.stage0_epochs,
         stage1_epochs=args.stage1_epochs,
         stage2_epochs=args.stage2_epochs,
         stage3_epochs=args.stage3_epochs,
+        stage0=args.stage0,
         stage2=args.stage2,
         stage3=args.stage3,
         contrastive=not args.no_contrastive,

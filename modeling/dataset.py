@@ -36,7 +36,7 @@ from torchvision import transforms as T
 from torchvision.transforms import functional as TF
 
 IMG_SIZE = 224
-N_SUPPORT = 5
+N_SUPPORT = 4
 NEG_PROB = 0.3
 NORMALIZE = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
@@ -362,6 +362,17 @@ def _load_image(path: Path) -> Image.Image:
 
 
 class EpisodeDataset(Dataset):
+    # Maps an instance source to the negative-background pool it should draw
+    # from. HOTS and InsDet share a "hots_insdet" pool because the two
+    # datasets are visually closer to each other than either is to FSOD; the
+    # FSOD instances draw from a separate pool to keep the domain gap from
+    # making negatives trivially easy.
+    _NEG_POOL_FOR_SOURCE: dict[str, str] = {
+        "hots": "hots_insdet",
+        "insdet": "hots_insdet",
+        "fsod": "fsod",
+    }
+
     def __init__(
         self,
         manifest_path: str | Path,
@@ -373,6 +384,7 @@ class EpisodeDataset(Dataset):
         hard_neg_ratio: float = 0.25,
         train: bool = True,
         seed: int | None = None,
+        sources: list[str] | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.data_root = (
@@ -383,11 +395,27 @@ class EpisodeDataset(Dataset):
 
         all_instances: list[dict[str, Any]] = self.manifest["instances"]
         if split is not None:
-            self.instances = [i for i in all_instances if i.get("split") == split]
-        else:
-            self.instances = all_instances
+            all_instances = [i for i in all_instances if i.get("split") == split]
+        if sources is not None:
+            sources_set = set(sources)
+            all_instances = [i for i in all_instances if i.get("source") in sources_set]
+        self.instances = all_instances
 
-        self.negatives: list[str] = self.manifest.get("negative_backgrounds", [])
+        # Bucket negative-background entries by source. Supports both the new
+        # dict-shape entries `{"path": ..., "source": ...}` and the legacy
+        # flat list of strings (which all map to the hots_insdet pool — the
+        # only domain that pre-FSOD manifests covered).
+        raw_negatives = self.manifest.get("negative_backgrounds", [])
+        self._negatives_by_pool: dict[str, list[str]] = {}
+        for entry in raw_negatives:
+            if isinstance(entry, dict):
+                pool = entry.get("source", "hots_insdet")
+                path = entry["path"]
+            else:
+                pool = "hots_insdet"
+                path = entry
+            self._negatives_by_pool.setdefault(pool, []).append(path)
+
         self.n_support = n_support
         # Use neg_prob as given for both train and val. Forcing val to 0 made
         # val_presence/val_map meaningless (model trivially says "present" → 100%).
@@ -400,6 +428,130 @@ class EpisodeDataset(Dataset):
         self._seed = seed
         # Populated externally by build_proto_cache() each epoch for hard-negative mining.
         self.hard_neg_cache: dict[str, Any] | None = None
+
+    def _negatives_for(self, instance: dict[str, Any]) -> list[str]:
+        """Background-image pool for a given instance, restricted to its source."""
+        pool_name = self._NEG_POOL_FOR_SOURCE.get(
+            instance.get("source", ""), "hots_insdet"
+        )
+        return self._negatives_by_pool.get(pool_name, [])
+
+    # ------------------------------------------------------------------
+    # FSOD-specific support synthesis: 4 rotations of the cropped bbox.
+    # ------------------------------------------------------------------
+
+    _FSOD_ROTATIONS = (0, 90, 180, 270)
+    _FSOD_CROP_PAD = 0.10  # 10% bbox-side padding on the support crop
+
+    def _fsod_supports(
+        self,
+        scene: Image.Image,
+        bbox: list[float],
+        rng: random.Random,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Synthesise 4 support tensors by cropping bbox + rotating four ways.
+
+        The crop is square-padded around the bbox so 90° rotations don't drop
+        content off the edges. Each rotated crop then runs through the normal
+        support augmentation pipeline so colour jitter / blur / etc. still
+        apply per support.
+        """
+        x1, y1, x2, y2 = bbox
+        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        side = max(x2 - x1, y2 - y1) * (1.0 + 2 * self._FSOD_CROP_PAD)
+        half = side * 0.5
+        w_img, h_img = scene.size
+        cx1 = max(0, int(cx - half))
+        cy1 = max(0, int(cy - half))
+        cx2 = min(w_img, int(cx + half))
+        cy2 = min(h_img, int(cy + half))
+        if cx2 <= cx1 or cy2 <= cy1:
+            cx1, cy1, cx2, cy2 = 0, 0, w_img, h_img
+        base_crop = scene.crop((cx1, cy1, cx2, cy2))
+
+        s_imgs: list[torch.Tensor] = []
+        s_bboxes: list[torch.Tensor] = []
+        for angle in self._FSOD_ROTATIONS:
+            if angle == 0:
+                rotated = base_crop
+            else:
+                # expand=True grows the canvas so 90° / 270° don't crop the
+                # corners; the rotated image is pillarboxed into a larger frame
+                # only for 90/270, but support_aug resizes back to 224 anyway.
+                rotated = base_crop.rotate(angle, expand=True)
+            # The whole rotated crop is the object — bbox spans the full image.
+            full_bbox = [0.0, 0.0, float(rotated.width), float(rotated.height)]
+            t, bb = self._support_aug(rotated, full_bbox, rng)
+            s_imgs.append(t)
+            s_bboxes.append(bb)
+        return torch.stack(s_imgs), torch.stack(s_bboxes)
+
+    def _fsod_negative_query(
+        self, instance: dict[str, Any], rng: random.Random
+    ) -> Path:
+        """Pick a negative query for an FSOD episode (no double-rolling).
+
+        Tier split mirrors `_sample_query` but skips the positive branch since
+        the caller has already committed to a negative episode.
+        """
+        same_source_negs = self._negatives_for(instance)
+        same_source_others = [
+            i for i in self.instances
+            if i["instance_id"] != instance["instance_id"]
+            and i.get("source") == instance.get("source")
+        ]
+        # Easy-background tier (50%) → fall back to foreign-instance otherwise.
+        if same_source_negs and (not same_source_others or rng.random() < 0.5):
+            return self._resolve(rng.choice(same_source_negs))
+        if same_source_others:
+            other = rng.choice(same_source_others)
+            pool = other["query_images"] + other["support_images"]
+            q = rng.choice(pool)
+            return self._resolve(q["path"])
+        # Pathological fallback — shouldn't trigger if FSOD has multiple cats.
+        q = rng.choice(instance["support_images"])
+        return self._resolve(q["path"])
+
+    def _fsod_episode(
+        self, idx: int, instance: dict[str, Any], rng: random.Random
+    ) -> dict[str, Any]:
+        """One FSOD episode: 4 rotated crops as supports, scene as query.
+
+        Positive episodes use the *same* (scene, bbox) entry as both the
+        support source and the query — that turns FSOD's category-level
+        annotations into instance-level supervision (the model is asked to
+        find the specific object whose own crops it just saw, not "find an
+        object of this category"). Negative episodes route through the
+        existing negative-sampling path so they still respect source pools.
+        """
+        anchor = rng.choice(instance["support_images"])
+        scene_path = self._resolve(anchor["path"])
+        scene = _load_image(scene_path)
+        anchor_bbox = list(anchor["bbox"])
+        support_imgs, support_bboxes = self._fsod_supports(scene, anchor_bbox, rng)
+
+        is_negative = rng.random() < self.neg_prob
+        q_bbox: list[float] | None
+        if not is_negative:
+            q_img = scene
+            q_bbox = anchor_bbox
+            present = True
+        else:
+            q_path = self._fsod_negative_query(instance, rng)
+            q_img = _load_image(q_path) if q_path != scene_path else scene
+            q_bbox = None
+            present = False
+
+        q_t, q_bbox_t = self._query_aug(q_img, q_bbox, rng)
+
+        return {
+            "support_imgs": support_imgs,
+            "support_bboxes": support_bboxes,
+            "query_img": q_t,
+            "query_bbox": q_bbox_t,
+            "is_present": torch.tensor(present, dtype=torch.bool),
+            "instance_id": instance["instance_id"],
+        }
 
     def set_neg_prob(self, prob: float) -> None:
         self.neg_prob = prob
@@ -444,16 +596,23 @@ class EpisodeDataset(Dataset):
         #   < 0.50                        : easy negative (background image)
         #   0.50 – (1 - hard_neg_ratio)   : random foreign instance
         #   >= (1 - hard_neg_ratio)        : hard negative (most similar prototype)
+        # All tiers stay within the instance's source domain so the model
+        # can't discriminate by global image style alone.
         r = rng.random()
         hard_thr = 1.0 - self.hard_neg_ratio
+        same_source_negs = self._negatives_for(instance)
+        same_source_others = [
+            i for i in self.instances
+            if i["instance_id"] != instance["instance_id"]
+            and i.get("source") == instance.get("source")
+        ]
 
-        if self.negatives and r < 0.5:
-            return self._resolve(rng.choice(self.negatives)), None, False
+        if same_source_negs and r < 0.5:
+            return self._resolve(rng.choice(same_source_negs)), None, False
 
-        others = [i for i in self.instances if i["instance_id"] != instance["instance_id"]]
-        if not others:
-            if self.negatives:
-                return self._resolve(rng.choice(self.negatives)), None, False
+        if not same_source_others:
+            if same_source_negs:
+                return self._resolve(rng.choice(same_source_negs)), None, False
             q = rng.choice(instance["support_images"])
             return self._resolve(q["path"]), None, False
 
@@ -461,7 +620,7 @@ class EpisodeDataset(Dataset):
             anchor = self.hard_neg_cache.get(instance["instance_id"])
             if anchor is not None:
                 sims = []
-                for inst in others:
+                for inst in same_source_others:
                     p = self.hard_neg_cache.get(inst["instance_id"])
                     if p is not None:
                         sim = F.cosine_similarity(anchor.unsqueeze(0), p.unsqueeze(0)).item()
@@ -473,7 +632,7 @@ class EpisodeDataset(Dataset):
                     q = rng.choice(pool)
                     return self._resolve(q["path"]), None, False
 
-        other = rng.choice(others)
+        other = rng.choice(same_source_others)
         pool = other["query_images"] + other["support_images"]
         q = rng.choice(pool)
         return self._resolve(q["path"]), None, False
@@ -514,8 +673,18 @@ class EpisodeDataset(Dataset):
 
         instance = rng.choice(self.instances)
 
-        # Distractor instance for copy-paste and support mixup
-        others = [i for i in self.instances if i["instance_id"] != instance["instance_id"]]
+        # FSOD episodes synthesise supports from one scene (4 rotated crops),
+        # so they bypass the multi-shot pool sampling used by HOTS/InsDet.
+        if instance.get("source") == "fsod":
+            return self._fsod_episode(idx, instance, rng)
+
+        # Distractor instance for copy-paste and support mixup — same source
+        # as the anchor so we don't blend a HOTS shot with an FSOD scene.
+        others = [
+            i for i in self.instances
+            if i["instance_id"] != instance["instance_id"]
+            and i.get("source") == instance.get("source")
+        ]
         d_instance = rng.choice(others) if (self.train and others) else None
 
         # Sample support images

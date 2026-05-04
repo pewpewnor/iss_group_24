@@ -32,7 +32,7 @@ import torch.nn as nn
 
 from modeling.model import DIM, M_TOKENS, FewShotLocalizer, decode
 
-K_SUPPORT = 5
+K_SUPPORT = 4
 
 
 class _PrototypeWrapper(nn.Module):

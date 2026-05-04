@@ -103,6 +103,13 @@ def plot_training_curves(history: list[dict[str, Any]], out_dir: Path) -> None:
     def _get(key: str) -> list[float]:
         return [row.get(key, 0.0) for row in history]
 
+    def _get_5095(row: dict) -> float:
+        # Backwards compat: pre-rename runs stored "val_map" instead of
+        # "val_map_5095".
+        if "val_map_5095" in row:
+            return row["val_map_5095"]
+        return row.get("val_map", 0.0)
+
     fig, axes = plt.subplots(4, 1, figsize=(11, 14), sharex=True)
     fig.suptitle("Training curves", fontsize=14, fontweight="bold")
 
@@ -139,7 +146,8 @@ def plot_training_curves(history: list[dict[str, Any]], out_dir: Path) -> None:
     ax.plot(epochs, _get("val_iou"), label="Val IoU", linewidth=1.6, color="#55A868")
     ax.plot(epochs, _get("val_contain"), label="Val containment", linewidth=1.4, linestyle=":", color="#0D7C3D")
     ax.plot(epochs, _get("val_map_50"), label="Val mAP@0.5", linewidth=1.4, linestyle="--", color="#1565C0")
-    ax.plot(epochs, _get("val_map"), label="Val mAP@[0.5:0.95]", linewidth=1.6, linestyle="-.", color="#2196F3")
+    ax.plot(epochs, [_get_5095(r) for r in history], label="Val mAP@[0.5:0.95]", linewidth=1.6, linestyle="-.", color="#2196F3")
+    ax.plot(epochs, _get("val_f1_50"), label="Val F1@0.5", linewidth=1.4, linestyle="-", color="#E91E63")
     ax.plot(epochs, _get("val_presence_acc"), label="Val presence acc", linewidth=1.6, linestyle="--", color="#CCB974")
     _stage_spans(ax, boundaries, n)
     _draw_stage_vlines(ax, boundaries)
@@ -201,11 +209,14 @@ def plot_contrastive_learning(history: list[dict[str, Any]], out_dir: Path) -> N
     ax.legend(fontsize=9)
     ax.grid(True, linewidth=0.4, alpha=0.5)
 
-    val_map = [row.get("val_map", 0.0) for row in history]
+    val_map_5095 = [
+        row["val_map_5095"] if "val_map_5095" in row else row.get("val_map", 0.0)
+        for row in history
+    ]
 
     ax = axes[1]
     ax.plot(epochs, val_iou, label="Val IoU", linewidth=1.8, color="#55A868")
-    ax.plot(epochs, val_map, label="Val mAP@[0.5:0.95]", linewidth=1.8, linestyle="-.", color="#2196F3")
+    ax.plot(epochs, val_map_5095, label="Val mAP@[0.5:0.95]", linewidth=1.8, linestyle="-.", color="#2196F3")
     _stage_spans(ax, boundaries, n)
     _draw_stage_vlines(ax, boundaries)
     ax.set_xlabel("Epoch (absolute)")
@@ -222,6 +233,49 @@ def plot_contrastive_learning(history: list[dict[str, Any]], out_dir: Path) -> N
 
     plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     out_path = out_dir / "contrastive_learning.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# 2b. Per-IoU AP curve (each AP@τ that goes into mAP@[0.5:0.95])
+# ---------------------------------------------------------------------------
+
+
+def plot_ap_per_iou(history: list[dict[str, Any]], out_dir: Path) -> None:
+    """Plot AP@τ for τ ∈ {0.50, 0.55, …, 0.95} as separate lines per epoch.
+
+    Renders the per-IoU breakdown that gets averaged into mAP@[0.5:0.95].
+    Useful for diagnosing whether the model gets coarse boxes right (high
+    AP@0.5, low AP@0.75) vs. tight boxes (high across the board).
+    """
+    _ensure(out_dir)
+    rows = [r for r in history if r.get("val_ap_per_iou")]
+    if not rows:
+        return
+    epochs = list(range(len(rows)))
+    boundaries = _stage_boundaries(rows)
+    n = len(rows)
+    thresholds = sorted(rows[0]["val_ap_per_iou"].keys())
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    fig.suptitle("Per-IoU AP curves (rows averaged → mAP@[0.5:0.95])", fontsize=13, fontweight="bold")
+    cmap = plt.get_cmap("viridis")
+    for i, tau in enumerate(thresholds):
+        vals = [r["val_ap_per_iou"].get(tau, 0.0) for r in rows]
+        colour = cmap(i / max(len(thresholds) - 1, 1))
+        ax.plot(epochs, vals, label=f"AP@{tau}", linewidth=1.4, color=colour)
+    _stage_spans(ax, boundaries, n)
+    _draw_stage_vlines(ax, boundaries)
+    ax.set_xlabel("Epoch (absolute)")
+    ax.set_ylabel("AP")
+    ax.set_ylim(0, 1.05)
+    ax.legend(fontsize=8, loc="upper left", ncol=2)
+    ax.grid(True, linewidth=0.4, alpha=0.5)
+
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    out_path = out_dir / "ap_per_iou.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"saved {out_path}")

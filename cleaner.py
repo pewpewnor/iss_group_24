@@ -23,6 +23,16 @@ HOTS_OBJECT_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "object"
 HOTS_SCENE_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "scene"
 INSDET_DIR = BASE_DIR / "InsDet"
 HOPE_DIR = BASE_DIR / "HOPE"
+FSOD_DIR = BASE_DIR / "FSOD"
+
+# FSOD scope controls. The dataset is huge (50k+ images, 800 categories).
+# FSOD episodes are synthesised at sample time: one (scene, bbox) entry feeds
+# both the supports (4 rotations of the cropped bbox region) and the query
+# (the full scene), so each entry counts as one whole episode's worth of
+# data. Tuning these trades stage-0 diversity vs. clean step duration / disk.
+FSOD_MAX_CATEGORIES = 600
+FSOD_MAX_IMAGES_PER_CAT = 50
+FSOD_NEG_SAMPLES = 500
 
 
 def _largest_component_bbox(mask: np.ndarray) -> list[int] | None:
@@ -189,6 +199,103 @@ def collect_insdet_instances() -> list[dict]:
     return instances
 
 
+def collect_fsod_instances() -> list[dict]:
+    """One instance per FSOD category, holding (scene, bbox) entries.
+
+    Stage-0 episodes are synthesised at sample time: pick one entry, crop
+    the bbox + rotate four ways → 4 supports; the same scene becomes the
+    query (with the same bbox as ground truth). One entry = one entire
+    episode, so support_images and query_images both reference the same
+    pool — the dataset side knows to treat fsod episodes specially.
+
+    Why this works as instance-level pretraining despite FSOD being
+    category-level: when both supports and query come from the *same*
+    scene image, the model is matching a specific object instance to its
+    own context, not generalising across instances of the same category.
+    The 4-way rotation gives viewpoint variation the way HOTS+InsDet
+    multi-shot supports would.
+    """
+    annot_path = FSOD_DIR / "annotations" / "fsod_train.json"
+    if not annot_path.exists():
+        print(f"  [skip] fsod: {annot_path} not found")
+        return []
+
+    with open(annot_path) as f:
+        coco = json.load(f)
+
+    cat_name = {c["id"]: c["name"] for c in coco["categories"]}
+    image_meta = {im["id"]: im for im in coco["images"]}
+
+    # Group annotations by category. Within a category, dedup by image_id and
+    # keep the largest-area bbox per image — multiple bboxes of the same
+    # category in one image would generate ambiguous queries.
+    by_cat: dict[int, dict[int, dict]] = {}
+    for ann in coco["annotations"]:
+        if ann.get("ignore") or ann.get("iscrowd"):
+            continue
+        cat_id = ann["category_id"]
+        img_id = ann["image_id"]
+        x, y, w_b, h_b = ann["bbox"]
+        if w_b <= 0 or h_b <= 0:
+            continue
+        area = w_b * h_b
+        cat = by_cat.setdefault(cat_id, {})
+        prev = cat.get(img_id)
+        if prev is None or area > prev["area"]:
+            cat[img_id] = {"area": area, "x": x, "y": y, "w": w_b, "h": h_b}
+
+    rng = random.Random(SEED)
+    cat_ids = sorted(by_cat)
+    rng.shuffle(cat_ids)
+    if FSOD_MAX_CATEGORIES > 0:
+        cat_ids = cat_ids[:FSOD_MAX_CATEGORIES]
+
+    instances: list[dict] = []
+    for cat_id in cat_ids:
+        per_image = by_cat[cat_id]
+        entries: list[dict] = []
+        for img_id, ann in per_image.items():
+            meta = image_meta.get(img_id)
+            if meta is None:
+                continue
+            img_path = FSOD_DIR / meta["file_name"]
+            if not img_path.exists():
+                continue
+            iw, ih = int(meta["width"]), int(meta["height"])
+            x1 = int(ann["x"])
+            y1 = int(ann["y"])
+            x2 = int(ann["x"] + ann["w"])
+            y2 = int(ann["y"] + ann["h"])
+            bbox = _pad_bbox([x1, y1, x2, y2], (iw, ih))
+            if not _bbox_valid(bbox, (iw, ih)):
+                continue
+            entries.append({"path": str(img_path), "bbox": bbox})
+
+        # Each entry is a self-contained episode source, so even a single
+        # entry would technically work — but keep a small minimum to ensure
+        # episodic resampling actually has variety per epoch.
+        if len(entries) < 5:
+            continue
+        rng.shuffle(entries)
+        if len(entries) > FSOD_MAX_IMAGES_PER_CAT:
+            entries = entries[:FSOD_MAX_IMAGES_PER_CAT]
+        name = cat_name[cat_id]
+        instances.append(
+            {
+                "instance_id": f"fsod_{_normalize_name(name)}",
+                "source": "fsod",
+                "class_name": name,
+                # The same flat pool drives both supports and query at sample
+                # time. Storing it under both keys keeps the manifest schema
+                # uniform with the other sources.
+                "support_images": entries,
+                "query_images": entries,
+            }
+        )
+    print(f"fsod: {len(instances)} categories kept (of {len(by_cat)} total)")
+    return instances
+
+
 def _normalize_name(name: str) -> str:
     """Normalize an instance name for cross-file matching (case + whitespace)."""
     return name.strip().lower().replace(" ", "_").replace("-", "_")
@@ -270,21 +377,64 @@ def attach_scene_queries(
     return out
 
 
-def collect_negative_backgrounds() -> list[str]:
-    """Negative (no-target) backgrounds: InsDet's Background dir + every HOPE
-    scene image. HOPE ships only 6D-pose labels (no 2D bboxes) and no 3D meshes,
-    so we cannot use HOPE images as positive episodes — instead they enter the
-    pool of distractor backgrounds for negative episodes.
+def collect_negative_backgrounds(
+    fsod_used_image_ids: set[str] | None = None,
+) -> list[dict]:
+    """Negative (no-target) backgrounds, **tagged by source**.
+
+    HOTS+InsDet share a "hots_insdet" pool (InsDet Background + HOPE
+    scenes). HOPE ships only 6D-pose labels (no 2D bboxes), so it can't
+    feed positive episodes — its scene RGBs are useful only as distractor
+    backgrounds. HOTS itself has no dedicated background dir; the
+    HOTS+InsDet pool is shared because the two datasets are visually
+    closer to each other than either is to FSOD.
+
+    FSOD has its own pool of random sampled images so a HOTS query is
+    never asked to reject an FSOD image (and vice versa) — that domain
+    gap is so large the model would learn to discriminate by global
+    style alone.
     """
-    out: list[str] = []
+    out: list[dict] = []
+
     bg_dir = INSDET_DIR / "Background"
+    n_insdet_bg = 0
     if bg_dir.exists():
-        out.extend(str(p) for p in sorted(bg_dir.glob("*.jpg")))
-    n_insdet = len(out)
+        for p in sorted(bg_dir.glob("*.jpg")):
+            out.append({"path": str(p), "source": "hots_insdet"})
+            n_insdet_bg += 1
+
+    n_hope = 0
     if HOPE_DIR.exists():
-        out.extend(str(p) for p in sorted(HOPE_DIR.rglob("*_rgb.jpg")))
-    n_hope = len(out) - n_insdet
-    print(f"  negatives: insdet={n_insdet} hope={n_hope}")
+        for p in sorted(HOPE_DIR.rglob("*_rgb.jpg")):
+            out.append({"path": str(p), "source": "hots_insdet"})
+            n_hope += 1
+
+    n_fsod = 0
+    if FSOD_DIR.exists():
+        rng = random.Random(SEED + 1)
+        used = fsod_used_image_ids or set()
+        candidates: list[Path] = []
+        for part in ("part_1", "part_2"):
+            part_dir = FSOD_DIR / part
+            if not part_dir.exists():
+                continue
+            candidates.extend(part_dir.rglob("*.jpg"))
+        # Shuffle to spread across categories rather than skewing to the first
+        # alphabetical wnids; then drop any image already used as a positive
+        # to keep negatives genuinely disjoint from positives.
+        rng.shuffle(candidates)
+        for p in candidates:
+            if str(p) in used:
+                continue
+            out.append({"path": str(p), "source": "fsod"})
+            n_fsod += 1
+            if n_fsod >= FSOD_NEG_SAMPLES:
+                break
+
+    print(
+        f"  negatives: hots_insdet(insdet_bg={n_insdet_bg} hope={n_hope})"
+        f" fsod={n_fsod}"
+    )
     return out
 
 
@@ -299,9 +449,13 @@ def filter_empty_instances(instances: list[dict]) -> list[dict]:
 
 
 def split_instances(instances: list[dict]) -> tuple[list, list, list]:
-    """Stratified 80/10/10 split — preserves the source ratio (HOTS/InsDet)
-    in each split. A pure random shuffle on a small dataset can put most of
-    one source in a single split, biasing val/test metrics."""
+    """Stratified 75/10/15 split for HOTS+InsDet; FSOD goes 100% into train.
+
+    HOTS/InsDet are instance-level so val/test on held-out instances measures
+    real generalisation. FSOD is category-level (its "instances" are just
+    categories), so it has no place in val/test — keeping it train-only also
+    matches the stage-0/1 boundary in the training schedule.
+    """
     rng = random.Random(SEED)
     by_source: dict[str, list[dict]] = {}
     for inst in instances:
@@ -312,6 +466,10 @@ def split_instances(instances: list[dict]) -> tuple[list, list, list]:
         group = by_source[source][:]
         rng.shuffle(group)
         n = len(group)
+        if source == "fsod":
+            train.extend(group)
+            print(f"  split[fsod]: train={n} val=0 test=0  (train-only by design)")
+            continue
         n_train = int(n * TRAIN_RATIO)
         n_val = int(n * VAL_RATIO)
         train.extend(group[:n_train])
@@ -321,7 +479,9 @@ def split_instances(instances: list[dict]) -> tuple[list, list, list]:
     return train, val, test
 
 
-def stage_images(splits: dict[str, list[dict]], negatives: list[str]) -> list[str]:
+def stage_images(
+    splits: dict[str, list[dict]], negatives: list[dict]
+) -> list[dict]:
     n_copied = 0
 
     def copy(src: Path, dst: Path) -> None:
@@ -346,20 +506,34 @@ def stage_images(splits: dict[str, list[dict]], negatives: list[str]) -> list[st
                         Path(split_name) / role / inst_id / dst.name
                     ).as_posix()
 
-    neg_dir = OUT_DIR / "negatives"
-    neg_dir.mkdir(parents=True, exist_ok=True)
-    new_negatives = []
-    for p in negatives:
-        dst = neg_dir / Path(p).name
-        shutil.copy2(p, dst)
+    # Negatives bucket by source so collisions in basenames across sources
+    # (FSOD's tarball-style filenames sometimes clash with HOPE's) don't
+    # silently overwrite each other.
+    new_negatives: list[dict] = []
+    for neg in negatives:
+        src = Path(neg["path"])
+        source = neg["source"]
+        sub_dir = OUT_DIR / "negatives" / source
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        dst = sub_dir / src.name
+        # Disambiguate basename collisions within a source by appending a
+        # short hash of the original path.
+        if dst.exists():
+            import hashlib
+            h = hashlib.md5(str(src).encode()).hexdigest()[:8]
+            dst = sub_dir / f"{src.stem}_{h}{src.suffix}"
+        shutil.copy2(src, dst)
         n_copied += 1
-        new_negatives.append((Path("negatives") / Path(p).name).as_posix())
+        new_negatives.append({
+            "path": (Path("negatives") / source / dst.name).as_posix(),
+            "source": source,
+        })
 
     print(f"staged images: {n_copied} files copied")
     return new_negatives
 
 
-def write_manifest(splits: dict[str, list[dict]], negatives: list[str]) -> None:
+def write_manifest(splits: dict[str, list[dict]], negatives: list[dict]) -> None:
     instances_with_split: list[dict] = []
     split_index: dict[str, list[str]] = {k: [] for k in splits}
     for split_name, insts in splits.items():
@@ -390,6 +564,7 @@ def write_stats(splits: dict[str, list[dict]]) -> None:
             "instances": len(insts),
             "hots": sum(1 for i in insts if i["source"] == "hots"),
             "insdet": sum(1 for i in insts if i["source"] == "insdet"),
+            "fsod": sum(1 for i in insts if i["source"] == "fsod"),
             "support_images": sum(len(i["support_images"]) for i in insts),
             "query_images": sum(len(i["query_images"]) for i in insts),
         }
@@ -406,14 +581,27 @@ def main():
     OUT_DIR.mkdir(parents=True)
 
     print("collecting instances")
-    instances = collect_hots_instances() + collect_insdet_instances()
+    target_instances = collect_hots_instances() + collect_insdet_instances()
 
     print("collecting scene queries")
     scene = collect_hots_scene_queries() + collect_insdet_scene_queries()
-    instances = attach_scene_queries(instances, scene)
-    instances = filter_empty_instances(instances)
+    target_instances = attach_scene_queries(target_instances, scene)
+    target_instances = filter_empty_instances(target_instances)
 
-    negatives = collect_negative_backgrounds()
+    print("collecting fsod instances (stage-0 pretraining pool)")
+    fsod_instances = collect_fsod_instances()
+
+    instances = target_instances + fsod_instances
+
+    # Track FSOD images already used as positives so we don't draw the same
+    # file as a negative — keeps the FSOD negative pool disjoint from the
+    # FSOD positive pool.
+    fsod_used: set[str] = set()
+    for inst in fsod_instances:
+        for img in inst["support_images"] + inst["query_images"]:
+            fsod_used.add(img["path"])
+
+    negatives = collect_negative_backgrounds(fsod_used_image_ids=fsod_used)
     print(f"negatives: {len(negatives)} background images")
 
     train, val, test = split_instances(instances)
