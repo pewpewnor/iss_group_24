@@ -1,13 +1,31 @@
 """FCOS-style target assignment + loss functions for few-shot localization.
 
 Losses:
-  varifocal_loss          — soft focal loss with IoU-based positive targets
+  focal_loss              — standard binary focal loss (hard 0/1 targets)
   area_weighted_giou_loss — GIoU loss up-weighted for small objects
-  presence BCE            — binary cross-entropy with IoU label smoothing
-  attention_bbox_loss     — KL between learned saliency attn and bbox target
+  presence BCE            — binary cross-entropy
+  attention_bbox_loss     — KL between aggregated support attention and bbox region
   nt_xent_loss            — prototype uniformity (contrastive)
   vicreg_loss             — prototype variance + covariance regularisation
   triplet_loss            — hard-negative prototype margin loss
+
+Notes on the loss redesign
+--------------------------
+The previous varifocal_loss had a saddle at init: with sigmoid≈0.5 and the
+positive-cell IoU floor clamped at 0.5, the weight `(gt - sigmoid)^γ * gt`
+evaluates to 0 — positive cells contributed *nothing* to the gradient, so
+the only force pushed predictions toward 0 (driven by negative cells), and
+the conf head collapsed to "predict 0 everywhere". Standard binary focal loss
+with hard 1/0 targets replaces it; positive cells now always receive a
+non-zero pulling-up gradient.
+
+The attention bbox auxiliary loss weight has been bumped 0.1 → 1.0 because
+it sat dead-flat at ~1.0 KL through 10 stage-1 epochs with the previous
+weight, meaning the support tokenizer never learned where the foreground was.
+
+Distillation between saliency-pooled and ROI-pooled descriptors is removed —
+the new model has no single "prototype vector" to distill into; the
+SupportTokenizer extracts M region tokens directly.
 """
 
 from __future__ import annotations
@@ -133,26 +151,25 @@ def decode_pred_box(reg: torch.Tensor, stride: int = 16) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def varifocal_loss(
+def focal_loss(
     pred_logits: torch.Tensor,
-    gt_score: torch.Tensor,
+    target_binary: torch.Tensor,
     alpha: float = 0.75,
     gamma: float = 2.0,
 ) -> torch.Tensor:
-    """Varifocal loss: soft focal loss with IoU-quality as positive target.
+    """Standard binary focal loss (Lin et al. 2017) with hard 0/1 targets.
 
-    Positive cells (gt_score > 0) are weighted by how far the prediction is from
-    the target IoU. Negative cells (gt_score = 0) are down-weighted by the
-    focal term when the model is already confident they are negative.
-    Returns sum (caller normalises by num_pos).
+    alpha=0.75 up-weights positives (rare class — typically 1–10 cells out of
+    196). Returns the *sum* over all elements; caller normalises by num_pos.
     """
-    pred_sigmoid = torch.sigmoid(pred_logits)
-    weight = (
-        alpha * (gt_score - pred_sigmoid).abs().pow(gamma) * gt_score
-        + (1 - alpha) * pred_sigmoid.pow(gamma) * (1 - gt_score)
+    p = torch.sigmoid(pred_logits)
+    pt = p * target_binary + (1 - p) * (1 - target_binary)
+    focal_w = (1 - pt).clamp(min=1e-6).pow(gamma)
+    alpha_w = alpha * target_binary + (1 - alpha) * (1 - target_binary)
+    bce = F.binary_cross_entropy_with_logits(
+        pred_logits, target_binary, reduction="none"
     )
-    loss = F.binary_cross_entropy_with_logits(pred_logits, gt_score, reduction="none")
-    return (loss * weight).sum()
+    return (alpha_w * focal_w * bce).sum()
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +188,6 @@ def area_weighted_giou_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tenso
     weights = 1.0 + 2.0 * torch.exp(-5.0 * norm_area)
     loss = generalized_box_iou_loss(pred, gt, reduction="none")
     return (loss * weights).mean()
-
-
-# ---------------------------------------------------------------------------
-# Presence classification helpers
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -215,22 +227,12 @@ def triplet_loss(
     instance_ids: list[str],
     margin: float = 0.3,
 ) -> torch.Tensor:
-    """Hard-negative prototype triplet loss.
-
-    For each anchor, finds the hardest negative (most similar prototype from a
-    different instance) and the hardest positive (if a same-instance prototype
-    exists in the batch). Pushes (anchor, positive) closer and (anchor, negative)
-    further apart with a margin.
-
-    Note: in episodic training each batch element is a unique instance, so positive
-    pairs are rare. The loss primarily contributes as a hard-negative push alongside
-    NT-Xent.
-    """
+    """Hard-negative prototype triplet loss."""
     B = protos.shape[0]
     if B < 2:
         return torch.zeros((), device=protos.device)
     normed = F.normalize(protos, dim=1)
-    sims = normed @ normed.T  # (B, B)
+    sims = normed @ normed.T
     loss = torch.zeros((), device=protos.device)
     count = 0
     for i, iid in enumerate(instance_ids):
@@ -245,7 +247,7 @@ def triplet_loss(
         if not pos_mask.any() or not neg_mask.any():
             continue
         pos_sim = sims[i][pos_mask].max()
-        neg_sim = sims[i][neg_mask].max()  # hardest negative
+        neg_sim = sims[i][neg_mask].max()
         loss = loss + F.relu(neg_sim - pos_sim + margin)
         count += 1
     return loss / max(count, 1)
@@ -262,29 +264,35 @@ def attention_bbox_loss(
     img_size: int = 224,
     stride: int = 32,
 ) -> torch.Tensor:
-    """KL divergence between learned saliency attention and a bbox target.
+    """KL divergence between aggregated support attention and a bbox target.
 
-    During training we have support bboxes (from cleaner.py); use them to
-    pull the saliency attention toward the foreground region. At inference
-    the model uses the learned attention freely without needing any bbox.
-
-    Args:
-        attn_map: (B, K, H, W) — softmax-normalised over (H, W) per support
-        support_bboxes: (B, K, 4) in image coords (xyxy, 224 image space)
-
-    Returns:
-        Scalar mean KL across (B, K) supports.
+    Accepts:
+      attn_map shape (B, K, M, H, W)  — new model: M region tokens per support.
+                                        Aggregated by sum across M then renormalised.
+      attn_map shape (B, K, H, W)     — legacy single-attention shape (kept for
+                                        backwards compat).
+    The resulting (B, K, H, W) probability map is matched against a uniform-
+    inside-bbox target by KL.
     """
-    b, k, h, w = attn_map.shape
-    device = attn_map.device
-    dtype = attn_map.dtype
+    if attn_map.dim() == 5:
+        # Aggregate across M tokens — each row of attn already sums to 1, so the
+        # sum has total mass M; divide it back to a probability distribution.
+        agg = attn_map.sum(dim=2)
+        agg = agg / agg.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+    elif attn_map.dim() == 4:
+        agg = attn_map
+    else:
+        raise ValueError(f"attn_map has unexpected shape {attn_map.shape}")
 
-    # Cell centres in image coords
+    b, k, h, w = agg.shape
+    device = agg.device
+    dtype = agg.dtype
+
     cy = (torch.arange(h, device=device, dtype=dtype) + 0.5) * stride
     cx = (torch.arange(w, device=device, dtype=dtype) + 0.5) * stride
 
     bb = support_bboxes.reshape(b * k, 4).to(dtype)
-    x1 = bb[:, 0:1].unsqueeze(-1)  # (B*K, 1, 1)
+    x1 = bb[:, 0:1].unsqueeze(-1)
     y1 = bb[:, 1:2].unsqueeze(-1)
     x2 = bb[:, 2:3].unsqueeze(-1)
     y2 = bb[:, 3:4].unsqueeze(-1)
@@ -292,17 +300,16 @@ def attention_bbox_loss(
     inside = (
         (cx.view(1, 1, w) >= x1) & (cx.view(1, 1, w) <= x2)
         & (cy.view(1, h, 1) >= y1) & (cy.view(1, h, 1) <= y2)
-    )  # (B*K, H, W)
+    )
     target = inside.to(dtype)
     target_sum = target.sum(dim=(1, 2), keepdim=True)
-    # Empty bbox -> uniform target (no signal, doesn't push attention anywhere)
     safe = target_sum > 0
     uniform = torch.full_like(target, 1.0 / (h * w))
     target = torch.where(safe, target / target_sum.clamp(min=1.0), uniform)
     target = target.view(b, k, h, w)
 
     eps = 1e-8
-    kl = (target * (torch.log(target + eps) - torch.log(attn_map + eps))).sum(dim=(2, 3))
+    kl = (target * (torch.log(target + eps) - torch.log(agg + eps))).sum(dim=(2, 3))
     return kl.mean()
 
 
@@ -318,33 +325,34 @@ def total_loss(
     grid: int = 14,
     stride: int = 16,
     support_bboxes: torch.Tensor | None = None,
-    attn_loss_weight: float = 0.1,
+    attn_loss_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
+    """Weighted sum of focal + box + presence + attention losses.
+
+    Loss weights:
+      focal:    1.0 (hard-target focal, sum normalised by num_pos)
+      box:      1.0 (area-weighted GIoU on positive cells only)
+      presence: 1.0 (BCE on (B,) presence_logit)
+      attn:     1.0 (KL between aggregated support attention and bbox region) —
+                bumped from 0.1 because the auxiliary signal is what teaches the
+                SupportTokenizer where the foreground is. Without it the M
+                region queries drift toward whatever minimises the dense detection
+                loss, which is uninformative gradient through cross-attention.
+    """
     reg_pred = pred["reg"]
     conf_logits = pred["conf"]
 
     conf_target, _, pos_mask = make_targets(gt_bbox, is_present, grid=grid, stride=stride)
     num_pos = pos_mask.sum().clamp(min=1)
 
-    # Decode all cells once — reused for varifocal targets, box loss, and label smoothing
+    # Focal loss with hard binary targets — positive cells always receive a
+    # gradient pulling sigmoid up, regardless of init.
+    focal = focal_loss(conf_logits, conf_target) / num_pos
+
+    # Area-weighted GIoU box loss (positive cells only)
     decoded = decode_pred_box(reg_pred, stride=stride)  # (B, 4, G, G)
     b = gt_bbox.shape[0]
     gt_exp = gt_bbox.view(b, 4, 1, 1).expand_as(decoded)
-
-    # Varifocal loss: build soft targets from predicted IoU at each cell.
-    # Clamp positive targets to a 0.5 floor so a randomly-initialized model
-    # (IoU ≈ 0 at start) doesn't see a target of 0 on positive cells, which
-    # otherwise teaches the conf head to predict 0 everywhere and collapse.
-    with torch.no_grad():
-        iou_flat = _iou_xyxy(
-            decoded.permute(0, 2, 3, 1).reshape(-1, 4),
-            gt_exp.permute(0, 2, 3, 1).reshape(-1, 4),
-        )
-        iou_map = iou_flat.view(b, 1, grid, grid).clamp(min=0.5)
-        gt_score_map = iou_map * conf_target  # negative cells stay 0
-    focal = varifocal_loss(conf_logits, gt_score_map) / num_pos
-
-    # Area-weighted GIoU box loss (positive cells only)
     if pos_mask.any():
         pred_pos = decoded.permute(0, 2, 3, 1)[pos_mask]   # (P, 4)
         gt_pos = gt_exp.permute(0, 2, 3, 1)[pos_mask]      # (P, 4)
@@ -352,10 +360,7 @@ def total_loss(
     else:
         box_loss = torch.zeros((), device=reg_pred.device)
 
-    # Presence BCE — hard binary targets. IoU-coupled label smoothing was
-    # tried earlier but creates a death spiral at init: random model has
-    # IoU≈0 on positives → smoothed target ≈ 0.05 → model learns "always
-    # not present" → val_presence collapses to 0%.
+    # Presence BCE
     if "presence_logit" in pred:
         presence_loss = F.binary_cross_entropy_with_logits(
             pred["presence_logit"], is_present.float()
@@ -363,41 +368,17 @@ def total_loss(
     else:
         presence_loss = torch.zeros((), device=reg_pred.device)
 
-    # Saliency attention auxiliary loss (only when both attn map and bboxes available)
+    # Aggregated support-attention bbox auxiliary loss
     attn_loss = torch.zeros((), device=reg_pred.device)
     support_attn = pred.get("support_attn")
     if support_attn is not None and support_bboxes is not None:
         attn_loss = attention_bbox_loss(support_attn, support_bboxes)
 
-    # Feature distillation: saliency-pooled descriptors must match the
-    # ROI-aligned teacher descriptors (cosine similarity). This gives the
-    # saliency module a feature-level training signal, much stronger than the
-    # attention-shape KL alone. Teacher descs are computed from the same
-    # projection weights but with bbox-supervised pooling, so they're a
-    # high-quality target. At inference (no bbox), this loss is skipped and
-    # only the saliency path runs.
-    distill_loss = torch.zeros((), device=reg_pred.device)
-    teacher_desc = pred.get("teacher_desc")
-    student_proto = pred.get("prototype")  # student-pooled prototype (B, D)
-    if teacher_desc is not None and student_proto is not None:
-        # Aggregate teacher across K to a single (B, D) for direct comparison
-        # with the student prototype. Plain mean is fine here — the teacher
-        # is an oracle target, not the live prototype.
-        teacher_proto = teacher_desc.mean(dim=1).detach()       # (B, D), no grad
-        s = F.normalize(student_proto, dim=-1)
-        t = F.normalize(teacher_proto, dim=-1)
-        distill_loss = (1.0 - (s * t).sum(dim=-1)).mean()       # cosine distance
-
-    loss = (
-        focal + box_loss + presence_loss
-        + attn_loss_weight * attn_loss
-        + 0.5 * distill_loss
-    )
+    loss = focal + box_loss + presence_loss + attn_loss_weight * attn_loss
     return {
         "loss": loss,
         "focal": focal.detach(),
         "box": box_loss.detach(),
         "presence": presence_loss.detach(),
         "attn": attn_loss.detach(),
-        "distill": distill_loss.detach(),
     }

@@ -4,17 +4,17 @@ Two artefacts are exported for the on-device pipeline:
 
   prototype.tflite — runs once when the user provides their 5 supports.
       input:  support_imgs (1, 5, 3, 224, 224)
-      output: prototype    (1, 64)
+      output: prototype    (1, K*M, DIM)   token bag — typically (1, 20, 128)
 
   detect.tflite — runs every camera frame, reusing the cached prototype.
-      input:  prototype    (1, 64)
+      input:  prototype    (1, K*M, DIM)
               query_img    (1, 3, 224, 224)
       output: bbox         (1, 4)   xyxy in 224-px coords
               score        (1,)     presence confidence in [0, 1]
 
 Splitting the pipeline avoids re-encoding 5 supports per frame at runtime —
-the prototype is cached client-side and the per-frame cost drops to just
-the query branch + detection head.
+the token bag is cached client-side and the per-frame cost drops to just
+the query branch + cross-attention head + detection head.
 
 Run:
     python -m modeling.export \
@@ -30,19 +30,21 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from modeling.model import FewShotLocalizer, decode
+from modeling.model import DIM, M_TOKENS, FewShotLocalizer, decode
+
+K_SUPPORT = 5
 
 
 class _PrototypeWrapper(nn.Module):
-    """Encodes 5 support images into a single prototype vector. Run once per session."""
+    """Encodes K support images into a (1, K*M, DIM) token bag. Run once per session."""
 
     def __init__(self, model: FewShotLocalizer) -> None:
         super().__init__()
         self.model = model
 
     def forward(self, support_imgs: torch.Tensor) -> torch.Tensor:
-        proto, _, _ = self.model.encode_support(support_imgs)
-        return proto
+        tokens, _ = self.model.encode_support(support_imgs)
+        return tokens
 
 
 class _DetectWrapper(nn.Module):
@@ -117,7 +119,10 @@ def export(checkpoint: str | Path, out_dir: str | Path, quantize: bool = True) -
     print("exporting detect model (per-frame, runs on every camera frame)...")
     _convert(
         _DetectWrapper(base_model).eval(),
-        (torch.zeros(1, 64), torch.zeros(1, 3, 224, 224)),
+        (
+            torch.zeros(1, K_SUPPORT * M_TOKENS, DIM),
+            torch.zeros(1, 3, 224, 224),
+        ),
         out_dir / "detect.tflite",
         quantize,
     )

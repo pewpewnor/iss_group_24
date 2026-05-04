@@ -21,6 +21,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
@@ -31,7 +32,6 @@ from modeling.dataset import EpisodeDataset, _Augment, _load_image, collate
 from modeling.evaluate import IOU_THRESHOLDS, _compute_pr_ap, _iou_xyxy
 from modeling.loss import _containment_ratio
 from modeling.loss import nt_xent_loss, total_loss, triplet_loss, vicreg_loss
-from torchvision.ops import generalized_box_iou_loss
 from modeling.model import FewShotLocalizer, decode
 
 
@@ -42,11 +42,10 @@ from modeling.model import FewShotLocalizer, decode
 
 def _heads(model: FewShotLocalizer) -> list:
     return (
-        list(model.projection.parameters())
-        + list(model.proto_agg.parameters())
+        list(model.support_tokenizer.parameters())
         + list(model.fpn.parameters())
         + list(model.p3_lat.parameters())
-        + list(model.gate.parameters())
+        + list(model.cross_attn.parameters())
         + list(model.det_head.parameters())
         + list(model.presence_head.parameters())
     )
@@ -133,8 +132,11 @@ def build_proto_cache(
             imgs.append(t)
 
         support_imgs_t = torch.stack(imgs).unsqueeze(0).to(device)
-        proto, _, _ = model.encode_support(support_imgs_t)
-        cache[instance["instance_id"]] = proto.squeeze(0).cpu()
+        tokens, _ = model.encode_support(support_imgs_t)
+        # Summarise the (1, K*M, dim) token bag to (dim,) for cosine-similarity
+        # hard-negative mining. Mean over tokens is a reasonable per-instance
+        # signature even though matching itself is now token-level.
+        cache[instance["instance_id"]] = tokens.mean(dim=1).squeeze(0).cpu()
 
     if was_training:
         model.train()
@@ -193,7 +195,7 @@ def validate(
     model: FewShotLocalizer,
     val_loader: DataLoader,
     device: torch.device,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     model.eval()
     losses, ious, contain, present_correct, n, n_pos = 0.0, 0.0, 0.0, 0, 0, 0
     all_scores: list[float] = []
@@ -224,8 +226,9 @@ def validate(
 
         pos = is_present
         if pos.any():
-            giou_vals = 1.0 - generalized_box_iou_loss(pred_box[pos], gt_bbox[pos], reduction="none")
-            ious += giou_vals.clamp(min=0).sum().item()
+            # Plain IoU on positive episodes — directly comparable to mAP thresholds.
+            iou_vals = _iou_xyxy(pred_box[pos], gt_bbox[pos])
+            ious += iou_vals.clamp(min=0, max=1).sum().item()
             contain_vals = _containment_ratio(pred_box[pos], gt_bbox[pos])
             contain += contain_vals.clamp(min=0, max=1).sum().item()
             n_pos += int(pos.sum().item())
@@ -242,6 +245,9 @@ def validate(
     # IOU_THRESHOLDS[0] is 0.5 → ap_vals[0] is mAP@0.5
     val_map_50 = ap_vals[0] if ap_vals else 0.0
     val_map = sum(ap_vals) / len(ap_vals) if ap_vals else 0.0
+    # Persist the full per-IoU breakdown so plot.py can render the COCO-style
+    # AP@τ curve over epochs (one line per τ in IOU_THRESHOLDS).
+    val_ap_per_iou = {f"{tau:.2f}": ap for tau, ap in zip(IOU_THRESHOLDS, ap_vals)}
 
     model.train()
     return {
@@ -250,6 +256,7 @@ def validate(
         "val_contain": contain / max(n_pos, 1),
         "val_map_50": val_map_50,
         "val_map": val_map,
+        "val_ap_per_iou": val_ap_per_iou,
         "val_presence_acc": present_correct / max(n, 1),
     }
 
@@ -321,7 +328,7 @@ def train_stage(
         model.backbone.eval()
 
         t0 = time.time()
-        running = {"loss": 0.0, "focal": 0.0, "box": 0.0, "presence": 0.0, "attn": 0.0, "distill": 0.0, "nt_xent": 0.0, "vicreg": 0.0, "triplet": 0.0}
+        running = {"loss": 0.0, "focal": 0.0, "box": 0.0, "presence": 0.0, "attn": 0.0, "nt_xent": 0.0, "vicreg": 0.0, "triplet": 0.0}
         for batch in train_loader:
             support_imgs = batch["support_imgs"].to(device)
             support_bboxes = batch["support_bboxes"].to(device)
@@ -360,7 +367,6 @@ def train_stage(
             running["box"] += float(losses["box"])
             running["presence"] += float(losses.get("presence", 0.0))
             running["attn"] += float(losses.get("attn", 0.0))
-            running["distill"] += float(losses.get("distill", 0.0))
             running["nt_xent"] += nt_val
             running["vicreg"] += vr_val
             running["triplet"] += trip_val
@@ -377,7 +383,7 @@ def train_stage(
         print(
             f"[{stage_name}] epoch {epoch}/{epochs} "
             f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f} "
-            f"presence={avg['presence']:.4f} attn={avg['attn']:.4f} distill={avg['distill']:.4f}{reg_str}) "
+            f"presence={avg['presence']:.4f} attn={avg['attn']:.4f}{reg_str}) "
             f"val_loss={metrics['val_loss']:.4f} "
             f"val_iou={metrics['val_iou']:.4f} "
             f"val_contain={metrics['val_contain']:.4f} "
@@ -395,7 +401,6 @@ def train_stage(
             "box": avg["box"],
             "presence": avg["presence"],
             "attn": avg["attn"],
-            "distill": avg["distill"],
             "nt_xent": avg["nt_xent"],
             "vicreg": avg["vicreg"],
             "triplet": avg["triplet"],
@@ -404,6 +409,7 @@ def train_stage(
             "val_contain": metrics["val_contain"],
             "val_map_50": metrics["val_map_50"],
             "val_map": metrics["val_map"],
+            "val_ap_per_iou": metrics["val_ap_per_iou"],
             "val_presence_acc": metrics["val_presence_acc"],
         })
 
@@ -416,6 +422,7 @@ def train_stage(
                     "val_contain": metrics["val_contain"],
                     "val_map_50": metrics["val_map_50"],
                     "val_map": metrics["val_map"],
+                    "val_ap_per_iou": metrics["val_ap_per_iou"],
                     "stage": stage_name,
                     "epoch": epoch,
                 },
@@ -444,6 +451,7 @@ def train_stage(
                 "val_contain": last_metrics["val_contain"],
                 "val_map_50": last_metrics["val_map_50"],
                 "val_map": last_metrics["val_map"],
+                "val_ap_per_iou": last_metrics["val_ap_per_iou"],
             },
             stage_path,
         )
@@ -608,10 +616,15 @@ def train(
         if rng.get("python") is not None:
             _random.setstate(rng["python"])
 
-    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
-    print(f"params: total={n_total/1e6:.2f}M trainable(initial)={n_train/1e6:.2f}M")
+    # Per-stage trainable counts are logged separately as each stage builds its
+    # optimizer (after the corresponding freeze_* call mutates requires_grad).
+    print(f"params: total={n_total/1e6:.2f}M")
     print(f"train instances: {len(train_ds.instances)}  val instances: {len(val_ds.instances)}")
+
+    def _log_trainable(stage_name: str) -> None:
+        n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  {stage_name} trainable params: {n/1e6:.2f}M")
 
     steps_per_epoch = max(episodes_per_epoch // batch_size, 1)
 
@@ -670,6 +683,7 @@ def train(
             # first learn what objects look like before learning to reject distractors.
             train_ds.set_hard_neg_ratio(0.25)
             opt = stage1_optimizer(model)
+            _log_trainable("stage1")
             if opt_state is not None:
                 opt.load_state_dict(opt_state)
             best, hist = train_stage(
@@ -710,6 +724,7 @@ def train(
             # space is now meaningful, so hard negatives carry useful signal.
             train_ds.set_hard_neg_ratio(0.5)
             opt = stage2_optimizer(model)
+            _log_trainable("stage2")
             if opt_state is not None:
                 opt.load_state_dict(opt_state)
             best, hist = train_stage(
@@ -749,6 +764,7 @@ def train(
             print(f"=== Stage 3: full unfreeze (all backbone @ 5e-6){resume_str} ===")
             train_ds.set_hard_neg_ratio(0.5)
             opt = stage3_optimizer(model)
+            _log_trainable("stage3")
             if opt_state is not None:
                 opt.load_state_dict(opt_state)
             best, hist = train_stage(
