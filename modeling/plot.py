@@ -137,6 +137,8 @@ def plot_training_curves(history: list[dict[str, Any]], out_dir: Path) -> None:
 
     ax = axes[3]
     ax.plot(epochs, _get("val_iou"), label="Val IoU", linewidth=1.6, color="#55A868")
+    ax.plot(epochs, _get("val_contain"), label="Val containment", linewidth=1.4, linestyle=":", color="#0D7C3D")
+    ax.plot(epochs, _get("val_map_50"), label="Val mAP@0.5", linewidth=1.4, linestyle="--", color="#1565C0")
     ax.plot(epochs, _get("val_map"), label="Val mAP@[0.5:0.95]", linewidth=1.6, linestyle="-.", color="#2196F3")
     ax.plot(epochs, _get("val_presence_acc"), label="Val presence acc", linewidth=1.6, linestyle="--", color="#CCB974")
     _stage_spans(ax, boundaries, n)
@@ -381,6 +383,7 @@ def plot_eval_report(report: dict[str, Any], out_dir: Path) -> None:
 
     metric_keys = [
         "mean_iou_pos",
+        "mean_contain_pos",
         "presence_acc",
         "ap@iou=0.5",
         "ap@iou=0.75",
@@ -388,6 +391,7 @@ def plot_eval_report(report: dict[str, Any], out_dir: Path) -> None:
     ]
     metric_labels = [
         "Mean IoU (pos)",
+        "Mean Contain (pos)",
         "Presence acc",
         "AP@0.5",
         "AP@0.75",

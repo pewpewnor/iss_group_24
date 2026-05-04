@@ -34,6 +34,23 @@ def _iou_xyxy(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return inter / (area_a + area_b - inter + 1e-6)
 
 
+def _containment_ratio(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Fraction of the GT box covered by the prediction: area(pred ∩ gt) / area(gt).
+
+    Distinct from IoU: containment is asymmetric and penalises under-coverage
+    only. A loose prediction that fully contains the GT scores 1.0; a tight
+    prediction that only partially overlaps the GT scores < 1.0. Useful when
+    "did we cover the object" matters more than "did we over-shoot".
+    """
+    inter_x1 = torch.maximum(pred[..., 0], gt[..., 0])
+    inter_y1 = torch.maximum(pred[..., 1], gt[..., 1])
+    inter_x2 = torch.minimum(pred[..., 2], gt[..., 2])
+    inter_y2 = torch.minimum(pred[..., 3], gt[..., 3])
+    inter = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+    gt_area = (gt[..., 2] - gt[..., 0]).clamp(min=0) * (gt[..., 3] - gt[..., 1]).clamp(min=0)
+    return inter / (gt_area + 1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Target assignment
 # ---------------------------------------------------------------------------
@@ -159,28 +176,6 @@ def area_weighted_giou_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tenso
 # ---------------------------------------------------------------------------
 # Presence classification helpers
 # ---------------------------------------------------------------------------
-
-
-def _smooth_presence_targets(
-    is_present: torch.Tensor,
-    pred_bbox: torch.Tensor,
-    gt_bbox: torch.Tensor,
-    smooth: float = 0.1,
-) -> torch.Tensor:
-    """IoU-based label smoothing for presence BCE.
-
-    For positive episodes, the target is softened from 1.0 to
-    (1 - smooth) * IoU + smooth * 0.5. A model that localizes well gets a target
-    closer to 1; poor localisation gets a softer target, reducing overconfident
-    penalisation on ambiguous GT boxes.
-    """
-    targets = is_present.float()
-    present = is_present.bool()
-    if present.any():
-        iou = _iou_xyxy(pred_bbox[present], gt_bbox[present])
-        targets = targets.clone()
-        targets[present] = (1 - smooth) * iou + smooth * 0.5
-    return targets
 
 
 # ---------------------------------------------------------------------------
@@ -336,13 +331,17 @@ def total_loss(
     b = gt_bbox.shape[0]
     gt_exp = gt_bbox.view(b, 4, 1, 1).expand_as(decoded)
 
-    # Varifocal loss: build soft targets from predicted IoU at each cell
+    # Varifocal loss: build soft targets from predicted IoU at each cell.
+    # Clamp positive targets to a 0.5 floor so a randomly-initialized model
+    # (IoU ≈ 0 at start) doesn't see a target of 0 on positive cells, which
+    # otherwise teaches the conf head to predict 0 everywhere and collapse.
     with torch.no_grad():
         iou_flat = _iou_xyxy(
             decoded.permute(0, 2, 3, 1).reshape(-1, 4),
             gt_exp.permute(0, 2, 3, 1).reshape(-1, 4),
         )
-        gt_score_map = iou_flat.view(b, 1, grid, grid) * conf_target
+        iou_map = iou_flat.view(b, 1, grid, grid).clamp(min=0.5)
+        gt_score_map = iou_map * conf_target  # negative cells stay 0
     focal = varifocal_loss(conf_logits, gt_score_map) / num_pos
 
     # Area-weighted GIoU box loss (positive cells only)
@@ -353,16 +352,13 @@ def total_loss(
     else:
         box_loss = torch.zeros((), device=reg_pred.device)
 
-    # Presence BCE with IoU-based label smoothing
+    # Presence BCE — hard binary targets. IoU-coupled label smoothing was
+    # tried earlier but creates a death spiral at init: random model has
+    # IoU≈0 on positives → smoothed target ≈ 0.05 → model learns "always
+    # not present" → val_presence collapses to 0%.
     if "presence_logit" in pred:
-        flat_conf = conf_logits.view(b, -1)
-        best = flat_conf.argmax(dim=1)
-        b_idx = torch.arange(b, device=reg_pred.device)
-        best_boxes = decoded.permute(0, 2, 3, 1)[b_idx, (best // grid).long(), (best % grid).long()]
-        with torch.no_grad():
-            smooth_targets = _smooth_presence_targets(is_present, best_boxes, gt_bbox)
         presence_loss = F.binary_cross_entropy_with_logits(
-            pred["presence_logit"], smooth_targets
+            pred["presence_logit"], is_present.float()
         )
     else:
         presence_loss = torch.zeros((), device=reg_pred.device)
@@ -373,11 +369,35 @@ def total_loss(
     if support_attn is not None and support_bboxes is not None:
         attn_loss = attention_bbox_loss(support_attn, support_bboxes)
 
-    loss = focal + box_loss + presence_loss + attn_loss_weight * attn_loss
+    # Feature distillation: saliency-pooled descriptors must match the
+    # ROI-aligned teacher descriptors (cosine similarity). This gives the
+    # saliency module a feature-level training signal, much stronger than the
+    # attention-shape KL alone. Teacher descs are computed from the same
+    # projection weights but with bbox-supervised pooling, so they're a
+    # high-quality target. At inference (no bbox), this loss is skipped and
+    # only the saliency path runs.
+    distill_loss = torch.zeros((), device=reg_pred.device)
+    teacher_desc = pred.get("teacher_desc")
+    student_proto = pred.get("prototype")  # student-pooled prototype (B, D)
+    if teacher_desc is not None and student_proto is not None:
+        # Aggregate teacher across K to a single (B, D) for direct comparison
+        # with the student prototype. Plain mean is fine here — the teacher
+        # is an oracle target, not the live prototype.
+        teacher_proto = teacher_desc.mean(dim=1).detach()       # (B, D), no grad
+        s = F.normalize(student_proto, dim=-1)
+        t = F.normalize(teacher_proto, dim=-1)
+        distill_loss = (1.0 - (s * t).sum(dim=-1)).mean()       # cosine distance
+
+    loss = (
+        focal + box_loss + presence_loss
+        + attn_loss_weight * attn_loss
+        + 0.5 * distill_loss
+    )
     return {
         "loss": loss,
         "focal": focal.detach(),
         "box": box_loss.detach(),
         "presence": presence_loss.detach(),
         "attn": attn_loss.detach(),
+        "distill": distill_loss.detach(),
     }

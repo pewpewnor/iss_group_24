@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from modeling.dataset import EpisodeDataset, collate
-from modeling.loss import _iou_xyxy
+from modeling.loss import _containment_ratio, _iou_xyxy
 from modeling.model import FewShotLocalizer, decode
 
 
@@ -78,10 +78,11 @@ def evaluate(
     iou_thr: float = 0.5,
 ) -> dict:
     model.eval()
+    bucket_keys = ["iou", "contain", "score", "is_present", "correct_at_iou"]
     per_source: dict[str, dict[str, list]] = defaultdict(
-        lambda: {"iou": [], "score": [], "is_present": [], "correct_at_iou": []}
+        lambda: {k: [] for k in bucket_keys}
     )
-    overall: dict[str, list] = {"iou": [], "score": [], "is_present": [], "correct_at_iou": []}
+    overall: dict[str, list] = {k: [] for k in bucket_keys}
 
     for batch in loader:
         support_imgs = batch["support_imgs"].to(device)
@@ -94,14 +95,17 @@ def evaluate(
         pred_box, pred_score = decode(out["reg"], out["conf"], presence_logit=out.get("presence_logit"))
 
         ious = _iou_xyxy(pred_box, gt_bbox)
+        contains = _containment_ratio(pred_box, gt_bbox)
         for i in range(gt_bbox.shape[0]):
             present = bool(is_present[i].item())
             score = float(pred_score[i].item())
             iou_v = float(ious[i].item()) if present else 0.0
+            contain_v = float(contains[i].item()) if present else 0.0
             correct = present and (iou_v >= iou_thr) and (score >= score_thr)
             src = ids[i].split("_", 1)[0]
             for bucket in (overall, per_source[src]):
                 bucket["iou"].append(iou_v)
+                bucket["contain"].append(contain_v)
                 bucket["score"].append(score)
                 bucket["is_present"].append(present)
                 bucket["correct_at_iou"].append(correct)
@@ -114,6 +118,11 @@ def evaluate(
         n_neg = n - n_pos
         mean_iou = (
             sum(v for v, p in zip(b["iou"], b["is_present"]) if p) / n_pos
+            if n_pos
+            else 0.0
+        )
+        mean_contain = (
+            sum(v for v, p in zip(b["contain"], b["is_present"]) if p) / n_pos
             if n_pos
             else 0.0
         )
@@ -135,6 +144,7 @@ def evaluate(
             "n_pos": n_pos,
             "n_neg": n_neg,
             "mean_iou_pos": round(mean_iou, 4),
+            "mean_contain_pos": round(mean_contain, 4),
             "presence_acc": round(presence_correct / n, 4),
             "ap@iou=0.5": ap_per_iou["0.50"],
             "ap@iou=0.75": ap_per_iou["0.75"],

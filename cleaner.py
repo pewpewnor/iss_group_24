@@ -22,6 +22,7 @@ OUT_DIR = Path("dataset/cleaned")
 HOTS_OBJECT_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "object"
 HOTS_SCENE_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "scene"
 INSDET_DIR = BASE_DIR / "InsDet"
+HOPE_DIR = BASE_DIR / "HOPE"
 
 
 def _largest_component_bbox(mask: np.ndarray) -> list[int] | None:
@@ -270,10 +271,21 @@ def attach_scene_queries(
 
 
 def collect_negative_backgrounds() -> list[str]:
+    """Negative (no-target) backgrounds: InsDet's Background dir + every HOPE
+    scene image. HOPE ships only 6D-pose labels (no 2D bboxes) and no 3D meshes,
+    so we cannot use HOPE images as positive episodes — instead they enter the
+    pool of distractor backgrounds for negative episodes.
+    """
+    out: list[str] = []
     bg_dir = INSDET_DIR / "Background"
-    if not bg_dir.exists():
-        return []
-    return [str(p) for p in sorted(bg_dir.glob("*.jpg"))]
+    if bg_dir.exists():
+        out.extend(str(p) for p in sorted(bg_dir.glob("*.jpg")))
+    n_insdet = len(out)
+    if HOPE_DIR.exists():
+        out.extend(str(p) for p in sorted(HOPE_DIR.rglob("*_rgb.jpg")))
+    n_hope = len(out) - n_insdet
+    print(f"  negatives: insdet={n_insdet} hope={n_hope}")
+    return out
 
 
 def filter_empty_instances(instances: list[dict]) -> list[dict]:

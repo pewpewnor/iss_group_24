@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import MobileNet_V3_Large_Weights, mobilenet_v3_large
-from torchvision.ops import FeaturePyramidNetwork
+from torchvision.ops import FeaturePyramidNetwork, roi_align
 
 IMG_SIZE = 224
 GRID = 14
@@ -284,21 +284,41 @@ class FewShotLocalizer(nn.Module):
     # ---- support branch ----------------------------------------------------
 
     def encode_support(
-        self, support_imgs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """support_imgs: (B, K, 3, 224, 224).
+        self,
+        support_imgs: torch.Tensor,
+        support_bboxes: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """support_imgs: (B, K, 3, 224, 224); support_bboxes: optional (B, K, 4).
 
         Returns:
-            prototype: (B, PROTO_DIM)
-            attn:      (B, K, 7, 7) — softmax-normalised attention map per support
+            prototype:    (B, PROTO_DIM) from saliency-pooled features
+            attn:         (B, K, 7, 7) saliency attention map
+            teacher_desc: (B, K, PROTO_DIM) ROI-aligned descriptor — used as a
+                          training-only feature-distillation teacher. None when
+                          no bbox is provided (inference path).
         """
         b, k = support_imgs.shape[:2]
         flat = support_imgs.reshape(b * k, 3, IMG_SIZE, IMG_SIZE)
         feat = self.backbone.forward_p5_only(flat)             # (B*K, 160, 7, 7)
+
+        # Saliency path — the inference path. Always runs.
         pooled, attn = self.saliency(feat)                     # (B*K, 160), (B*K, 1, 7, 7)
         descs = self.projection(pooled).view(b, k, -1)         # (B, K, 64)
         proto = self.proto_agg(descs)                          # (B, 64)
-        return proto, attn.view(b, k, attn.shape[-2], attn.shape[-1])
+
+        # ROI Align teacher path — only when bbox is available (training).
+        teacher_desc: torch.Tensor | None = None
+        if support_bboxes is not None:
+            boxes = support_bboxes.reshape(b * k, 4).to(feat.dtype)
+            batch_idx = torch.arange(b * k, device=feat.device, dtype=feat.dtype).unsqueeze(1)
+            rois = torch.cat([batch_idx, boxes], dim=1)
+            cropped = roi_align(  # pyright: ignore[reportCallIssue]
+                feat, rois, output_size=(7, 7), spatial_scale=1.0 / P5_STRIDE, aligned=True
+            )
+            roi_pooled = F.adaptive_avg_pool2d(cropped, 1).flatten(1)  # (B*K, 160)
+            teacher_desc = self.projection(roi_pooled).view(b, k, -1)  # (B, K, 64)
+
+        return proto, attn.view(b, k, attn.shape[-2], attn.shape[-1]), teacher_desc
 
     @torch.no_grad()
     def compute_prototype(self, support_imgs: torch.Tensor) -> torch.Tensor:
@@ -308,7 +328,7 @@ class FewShotLocalizer(nn.Module):
         result and pass it to ``detect()`` per query frame to skip the
         support-branch cost on every frame.
         """
-        proto, _ = self.encode_support(support_imgs)
+        proto, _, _ = self.encode_support(support_imgs)
         return proto
 
     # ---- query branch ------------------------------------------------------
@@ -367,14 +387,18 @@ class FewShotLocalizer(nn.Module):
         self,
         support_imgs: torch.Tensor,
         query_img: torch.Tensor,
+        support_bboxes: torch.Tensor | None = None,
         prototype: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if prototype is None:
-            proto, support_attn = self.encode_support(support_imgs)
+            proto, support_attn, teacher_desc = self.encode_support(
+                support_imgs, support_bboxes
+            )
         else:
-            proto, support_attn = prototype, None
+            proto, support_attn, teacher_desc = prototype, None, None
         out = self._head(proto, self.encode_query(query_img))
-        out["support_attn"] = support_attn  # type: ignore[assignment]  # may be None at inference
+        out["support_attn"] = support_attn        # type: ignore[assignment]
+        out["teacher_desc"] = teacher_desc        # type: ignore[assignment]
         return out
 
 

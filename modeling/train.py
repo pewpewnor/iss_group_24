@@ -1,11 +1,18 @@
 """Three-stage episodic training entrypoint.
 
-Stage 1 (warmup): backbone fully frozen, heads at LR 1e-3.
-Stage 2: features[0:7] frozen, features[7:] LR 1e-5, heads LR 5e-4.
-Stage 3 (optional, --stage3): full unfreeze, all params at very low LR.
+Stage 1 (default):       backbone fully frozen, heads at LR 1e-3.
+Stage 2 (--stage2):      features[0:7] frozen, features[7:] LR 1e-5, heads LR 5e-4.
+Stage 3 (--stage3):      full unfreeze, all params at very low LR.
 
-Run from repo root:
-    python -m modeling.train --manifest dataset/cleaned/manifest.json
+Each stage is opt-in beyond stage 1. Common workflows:
+    # Stage 1 only, from scratch
+    python -m modeling.train --no-resume
+
+    # Stage 2 from a previously-trained stage 1 checkpoint
+    python -m modeling.train --resume model/stage1.pt --start-stage stage2 --stage2
+
+    # All three stages back-to-back
+    python -m modeling.train --no-resume --stage2 --stage3
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ import random as _random
 
 from modeling.dataset import EpisodeDataset, _Augment, _load_image, collate
 from modeling.evaluate import IOU_THRESHOLDS, _compute_pr_ap, _iou_xyxy
+from modeling.loss import _containment_ratio
 from modeling.loss import nt_xent_loss, total_loss, triplet_loss, vicreg_loss
 from torchvision.ops import generalized_box_iou_loss
 from modeling.model import FewShotLocalizer, decode
@@ -125,7 +133,7 @@ def build_proto_cache(
             imgs.append(t)
 
         support_imgs_t = torch.stack(imgs).unsqueeze(0).to(device)
-        proto, _ = model.encode_support(support_imgs_t)
+        proto, _, _ = model.encode_support(support_imgs_t)
         cache[instance["instance_id"]] = proto.squeeze(0).cpu()
 
     if was_training:
@@ -187,7 +195,7 @@ def validate(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
-    losses, ious, present_correct, n, n_pos = 0.0, 0.0, 0, 0, 0
+    losses, ious, contain, present_correct, n, n_pos = 0.0, 0.0, 0.0, 0, 0, 0
     all_scores: list[float] = []
     all_ious: list[float] = []
     all_present: list[bool] = []
@@ -198,7 +206,7 @@ def validate(
         gt_bbox = batch["query_bbox"].to(device)
         is_present = batch["is_present"].to(device)
 
-        out = model(support_imgs, query_img)
+        out = model(support_imgs, query_img, support_bboxes=support_bboxes)
         loss_dict = total_loss(out, gt_bbox, is_present, support_bboxes=support_bboxes)
         losses += loss_dict["loss"].item() * gt_bbox.shape[0]
 
@@ -218,6 +226,8 @@ def validate(
         if pos.any():
             giou_vals = 1.0 - generalized_box_iou_loss(pred_box[pos], gt_bbox[pos], reduction="none")
             ious += giou_vals.clamp(min=0).sum().item()
+            contain_vals = _containment_ratio(pred_box[pos], gt_bbox[pos])
+            contain += contain_vals.clamp(min=0, max=1).sum().item()
             n_pos += int(pos.sum().item())
         n += gt_bbox.shape[0]
 
@@ -229,12 +239,16 @@ def validate(
         )
         for tau in IOU_THRESHOLDS
     ]
+    # IOU_THRESHOLDS[0] is 0.5 → ap_vals[0] is mAP@0.5
+    val_map_50 = ap_vals[0] if ap_vals else 0.0
     val_map = sum(ap_vals) / len(ap_vals) if ap_vals else 0.0
 
     model.train()
     return {
         "val_loss": losses / max(n, 1),
         "val_iou": ious / max(n_pos, 1),
+        "val_contain": contain / max(n_pos, 1),
+        "val_map_50": val_map_50,
         "val_map": val_map,
         "val_presence_acc": present_correct / max(n, 1),
     }
@@ -307,7 +321,7 @@ def train_stage(
         model.backbone.eval()
 
         t0 = time.time()
-        running = {"loss": 0.0, "focal": 0.0, "box": 0.0, "presence": 0.0, "attn": 0.0, "nt_xent": 0.0, "vicreg": 0.0, "triplet": 0.0}
+        running = {"loss": 0.0, "focal": 0.0, "box": 0.0, "presence": 0.0, "attn": 0.0, "distill": 0.0, "nt_xent": 0.0, "vicreg": 0.0, "triplet": 0.0}
         for batch in train_loader:
             support_imgs = batch["support_imgs"].to(device)
             support_bboxes = batch["support_bboxes"].to(device)
@@ -315,7 +329,7 @@ def train_stage(
             gt_bbox = batch["query_bbox"].to(device)
             is_present = batch["is_present"].to(device)
 
-            out = model(support_imgs, query_img)
+            out = model(support_imgs, query_img, support_bboxes=support_bboxes)
             losses = total_loss(out, gt_bbox, is_present, support_bboxes=support_bboxes)
             loss = losses["loss"]
 
@@ -346,6 +360,7 @@ def train_stage(
             running["box"] += float(losses["box"])
             running["presence"] += float(losses.get("presence", 0.0))
             running["attn"] += float(losses.get("attn", 0.0))
+            running["distill"] += float(losses.get("distill", 0.0))
             running["nt_xent"] += nt_val
             running["vicreg"] += vr_val
             running["triplet"] += trip_val
@@ -362,9 +377,11 @@ def train_stage(
         print(
             f"[{stage_name}] epoch {epoch}/{epochs} "
             f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f} "
-            f"presence={avg['presence']:.4f} attn={avg['attn']:.4f}{reg_str}) "
+            f"presence={avg['presence']:.4f} attn={avg['attn']:.4f} distill={avg['distill']:.4f}{reg_str}) "
             f"val_loss={metrics['val_loss']:.4f} "
             f"val_iou={metrics['val_iou']:.4f} "
+            f"val_contain={metrics['val_contain']:.4f} "
+            f"val_map50={metrics['val_map_50']:.4f} "
             f"val_map={metrics['val_map']:.4f} "
             f"val_presence={metrics['val_presence_acc']:.4f} "
             f"time={elapsed:.1f}s"
@@ -378,11 +395,14 @@ def train_stage(
             "box": avg["box"],
             "presence": avg["presence"],
             "attn": avg["attn"],
+            "distill": avg["distill"],
             "nt_xent": avg["nt_xent"],
             "vicreg": avg["vicreg"],
             "triplet": avg["triplet"],
             "val_loss": metrics["val_loss"],
             "val_iou": metrics["val_iou"],
+            "val_contain": metrics["val_contain"],
+            "val_map_50": metrics["val_map_50"],
             "val_map": metrics["val_map"],
             "val_presence_acc": metrics["val_presence_acc"],
         })
@@ -393,6 +413,8 @@ def train_stage(
                 {
                     "model": model.state_dict(),
                     "val_iou": best_val_iou,
+                    "val_contain": metrics["val_contain"],
+                    "val_map_50": metrics["val_map_50"],
                     "val_map": metrics["val_map"],
                     "stage": stage_name,
                     "epoch": epoch,
@@ -419,6 +441,8 @@ def train_stage(
                 "stage": stage_name,
                 "epoch": last_metrics["epoch"],
                 "val_iou": last_metrics["val_iou"],
+                "val_contain": last_metrics["val_contain"],
+                "val_map_50": last_metrics["val_map_50"],
                 "val_map": last_metrics["val_map"],
             },
             stage_path,
@@ -444,9 +468,10 @@ def train(
     val_episodes: int = 500,
     batch_size: int = 16,
     num_workers: int = 4,
-    stage1_epochs: int = 12,
-    stage2_epochs: int = 40,
+    stage1_epochs: int = 10,
+    stage2_epochs: int = 30,
     stage3_epochs: int = 10,
+    stage2: bool = False,
     stage3: bool = False,
     contrastive: bool = True,
     contrastive_weight_s1: float = 0.1,   # user: bump from 0.1 → 0.2 once backbone unfreezes
@@ -457,6 +482,7 @@ def train(
     triplet: bool = False,
     triplet_weight: float = 0.05,
     hard_neg_mining: bool = True,
+    start_stage: str | None = None,
     seed: int = 42,
     device: str | None = None,
     pretrained: bool = True,
@@ -516,6 +542,9 @@ def train(
         split=val_split,
         data_root=str(data_root) if data_root else None,
         episodes_per_epoch=val_episodes,
+        # Fixed 30% negatives in val so val_presence and val_map are meaningful
+        # and stable across runs (independent of the train neg_prob schedule).
+        neg_prob=0.3,
         train=False,
         seed=seed,
     )
@@ -597,6 +626,15 @@ def train(
 
     def _resume_for(stage_name: str, configured_epochs: int):
         """Return (skip, start_epoch, opt_state, sched_state) for a stage."""
+        # Force-skip any stage earlier than start_stage (e.g. start fresh stage 2
+        # using stage 1 weights from a previous run, without re-training stage 1).
+        if (
+            start_stage is not None
+            and start_stage in STAGE_ORDER
+            and stage_name in STAGE_ORDER
+            and STAGE_ORDER.index(stage_name) < STAGE_ORDER.index(start_stage)
+        ):
+            return True, 1, None, None
         if not resume_state:
             return False, 1, None, None
         saved_stage = resume_state.get("stage")
@@ -652,7 +690,7 @@ def train(
             )
             full_history.extend(hist)
 
-    if stage2_epochs > 0:
+    if stage2 and stage2_epochs > 0:
         skip, start_epoch, opt_state, sched_state = _resume_for("stage2", stage2_epochs)
         stage_configs_for_lr.append({
             "name": "stage2",
@@ -809,9 +847,20 @@ def main() -> None:
     p.add_argument("--val-episodes", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--stage1-epochs", type=int, default=8)
-    p.add_argument("--stage2-epochs", type=int, default=20)
+    p.add_argument("--stage1-epochs", type=int, default=10)
+    p.add_argument("--stage2-epochs", type=int, default=30)
     p.add_argument("--stage3-epochs", type=int, default=10)
+    p.add_argument(
+        "--start-stage",
+        choices=["stage1", "stage2", "stage3"],
+        default=None,
+        help=(
+            "skip earlier stages and start fresh from this one. "
+            "Pair with --resume model/stage1.pt to continue a prior run "
+            "into stage 2 with new optimizer/scheduler state."
+        ),
+    )
+    p.add_argument("--stage2", action="store_true", help="run optional Stage 2 partial unfreeze")
     p.add_argument("--stage3", action="store_true", help="run optional Stage 3 full unfreeze")
     p.add_argument("--no-contrastive", action="store_true", help="disable NT-Xent prototype loss")
     p.add_argument("--contrastive-weight-s1", type=float, default=0.1)
@@ -844,6 +893,7 @@ def main() -> None:
         stage1_epochs=args.stage1_epochs,
         stage2_epochs=args.stage2_epochs,
         stage3_epochs=args.stage3_epochs,
+        stage2=args.stage2,
         stage3=args.stage3,
         contrastive=not args.no_contrastive,
         contrastive_weight_s1=args.contrastive_weight_s1,
@@ -852,6 +902,7 @@ def main() -> None:
         vicreg=not args.no_vicreg,
         vicreg_weight=args.vicreg_weight,
         hard_neg_mining=not args.no_hard_neg,
+        start_stage=args.start_stage,
         seed=args.seed,
         device=args.device,
         pretrained=not args.no_pretrained,

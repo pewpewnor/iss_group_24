@@ -389,7 +389,9 @@ class EpisodeDataset(Dataset):
 
         self.negatives: list[str] = self.manifest.get("negative_backgrounds", [])
         self.n_support = n_support
-        self.neg_prob = neg_prob if train else 0.0
+        # Use neg_prob as given for both train and val. Forcing val to 0 made
+        # val_presence/val_map meaningless (model trivially says "present" → 100%).
+        self.neg_prob = neg_prob
         self.hard_neg_ratio = hard_neg_ratio
         self.episodes_per_epoch = episodes_per_epoch
         self.train = train
