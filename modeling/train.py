@@ -132,6 +132,46 @@ def build_proto_cache(
 
 
 # ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+
+STAGE_ORDER: tuple[str, ...] = ("stage1", "stage2", "stage3")
+
+
+def _make_full_ckpt(
+    model: FewShotLocalizer,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    stage_name: str,
+    epoch: int,
+    stage_epochs: int,
+    best_val_iou: float,
+    full_history: list[dict],
+) -> dict:
+    """Bundle everything needed to resume training mid-stage."""
+    return {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "stage": stage_name,
+        "epoch": epoch,
+        "stage_epochs": stage_epochs,
+        "best_val_iou": best_val_iou,
+        "full_history": full_history,
+        "rng": {
+            "torch": torch.get_rng_state(),
+            "torch_cuda": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            ),
+            "python": _random.getstate(),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Loops
 # ---------------------------------------------------------------------------
 
@@ -190,12 +230,20 @@ def train_stage(
     vicreg: bool = True,
     vicreg_weight: float = 0.05,
     hard_neg_mining: bool = True,
+    start_epoch: int = 1,
+    scheduler_state: dict | None = None,
+    prior_history: list[dict] | None = None,
 ) -> tuple[float, list[dict]]:
     """Train for ``epochs`` epochs and return ``(best_val_iou, epoch_history)``.
 
     ``epoch_history`` is a list of per-epoch metric dicts with keys:
     stage, epoch, loss, focal, box, nt_xent, vicreg, val_loss, val_iou,
     val_presence_acc.
+
+    For resumption: ``start_epoch`` skips already-completed epochs in this
+    stage, ``scheduler_state`` restores the cosine schedule's step counter,
+    and ``prior_history`` is the across-stage history from before this stage
+    so checkpoints can persist the full plotting record.
     """
     # Cosine LR decay over all steps in this stage — smoother than step decay,
     # prevents oscillation at the end of long stages.
@@ -203,10 +251,13 @@ def train_stage(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1), eta_min=1e-7
     )
+    if scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
 
+    prior = list(prior_history) if prior_history else []
     epoch_history: list[dict] = []
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         # Build prototype cache for hard-negative mining at the start of each epoch.
         if hard_neg_mining and hasattr(train_loader.dataset, "hard_neg_cache"):
             train_loader.dataset.hard_neg_cache = build_proto_cache(
@@ -288,19 +339,25 @@ def train_stage(
 
         if metrics["val_iou"] > best_val_iou:
             best_val_iou = metrics["val_iou"]
-            ckpt = {
-                "model": model.state_dict(),
-                "val_iou": best_val_iou,
-                "stage": stage_name,
-                "epoch": epoch,
-            }
-            torch.save(ckpt, out_dir / "best.pt")
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "val_iou": best_val_iou,
+                    "stage": stage_name,
+                    "epoch": epoch,
+                },
+                out_dir / "best.pt",
+            )
             print(f"  saved best.pt (val_iou={best_val_iou:.4f})")
 
         torch.save(
-            {"model": model.state_dict(), "stage": stage_name, "epoch": epoch},
+            _make_full_ckpt(
+                model, optimizer, scheduler, stage_name, epoch, epochs,
+                best_val_iou, prior + epoch_history,
+            ),
             out_dir / "last.pt",
         )
+        print(f"  saved last.pt ({stage_name} epoch {epoch}/{epochs})")
 
     return best_val_iou, epoch_history
 
@@ -316,7 +373,7 @@ def train(
     val_split: str = "val",
     data_root: str | Path | None = None,
     out_dir: str | Path = "model",
-    resume: str | Path | None = None,
+    resume: str | Path | bool | None = True,
     episodes_per_epoch: int = 2000,
     val_episodes: int = 500,
     batch_size: int = 16,
@@ -352,7 +409,9 @@ def train(
         "val_split": val_split,
         "data_root": str(data_root) if data_root else None,
         "out_dir": str(out_dir),
-        "resume": str(resume) if resume else None,
+        "resume": (
+            str(resume) if isinstance(resume, (str, Path)) else bool(resume)
+        ),
         "episodes_per_epoch": episodes_per_epoch,
         "val_episodes": val_episodes,
         "batch_size": batch_size,
@@ -412,10 +471,45 @@ def train(
 
     model = FewShotLocalizer(pretrained=pretrained).to(device_t)
 
-    if resume:
-        state = torch.load(str(resume), map_location=device_t)
-        model.load_state_dict(state["model"] if "model" in state else state)
-        print(f"resumed from {resume}")
+    resume_path: Path | None = None
+    if isinstance(resume, (str, Path)):
+        candidate = Path(resume)
+        if candidate.exists():
+            resume_path = candidate
+        else:
+            print(f"warn: resume path {candidate} not found — starting fresh")
+    elif resume is True:
+        candidate = out_dir / "last.pt"
+        if candidate.exists():
+            resume_path = candidate
+            print(f"auto-resuming from {resume_path}")
+        else:
+            print(f"no checkpoint at {candidate} — starting fresh")
+
+    resume_state: dict | None = None
+    if resume_path is not None:
+        loaded = torch.load(
+            str(resume_path), map_location=device_t, weights_only=False
+        )
+        resume_state = dict(loaded) if not isinstance(loaded, dict) else loaded
+        model.load_state_dict(
+            resume_state["model"] if "model" in resume_state else resume_state
+        )
+        print(
+            f"resumed from {resume_path} "
+            f"(stage={resume_state.get('stage')}, epoch={resume_state.get('epoch')})"
+        )
+        rng = resume_state.get("rng") or {}
+        if rng.get("torch") is not None:
+            torch.set_rng_state(rng["torch"].cpu().to(torch.uint8))
+        if rng.get("torch_cuda") is not None and torch.cuda.is_available():
+            try:
+                cuda_states = [s.cpu().to(torch.uint8) for s in rng["torch_cuda"]]
+                torch.cuda.set_rng_state_all(cuda_states)
+            except Exception as e:
+                print(f"  warn: failed to restore cuda rng: {e}")
+        if rng.get("python") is not None:
+            _random.setstate(rng["python"])
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
@@ -424,35 +518,68 @@ def train(
 
     steps_per_epoch = max(episodes_per_epoch // batch_size, 1)
 
-    best = 0.0
-    full_history: list[dict] = []
+    best = (
+        float(resume_state.get("best_val_iou", 0.0)) if resume_state else 0.0
+    )
+    full_history: list[dict] = (
+        list(resume_state.get("full_history", [])) if resume_state else []
+    )
 
     stage_configs_for_lr: list[dict] = []
 
+    def _resume_for(stage_name: str, configured_epochs: int):
+        """Return (skip, start_epoch, opt_state, sched_state) for a stage."""
+        if not resume_state:
+            return False, 1, None, None
+        saved_stage = resume_state.get("stage")
+        saved_epoch = int(resume_state.get("epoch", 0))
+        if saved_stage == stage_name:
+            if saved_epoch >= configured_epochs:
+                return True, 1, None, None
+            return (
+                False,
+                saved_epoch + 1,
+                resume_state.get("optimizer"),
+                resume_state.get("scheduler"),
+            )
+        if saved_stage in STAGE_ORDER and stage_name in STAGE_ORDER:
+            if STAGE_ORDER.index(saved_stage) > STAGE_ORDER.index(stage_name):
+                return True, 1, None, None
+        return False, 1, None, None
+
     if stage1_epochs > 0:
-        print("=== Stage 1: warmup (backbone frozen) ===")
-        opt = stage1_optimizer(model)
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage1", stage1_epochs)
         stage_configs_for_lr.append({
             "name": "stage1",
             "epochs": stage1_epochs,
             "steps_per_epoch": steps_per_epoch,
             "param_groups": [{"label": "heads", "lr": 1e-3}],
         })
-        best, hist = train_stage(
-            model, opt, train_loader, val_loader, device_t,
-            stage1_epochs, "stage1", out_dir, best,
-            contrastive=contrastive,
-            contrastive_weight=contrastive_weight_s1,
-            contrastive_temp=contrastive_temp,
-            vicreg=vicreg,
-            vicreg_weight=vicreg_weight,
-            hard_neg_mining=hard_neg_mining,
-        )
-        full_history.extend(hist)
+        if skip:
+            print("=== Stage 1: skipped (already complete in checkpoint) ===")
+        else:
+            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+            print(f"=== Stage 1: warmup (backbone frozen){resume_str} ===")
+            opt = stage1_optimizer(model)
+            if opt_state is not None:
+                opt.load_state_dict(opt_state)
+            best, hist = train_stage(
+                model, opt, train_loader, val_loader, device_t,
+                stage1_epochs, "stage1", out_dir, best,
+                contrastive=contrastive,
+                contrastive_weight=contrastive_weight_s1,
+                contrastive_temp=contrastive_temp,
+                vicreg=vicreg,
+                vicreg_weight=vicreg_weight,
+                hard_neg_mining=hard_neg_mining,
+                start_epoch=start_epoch,
+                scheduler_state=sched_state,
+                prior_history=full_history,
+            )
+            full_history.extend(hist)
 
     if stage2_epochs > 0:
-        print("=== Stage 2: partial unfreeze (features[7:] @ 1e-5) ===")
-        opt = stage2_optimizer(model)
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage2", stage2_epochs)
         stage_configs_for_lr.append({
             "name": "stage2",
             "epochs": stage2_epochs,
@@ -462,21 +589,31 @@ def train(
                 {"label": "heads", "lr": 5e-4},
             ],
         })
-        best, hist = train_stage(
-            model, opt, train_loader, val_loader, device_t,
-            stage2_epochs, "stage2", out_dir, best,
-            contrastive=contrastive,
-            contrastive_weight=contrastive_weight_s2,
-            contrastive_temp=contrastive_temp,
-            vicreg=vicreg,
-            vicreg_weight=vicreg_weight,
-            hard_neg_mining=hard_neg_mining,
-        )
-        full_history.extend(hist)
+        if skip:
+            print("=== Stage 2: skipped (already complete in checkpoint) ===")
+        else:
+            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+            print(f"=== Stage 2: partial unfreeze (features[7:] @ 1e-5){resume_str} ===")
+            opt = stage2_optimizer(model)
+            if opt_state is not None:
+                opt.load_state_dict(opt_state)
+            best, hist = train_stage(
+                model, opt, train_loader, val_loader, device_t,
+                stage2_epochs, "stage2", out_dir, best,
+                contrastive=contrastive,
+                contrastive_weight=contrastive_weight_s2,
+                contrastive_temp=contrastive_temp,
+                vicreg=vicreg,
+                vicreg_weight=vicreg_weight,
+                hard_neg_mining=hard_neg_mining,
+                start_epoch=start_epoch,
+                scheduler_state=sched_state,
+                prior_history=full_history,
+            )
+            full_history.extend(hist)
 
     if stage3 and stage3_epochs > 0:
-        print("=== Stage 3: full unfreeze (all backbone @ 5e-6) ===")
-        opt = stage3_optimizer(model)
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage3", stage3_epochs)
         stage_configs_for_lr.append({
             "name": "stage3",
             "epochs": stage3_epochs,
@@ -487,17 +624,28 @@ def train(
                 {"label": "heads", "lr": 1e-4},
             ],
         })
-        best, hist = train_stage(
-            model, opt, train_loader, val_loader, device_t,
-            stage3_epochs, "stage3", out_dir, best,
-            contrastive=contrastive,
-            contrastive_weight=contrastive_weight_s2,
-            contrastive_temp=contrastive_temp,
-            vicreg=vicreg,
-            vicreg_weight=vicreg_weight,
-            hard_neg_mining=hard_neg_mining,
-        )
-        full_history.extend(hist)
+        if skip:
+            print("=== Stage 3: skipped (already complete in checkpoint) ===")
+        else:
+            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+            print(f"=== Stage 3: full unfreeze (all backbone @ 5e-6){resume_str} ===")
+            opt = stage3_optimizer(model)
+            if opt_state is not None:
+                opt.load_state_dict(opt_state)
+            best, hist = train_stage(
+                model, opt, train_loader, val_loader, device_t,
+                stage3_epochs, "stage3", out_dir, best,
+                contrastive=contrastive,
+                contrastive_weight=contrastive_weight_s2,
+                contrastive_temp=contrastive_temp,
+                vicreg=vicreg,
+                vicreg_weight=vicreg_weight,
+                hard_neg_mining=hard_neg_mining,
+                start_epoch=start_epoch,
+                scheduler_state=sched_state,
+                prior_history=full_history,
+            )
+            full_history.extend(hist)
 
     print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")
 
@@ -563,7 +711,16 @@ def main() -> None:
         help="directory image paths are relative to (default: manifest parent dir)",
     )
     p.add_argument("--out-dir", default="model")
-    p.add_argument("--resume", default=None, help="checkpoint path to resume from")
+    p.add_argument(
+        "--resume",
+        default=None,
+        help="explicit checkpoint path; default auto-detects <out-dir>/last.pt",
+    )
+    p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="disable auto-resume — train from scratch",
+    )
     p.add_argument("--episodes-per-epoch", type=int, default=1000)
     p.add_argument("--val-episodes", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=8)
@@ -584,13 +741,18 @@ def main() -> None:
     p.add_argument("--no-pretrained", action="store_true")
     args = p.parse_args()
 
+    if args.no_resume:
+        resume_arg: str | bool = False
+    else:
+        resume_arg = args.resume if args.resume else True
+
     train(
         manifest=args.manifest,
         train_split=args.train_split,
         val_split=args.val_split,
         data_root=args.data_root,
         out_dir=args.out_dir,
-        resume=args.resume,
+        resume=resume_arg,
         episodes_per_epoch=args.episodes_per_epoch,
         val_episodes=args.val_episodes,
         batch_size=args.batch_size,

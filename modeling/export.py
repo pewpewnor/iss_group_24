@@ -54,7 +54,7 @@ def export(checkpoint: str | Path, out: str | Path, quantize: bool = True) -> No
     out.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"loading checkpoint: {checkpoint}")
-    state = torch.load(checkpoint, map_location="cpu")
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     base_model = FewShotLocalizer(pretrained=False)
     base_model.load_state_dict(state["model"] if "model" in state else state)
     base_model.eval()

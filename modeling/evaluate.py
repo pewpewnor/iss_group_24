@@ -138,7 +138,7 @@ def run(
 
     device_t = torch.device(device)
     model = FewShotLocalizer(pretrained=False).to(device_t)
-    state = torch.load(str(checkpoint), map_location=device_t)
+    state = torch.load(str(checkpoint), map_location=device_t, weights_only=False)
     model.load_state_dict(state["model"] if "model" in state else state)
 
     ds = EpisodeDataset(

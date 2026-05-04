@@ -3,5 +3,4 @@ dataset/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-model/*.pt
-model/eval_report.json
+model/
