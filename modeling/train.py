@@ -22,7 +22,8 @@ import random as _random
 
 from modeling.dataset import EpisodeDataset, _Augment, _load_image, collate
 from modeling.evaluate import IOU_THRESHOLDS, _compute_pr_ap, _iou_xyxy
-from modeling.loss import giou, nt_xent_loss, total_loss, vicreg_loss
+from modeling.loss import nt_xent_loss, total_loss, triplet_loss, vicreg_loss
+from torchvision.ops import generalized_box_iou_loss
 from modeling.model import FewShotLocalizer, decode
 
 
@@ -34,8 +35,12 @@ from modeling.model import FewShotLocalizer, decode
 def _heads(model: FewShotLocalizer) -> list:
     return (
         list(model.projection.parameters())
+        + list(model.proto_agg.parameters())
         + list(model.fpn.parameters())
+        + list(model.p3_lat.parameters())
+        + list(model.gate.parameters())
         + list(model.det_head.parameters())
+        + list(model.presence_head.parameters())
     )
 
 
@@ -113,16 +118,14 @@ def build_proto_cache(
         k = dataset.n_support
         samples = [rng.choice(pool) for _ in range(k)] if len(pool) < k else rng.sample(pool, k)
 
-        imgs, bboxes = [], []
+        imgs = []
         for s in samples:
             img = _load_image(dataset._resolve(s["path"]))
-            t, bb = aug(img, list(s["bbox"]), rng)
+            t, _ = aug(img, list(s["bbox"]), rng)
             imgs.append(t)
-            bboxes.append(bb)
 
         support_imgs_t = torch.stack(imgs).unsqueeze(0).to(device)
-        support_bboxes_t = torch.stack(bboxes).unsqueeze(0).to(device)
-        proto = model.encode_support(support_imgs_t, support_bboxes_t)
+        proto, _ = model.encode_support(support_imgs_t)
         cache[instance["instance_id"]] = proto.squeeze(0).cpu()
 
     if was_training:
@@ -195,11 +198,11 @@ def validate(
         gt_bbox = batch["query_bbox"].to(device)
         is_present = batch["is_present"].to(device)
 
-        out = model(support_imgs, support_bboxes, query_img)
-        loss_dict = total_loss(out, gt_bbox, is_present)
+        out = model(support_imgs, query_img)
+        loss_dict = total_loss(out, gt_bbox, is_present, support_bboxes=support_bboxes)
         losses += loss_dict["loss"].item() * gt_bbox.shape[0]
 
-        pred_box, pred_score = decode(out["reg"], out["conf"])
+        pred_box, pred_score = decode(out["reg"], out["conf"], presence_logit=out.get("presence_logit"))
         pred_present = pred_score > 0.5
         present_correct += (pred_present == is_present).sum().item()
 
@@ -213,8 +216,8 @@ def validate(
 
         pos = is_present
         if pos.any():
-            ious_b = giou(pred_box[pos], gt_bbox[pos])
-            ious += ious_b.clamp(min=0).sum().item()
+            giou_vals = 1.0 - generalized_box_iou_loss(pred_box[pos], gt_bbox[pos], reduction="none")
+            ious += giou_vals.clamp(min=0).sum().item()
             n_pos += int(pos.sum().item())
         n += gt_bbox.shape[0]
 
@@ -253,7 +256,10 @@ def train_stage(
     contrastive_temp: float = 0.1,
     vicreg: bool = True,
     vicreg_weight: float = 0.05,
+    triplet: bool = False,
+    triplet_weight: float = 0.05,
     hard_neg_mining: bool = True,
+    neg_prob_schedule: dict[int, float] | None = None,
     start_epoch: int = 1,
     scheduler_state: dict | None = None,
     prior_history: list[dict] | None = None,
@@ -282,9 +288,16 @@ def train_stage(
     epoch_history: list[dict] = []
 
     for epoch in range(start_epoch, epochs + 1):
+        # Apply neg_prob schedule (epoch -> prob; latest applicable wins).
+        if neg_prob_schedule and hasattr(train_loader.dataset, "set_neg_prob"):
+            applicable = [(e, p) for e, p in neg_prob_schedule.items() if e <= epoch]
+            if applicable:
+                _, prob = max(applicable)
+                train_loader.dataset.set_neg_prob(prob)  # type: ignore[attr-defined]
+
         # Build prototype cache for hard-negative mining at the start of each epoch.
         if hard_neg_mining and hasattr(train_loader.dataset, "hard_neg_cache"):
-            train_loader.dataset.hard_neg_cache = build_proto_cache(
+            train_loader.dataset.hard_neg_cache = build_proto_cache(  # type: ignore[attr-defined]
                 model, train_loader.dataset, device  # type: ignore[arg-type]
             )
 
@@ -294,7 +307,7 @@ def train_stage(
         model.backbone.eval()
 
         t0 = time.time()
-        running = {"loss": 0.0, "focal": 0.0, "box": 0.0, "nt_xent": 0.0, "vicreg": 0.0}
+        running = {"loss": 0.0, "focal": 0.0, "box": 0.0, "presence": 0.0, "attn": 0.0, "nt_xent": 0.0, "vicreg": 0.0, "triplet": 0.0}
         for batch in train_loader:
             support_imgs = batch["support_imgs"].to(device)
             support_bboxes = batch["support_bboxes"].to(device)
@@ -302,11 +315,11 @@ def train_stage(
             gt_bbox = batch["query_bbox"].to(device)
             is_present = batch["is_present"].to(device)
 
-            out = model(support_imgs, support_bboxes, query_img)
-            losses = total_loss(out, gt_bbox, is_present)
+            out = model(support_imgs, query_img)
+            losses = total_loss(out, gt_bbox, is_present, support_bboxes=support_bboxes)
             loss = losses["loss"]
 
-            nt_val, vr_val = 0.0, 0.0
+            nt_val, vr_val, trip_val = 0.0, 0.0, 0.0
             if contrastive:
                 nt = nt_xent_loss(out["prototype"], temperature=contrastive_temp)
                 loss = loss + contrastive_weight * nt
@@ -315,6 +328,10 @@ def train_stage(
                 vr = vicreg_loss(out["prototype"])
                 loss = loss + vicreg_weight * vr
                 vr_val = vr.detach().item()
+            if triplet:
+                trip = triplet_loss(out["prototype"], list(batch["instance_id"]))
+                loss = loss + triplet_weight * trip
+                trip_val = trip.detach().item()
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -327,21 +344,25 @@ def train_stage(
             running["loss"] += loss.item()
             running["focal"] += float(losses["focal"])
             running["box"] += float(losses["box"])
+            running["presence"] += float(losses.get("presence", 0.0))
+            running["attn"] += float(losses.get("attn", 0.0))
             running["nt_xent"] += nt_val
             running["vicreg"] += vr_val
+            running["triplet"] += trip_val
 
         n = len(train_loader)
         avg = {k: v / max(n, 1) for k, v in running.items()}
         metrics = validate(model, val_loader, device)
         elapsed = time.time() - t0
-        reg_str = (
-            f" nt_xent={avg['nt_xent']:.4f} vicreg={avg['vicreg']:.4f}"
-            if (contrastive or vicreg)
-            else ""
-        )
+        reg_str = ""
+        if contrastive or vicreg:
+            reg_str += f" nt_xent={avg['nt_xent']:.4f} vicreg={avg['vicreg']:.4f}"
+        if triplet:
+            reg_str += f" triplet={avg['triplet']:.4f}"
         print(
             f"[{stage_name}] epoch {epoch}/{epochs} "
-            f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f}{reg_str}) "
+            f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f} "
+            f"presence={avg['presence']:.4f} attn={avg['attn']:.4f}{reg_str}) "
             f"val_loss={metrics['val_loss']:.4f} "
             f"val_iou={metrics['val_iou']:.4f} "
             f"val_map={metrics['val_map']:.4f} "
@@ -355,8 +376,11 @@ def train_stage(
             "loss": avg["loss"],
             "focal": avg["focal"],
             "box": avg["box"],
+            "presence": avg["presence"],
+            "attn": avg["attn"],
             "nt_xent": avg["nt_xent"],
             "vicreg": avg["vicreg"],
+            "triplet": avg["triplet"],
             "val_loss": metrics["val_loss"],
             "val_iou": metrics["val_iou"],
             "val_map": metrics["val_map"],
@@ -430,6 +454,8 @@ def train(
     contrastive_temp: float = 0.1,
     vicreg: bool = True,
     vicreg_weight: float = 0.05,
+    triplet: bool = False,
+    triplet_weight: float = 0.05,
     hard_neg_mining: bool = True,
     seed: int = 42,
     device: str | None = None,
@@ -602,6 +628,9 @@ def train(
         else:
             resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
             print(f"=== Stage 1: warmup (backbone frozen){resume_str} ===")
+            # Stage 1: ramp neg_prob 0 -> 0.15 over the warmup. The model needs to
+            # first learn what objects look like before learning to reject distractors.
+            train_ds.set_hard_neg_ratio(0.25)
             opt = stage1_optimizer(model)
             if opt_state is not None:
                 opt.load_state_dict(opt_state)
@@ -613,7 +642,10 @@ def train(
                 contrastive_temp=contrastive_temp,
                 vicreg=vicreg,
                 vicreg_weight=vicreg_weight,
+                triplet=triplet,
+                triplet_weight=triplet_weight,
                 hard_neg_mining=hard_neg_mining,
+                neg_prob_schedule={1: 0.0, 3: 0.15},
                 start_epoch=start_epoch,
                 scheduler_state=sched_state,
                 prior_history=full_history,
@@ -636,6 +668,9 @@ def train(
         else:
             resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
             print(f"=== Stage 2: partial unfreeze (features[7:] @ 1e-5){resume_str} ===")
+            # Stage 2: full negatives + boosted hard-negative ratio. Prototype
+            # space is now meaningful, so hard negatives carry useful signal.
+            train_ds.set_hard_neg_ratio(0.5)
             opt = stage2_optimizer(model)
             if opt_state is not None:
                 opt.load_state_dict(opt_state)
@@ -647,7 +682,10 @@ def train(
                 contrastive_temp=contrastive_temp,
                 vicreg=vicreg,
                 vicreg_weight=vicreg_weight,
+                triplet=triplet,
+                triplet_weight=triplet_weight,
                 hard_neg_mining=hard_neg_mining,
+                neg_prob_schedule={1: 0.3},
                 start_epoch=start_epoch,
                 scheduler_state=sched_state,
                 prior_history=full_history,
@@ -671,6 +709,7 @@ def train(
         else:
             resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
             print(f"=== Stage 3: full unfreeze (all backbone @ 5e-6){resume_str} ===")
+            train_ds.set_hard_neg_ratio(0.5)
             opt = stage3_optimizer(model)
             if opt_state is not None:
                 opt.load_state_dict(opt_state)
@@ -682,7 +721,10 @@ def train(
                 contrastive_temp=contrastive_temp,
                 vicreg=vicreg,
                 vicreg_weight=vicreg_weight,
+                triplet=triplet,
+                triplet_weight=triplet_weight,
                 hard_neg_mining=hard_neg_mining,
+                neg_prob_schedule={1: 0.3},
                 start_epoch=start_epoch,
                 scheduler_state=sched_state,
                 prior_history=full_history,

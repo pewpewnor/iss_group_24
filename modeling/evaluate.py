@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from modeling.dataset import EpisodeDataset, collate
-from modeling.loss import giou  # noqa: F401
+from modeling.loss import _iou_xyxy
 from modeling.model import FewShotLocalizer, decode
 
 
@@ -68,17 +68,6 @@ def _compute_pr_ap(scores: list[float], is_tp: list[bool], n_gt: int) -> float:
     return ap_sum / 101.0
 
 
-def _iou_xyxy(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Plain IoU (not GIoU) for evaluation. Element-wise on matched (..., 4) boxes."""
-    inter_x1 = torch.maximum(a[..., 0], b[..., 0])
-    inter_y1 = torch.maximum(a[..., 1], b[..., 1])
-    inter_x2 = torch.minimum(a[..., 2], b[..., 2])
-    inter_y2 = torch.minimum(a[..., 3], b[..., 3])
-    inter = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
-    area_a = (a[..., 2] - a[..., 0]).clamp(min=0) * (a[..., 3] - a[..., 1]).clamp(min=0)
-    area_b = (b[..., 2] - b[..., 0]).clamp(min=0) * (b[..., 3] - b[..., 1]).clamp(min=0)
-    return inter / (area_a + area_b - inter + 1e-6)
-
 
 @torch.no_grad()
 def evaluate(
@@ -96,14 +85,13 @@ def evaluate(
 
     for batch in loader:
         support_imgs = batch["support_imgs"].to(device)
-        support_bboxes = batch["support_bboxes"].to(device)
         query_img = batch["query_img"].to(device)
         gt_bbox = batch["query_bbox"].to(device)
         is_present = batch["is_present"].to(device)
         ids = batch["instance_id"]
 
-        out = model(support_imgs, support_bboxes, query_img)
-        pred_box, pred_score = decode(out["reg"], out["conf"])
+        out = model(support_imgs, query_img)
+        pred_box, pred_score = decode(out["reg"], out["conf"], presence_logit=out.get("presence_logit"))
 
         ious = _iou_xyxy(pred_box, gt_bbox)
         for i in range(gt_bbox.shape[0]):

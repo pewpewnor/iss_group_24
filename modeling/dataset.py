@@ -14,10 +14,11 @@ For NEG_PROB of training episodes the query is drawn from a different instance
 Augmentation pipeline (training only)
 --------------------------------------
 Support images:
-  resize → scale-jitter crop → hflip → color jitter → grayscale → blur → (tensor) → erase
+  resize → multi-scale crop (0.4–1.0) → hflip → color jitter → grayscale → blur
+  → (tensor) → erase → bbox jitter
 
 Query images:
-  resize → hflip → perspective → color jitter → grayscale
+  resize → copy-paste distractor (p=0.4) → hflip → perspective → color jitter → grayscale
 """
 
 from __future__ import annotations
@@ -38,6 +39,10 @@ IMG_SIZE = 224
 N_SUPPORT = 5
 NEG_PROB = 0.3
 NORMALIZE = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+# Multi-scale crop: randomly select one of these as the minimum crop fraction.
+# Smaller values (0.4) zoom in, training the model on objects at larger apparent scale.
+SUPPORT_CROP_SCALES = (0.4, 0.6, 0.8, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +90,8 @@ def _scale_jitter_crop_with_bbox(
         scale = rng.uniform(min_crop, 1.0)
         cw = int(w * scale)
         ch = int(h * scale)
-        x0 = rng.randint(0, w - cw)
-        y0 = rng.randint(0, h - ch)
+        x0 = rng.randint(0, max(w - cw, 0))
+        y0 = rng.randint(0, max(h - ch, 0))
 
         if bbox is not None:
             bx1, by1, bx2, by2 = bbox
@@ -94,15 +99,13 @@ def _scale_jitter_crop_with_bbox(
             bh = by2 - by1
             if bw <= 0 or bh <= 0:
                 break
-            # intersection of crop with bbox
             ix1 = max(bx1, x0)
             iy1 = max(by1, y0)
             ix2 = min(bx2, x0 + cw)
             iy2 = min(by2, y0 + ch)
             if ix2 <= ix1 or iy2 <= iy1:
                 continue
-            inter_area = (ix2 - ix1) * (iy2 - iy1)
-            if inter_area < 0.5 * bw * bh:
+            if (ix2 - ix1) * (iy2 - iy1) < 0.5 * bw * bh:
                 continue
 
         img_crop = img.crop((x0, y0, x0 + cw, y0 + ch))
@@ -143,12 +146,12 @@ def _perspective_with_bbox(
     def jitter() -> int:
         return rng.randint(-d, d)
 
-    startpoints = [(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)]
-    endpoints = [
-        (0 + jitter(), 0 + jitter()),
-        (w - 1 + jitter(), 0 + jitter()),
-        (w - 1 + jitter(), h - 1 + jitter()),
-        (0 + jitter(), h - 1 + jitter()),
+    startpoints: list[list[int]] = [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]]
+    endpoints: list[list[int]] = [
+        [0 + jitter(), 0 + jitter()],
+        [w - 1 + jitter(), 0 + jitter()],
+        [w - 1 + jitter(), h - 1 + jitter()],
+        [0 + jitter(), h - 1 + jitter()],
     ]
 
     img = TF.perspective(img, startpoints, endpoints, interpolation=TF.InterpolationMode.BILINEAR)
@@ -164,10 +167,8 @@ def _perspective_with_bbox(
         denom = coeffs[6] * cx + coeffs[7] * cy + 1.0
         if abs(denom) < 1e-8:
             return img, bbox
-        tx = (coeffs[0] * cx + coeffs[1] * cy + coeffs[2]) / denom
-        ty = (coeffs[3] * cx + coeffs[4] * cy + coeffs[5]) / denom
-        xs.append(tx)
-        ys.append(ty)
+        xs.append((coeffs[0] * cx + coeffs[1] * cy + coeffs[2]) / denom)
+        ys.append((coeffs[3] * cx + coeffs[4] * cy + coeffs[5]) / denom)
     new_bbox = [
         max(0.0, min(xs)),
         max(0.0, min(ys)),
@@ -180,10 +181,8 @@ def _perspective_with_bbox(
 
 
 def _perspective_coeffs(
-    startpoints: list[tuple[int, int]], endpoints: list[tuple[int, int]]
+    startpoints: list[list[int]], endpoints: list[list[int]]
 ) -> list[float]:
-    """Compute the 8 perspective transform coefficients (forward mapping).
-    Mirrors the convention used internally by torchvision."""
     matrix = []
     for (x1, y1), (x2, y2) in zip(startpoints, endpoints):
         matrix.append([x1, y1, 1, 0, 0, 0, -x2 * x1, -x2 * y1])
@@ -201,8 +200,7 @@ def _perspective_coeffs(
 
 
 def _gaussian_blur(img: Image.Image, rng: random.Random, max_radius: float = 2.0) -> Image.Image:
-    radius = rng.uniform(0.0, max_radius)
-    return img.filter(ImageFilter.GaussianBlur(radius=radius))
+    return img.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.0, max_radius)))
 
 
 def _random_erase(tensor: torch.Tensor, rng: random.Random, p: float = 0.2) -> torch.Tensor:
@@ -227,6 +225,52 @@ def _random_erase(tensor: torch.Tensor, rng: random.Random, p: float = 0.2) -> t
     return tensor
 
 
+def _jitter_bbox(
+    bbox: list[float],
+    img_size: float,
+    rng: random.Random,
+    jitter: float = 0.05,
+) -> list[float]:
+    """Perturb each bbox edge by up to ±jitter × side length.
+
+    Trains ROI Align to be robust to imprecise support annotations, matching
+    the condition at inference where user crops are never pixel-perfect.
+    """
+    x1, y1, x2, y2 = bbox
+    w, h = x2 - x1, y2 - y1
+    x1 += rng.uniform(-jitter, jitter) * w
+    y1 += rng.uniform(-jitter, jitter) * h
+    x2 += rng.uniform(-jitter, jitter) * w
+    y2 += rng.uniform(-jitter, jitter) * h
+    return [max(0.0, x1), max(0.0, y1), min(img_size, x2), min(img_size, y2)]
+
+
+def _copy_paste_query(
+    query_img: Image.Image,
+    query_bbox: list[float] | None,
+    distractor: Image.Image,
+    rng: random.Random,
+    p: float = 0.4,
+) -> tuple[Image.Image, list[float] | None]:
+    """Paste a scaled distractor object onto the query image.
+
+    The distractor comes from a different instance, training the model to
+    ignore visually similar objects that are not the target.
+    """
+    if rng.random() >= p:
+        return query_img, query_bbox
+    w, h = query_img.size
+    scale = rng.uniform(0.1, 0.4)
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+    distractor = distractor.resize((nw, nh), Image.Resampling.BILINEAR)
+    x0 = rng.randint(0, max(w - nw, 0))
+    y0 = rng.randint(0, max(h - nh, 0))
+    out = query_img.copy()
+    out.paste(distractor, (x0, y0))
+    return out, query_bbox  # query_bbox is unchanged — target location is unaffected
+
+
 # ---------------------------------------------------------------------------
 # Augmentation pipeline
 # ---------------------------------------------------------------------------
@@ -240,10 +284,10 @@ class _Augment:
     """Bbox-aware augmentation.
 
     Support pipeline (train):
-      resize → scale-jitter crop → hflip → color jitter → grayscale → blur → (tensor) → erase
+      resize → multi-scale crop → hflip → color jitter → grayscale → blur → tensor → erase
 
     Query pipeline (train):
-      resize → hflip → perspective → color jitter → grayscale
+      resize → copy-paste distractor → hflip → perspective → color jitter → grayscale
     """
 
     def __init__(self, kind: str, train: bool) -> None:
@@ -264,28 +308,37 @@ class _Augment:
             raise ValueError(kind)
 
     def __call__(
-        self, img: Image.Image, bbox: list[float] | None, rng: random.Random
+        self,
+        img: Image.Image,
+        bbox: list[float] | None,
+        rng: random.Random,
+        distractor: Image.Image | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         img, bbox = _resize_with_bbox(img, bbox)
 
         if self.train:
             if self.kind == "support":
-                img, bbox = _scale_jitter_crop_with_bbox(img, bbox, rng, min_crop=0.7)
-                if random.random() < self.flip_p:
+                # Multi-scale crop: randomly select the minimum crop fraction.
+                # Smaller min_crop → larger apparent object scale in the cropped view.
+                min_crop = rng.choice(SUPPORT_CROP_SCALES)
+                img, bbox = _scale_jitter_crop_with_bbox(img, bbox, rng, min_crop=min_crop)
+                if rng.random() < self.flip_p:
                     img, bbox = _hflip_with_bbox(img, bbox)
                 img = self.color(img)
-                if random.random() < self.gray_p:
+                if rng.random() < self.gray_p:
                     img = ImageOps.grayscale(img).convert("RGB")
-                if random.random() < self.blur_p:
+                if rng.random() < self.blur_p:
                     img = _gaussian_blur(img, rng, max_radius=2.0)
 
             elif self.kind == "query":
-                if random.random() < self.flip_p:
+                if distractor is not None:
+                    img, bbox = _copy_paste_query(img, bbox, distractor, rng)
+                if rng.random() < self.flip_p:
                     img, bbox = _hflip_with_bbox(img, bbox)
-                if random.random() < self.persp_p:
+                if rng.random() < self.persp_p:
                     img, bbox = _perspective_with_bbox(img, bbox, rng, distortion=0.2)
                 img = self.color(img)
-                if random.random() < self.gray_p:
+                if rng.random() < self.gray_p:
                     img = ImageOps.grayscale(img).convert("RGB")
 
         t = _to_tensor(img)
@@ -317,12 +370,11 @@ class EpisodeDataset(Dataset):
         episodes_per_epoch: int = 1000,
         n_support: int = N_SUPPORT,
         neg_prob: float = NEG_PROB,
+        hard_neg_ratio: float = 0.25,
         train: bool = True,
         seed: int | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
-        # Manifest lives at dataset/cleaned/manifest.json; image paths are
-        # relative to dataset/cleaned/, so default data_root is manifest's parent.
         self.data_root = (
             Path(data_root) if data_root is not None else self.manifest_path.parent
         )
@@ -338,19 +390,23 @@ class EpisodeDataset(Dataset):
         self.negatives: list[str] = self.manifest.get("negative_backgrounds", [])
         self.n_support = n_support
         self.neg_prob = neg_prob if train else 0.0
+        self.hard_neg_ratio = hard_neg_ratio
         self.episodes_per_epoch = episodes_per_epoch
         self.train = train
         self._support_aug = _Augment("support", train)
         self._query_aug = _Augment("query", train)
-        self._rng_obj = random.Random(seed)
+        self._seed = seed
         # Populated externally by build_proto_cache() each epoch for hard-negative mining.
         self.hard_neg_cache: dict[str, Any] | None = None
 
+    def set_neg_prob(self, prob: float) -> None:
+        self.neg_prob = prob
+
+    def set_hard_neg_ratio(self, ratio: float) -> None:
+        self.hard_neg_ratio = ratio
+
     def __len__(self) -> int:
         return self.episodes_per_epoch
-
-    def _rng(self) -> random.Random:
-        return self._rng_obj
 
     def _resolve(self, p: str) -> Path:
         path = Path(p)
@@ -358,23 +414,36 @@ class EpisodeDataset(Dataset):
             return path
         return self.data_root / path
 
+    def _build_query_pool(self, instance: dict[str, Any]) -> list[dict]:
+        """Oversample scene queries 3× over isolated queries.
+
+        Scene queries (real backgrounds, multiple objects) are harder and more
+        representative of inference conditions. Oversampling exposes the model
+        to the hard distribution without collecting more data.
+        """
+        all_q = instance["query_images"]
+        scene = [q for q in all_q if q.get("scene_type")]
+        isolated = [q for q in all_q if not q.get("scene_type")]
+        return isolated + scene * 3 if scene else all_q
+
     def _sample_query(
         self, instance: dict[str, Any], rng: random.Random
     ) -> tuple[Path, list[float] | None, bool]:
         """Returns (path, bbox-or-None, is_present)."""
         is_negative = rng.random() < self.neg_prob
         if not is_negative:
-            pool = instance["query_images"]
+            pool = self._build_query_pool(instance)
             if not pool:
                 pool = instance["support_images"]
             q = rng.choice(pool)
             return self._resolve(q["path"]), list(q["bbox"]), True
 
         # Negative episode — three tiers based on a secondary roll:
-        #   < 0.50 : easy negative (background image)
-        #   0.50–0.75 : random foreign instance
-        #   >= 0.75 : hard negative (most similar instance by prototype cosine sim)
+        #   < 0.50                        : easy negative (background image)
+        #   0.50 – (1 - hard_neg_ratio)   : random foreign instance
+        #   >= (1 - hard_neg_ratio)        : hard negative (most similar prototype)
         r = rng.random()
+        hard_thr = 1.0 - self.hard_neg_ratio
 
         if self.negatives and r < 0.5:
             return self._resolve(rng.choice(self.negatives)), None, False
@@ -386,7 +455,7 @@ class EpisodeDataset(Dataset):
             q = rng.choice(instance["support_images"])
             return self._resolve(q["path"]), None, False
 
-        if r >= 0.75 and self.hard_neg_cache is not None:
+        if r >= hard_thr and self.hard_neg_cache is not None:
             anchor = self.hard_neg_cache.get(instance["instance_id"])
             if anchor is not None:
                 sims = []
@@ -407,27 +476,82 @@ class EpisodeDataset(Dataset):
         q = rng.choice(pool)
         return self._resolve(q["path"]), None, False
 
+    def _maybe_mixup_support(
+        self,
+        support_imgs: torch.Tensor,
+        support_bboxes: torch.Tensor,
+        d_instance: dict[str, Any],
+        rng: random.Random,
+        alpha: float = 0.2,
+        p: float = 0.15,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Linearly interpolate support images with another instance's support.
+
+        Beta(alpha, alpha) with alpha=0.2 is bimodal — most blends are heavily
+        weighted toward one instance (λ near 0 or 1), acting as mild contamination
+        rather than hard confusion. Forces the projection head to learn smooth,
+        well-separated prototype manifolds.
+        """
+        if rng.random() >= p:
+            return support_imgs, support_bboxes
+        d_pool = d_instance["support_images"]
+        d_support = [rng.choice(d_pool) for _ in range(self.n_support)]
+        d_imgs = []
+        for s in d_support:
+            img = _load_image(self._resolve(s["path"]))
+            t, _ = self._support_aug(img, list(s["bbox"]), rng)
+            d_imgs.append(t)
+        lam = rng.betavariate(alpha, alpha)
+        mixed = lam * support_imgs + (1 - lam) * torch.stack(d_imgs)
+        return mixed, support_bboxes  # bboxes belong to the main instance
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        rng = self._rng()
+        # Per-index independent seed: combines position with worker seed so every
+        # (epoch, worker, idx) triple produces a unique, reproducible episode.
+        rng = random.Random(idx + self.episodes_per_epoch * torch.initial_seed())
+
         instance = rng.choice(self.instances)
+
+        # Distractor instance for copy-paste and support mixup
+        others = [i for i in self.instances if i["instance_id"] != instance["instance_id"]]
+        d_instance = rng.choice(others) if (self.train and others) else None
+
+        # Sample support images
         support_pool = instance["support_images"]
-        if len(support_pool) < self.n_support:
-            support = [rng.choice(support_pool) for _ in range(self.n_support)]
-        else:
-            support = rng.sample(support_pool, self.n_support)
+        support = (
+            rng.sample(support_pool, self.n_support)
+            if len(support_pool) >= self.n_support
+            else [rng.choice(support_pool) for _ in range(self.n_support)]
+        )
 
         s_imgs, s_bboxes = [], []
         for s in support:
             img = _load_image(self._resolve(s["path"]))
             t, bb = self._support_aug(img, list(s["bbox"]), rng)
+            if self.train:
+                # Bbox jitter: simulate imprecise user-provided support crops
+                bb = torch.tensor(_jitter_bbox(bb.tolist(), IMG_SIZE, rng), dtype=torch.float32)
             s_imgs.append(t)
             s_bboxes.append(bb)
-        support_imgs = torch.stack(s_imgs, dim=0)
-        support_bboxes = torch.stack(s_bboxes, dim=0)
+        support_imgs = torch.stack(s_imgs)
+        support_bboxes = torch.stack(s_bboxes)
 
+        # Support mixup (lazy: loads distractor images only when fired)
+        if self.train and d_instance is not None:
+            support_imgs, support_bboxes = self._maybe_mixup_support(
+                support_imgs, support_bboxes, d_instance, rng
+            )
+
+        # Distractor image for copy-paste (1 image, cheap)
+        distractor: Image.Image | None = None
+        if self.train and d_instance is not None:
+            d_s = rng.choice(d_instance["support_images"])
+            distractor = _load_image(self._resolve(d_s["path"]))
+
+        # Sample query image
         q_path, q_bbox, is_present = self._sample_query(instance, rng)
         q_img = _load_image(q_path)
-        q_t, q_bbox_t = self._query_aug(q_img, q_bbox, rng)
+        q_t, q_bbox_t = self._query_aug(q_img, q_bbox, rng, distractor=distractor)
 
         return {
             "support_imgs": support_imgs,

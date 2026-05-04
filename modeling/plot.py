@@ -61,7 +61,7 @@ def _stage_boundaries(history: list[dict[str, Any]]) -> list[tuple[int, str]]:
 
 
 def _draw_stage_vlines(ax: plt.Axes, boundaries: list[tuple[int, str]]) -> None:
-    for idx, (epoch_i, stage) in enumerate(boundaries):
+    for idx, (epoch_i, _) in enumerate(boundaries):
         if idx == 0:
             continue
         ax.axvline(epoch_i, color="grey", linestyle="--", linewidth=0.8, alpha=0.7)
@@ -110,6 +110,8 @@ def plot_training_curves(history: list[dict[str, Any]], out_dir: Path) -> None:
     ax.plot(epochs, _get("loss"), label="Total loss", linewidth=1.8, color="#333333")
     ax.plot(epochs, _get("focal"), label="Focal loss", linewidth=1.4, linestyle="--", color="#4C72B0")
     ax.plot(epochs, _get("box"), label="Box (GIoU) loss", linewidth=1.4, linestyle="--", color="#DD8452")
+    ax.plot(epochs, _get("presence"), label="Presence BCE", linewidth=1.4, linestyle="-.", color="#E76F51")
+    ax.plot(epochs, _get("attn"), label="Saliency attn KL", linewidth=1.2, linestyle=":", color="#9C27B0")
     _stage_spans(ax, boundaries, n)
     _draw_stage_vlines(ax, boundaries)
     ax.set_ylabel("Train loss")
@@ -151,7 +153,7 @@ def plot_training_curves(history: list[dict[str, Any]], out_dir: Path) -> None:
     ]
     fig.legend(handles=handles, loc="upper right", fontsize=8, title="Stage", title_fontsize=8)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     out_path = out_dir / "training_curves.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -216,7 +218,7 @@ def plot_contrastive_learning(history: list[dict[str, Any]], out_dir: Path) -> N
     ]
     fig.legend(handles=stage_handles, loc="upper right", fontsize=8, title="Stage", title_fontsize=8)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     out_path = out_dir / "contrastive_learning.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -582,7 +584,7 @@ def plot_dataset_stats(stats_path: Path, out_dir: Path) -> None:
         pie_labels = [s.upper() for s in instance_counts.keys()]
         pie_vals = list(instance_counts.values())
         pie_colors = [_color(s, i) for i, s in enumerate(instance_counts.keys())]
-        wedges, texts, autotexts = ax_pie.pie(
+        _, _, autotexts = ax_pie.pie(
             pie_vals, labels=pie_labels, colors=pie_colors,
             autopct="%1.0f%%", startangle=90,
             textprops={"fontsize": 10},

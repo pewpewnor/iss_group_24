@@ -6,11 +6,15 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 
 SEED = 42
-TRAIN_RATIO = 0.70
-VAL_RATIO = 0.15
+TRAIN_RATIO = 0.75
+VAL_RATIO = 0.10
 N_SUPPORT = 5
+BBOX_PAD_FRAC = 0.05      # pad each bbox by 5% on each side to avoid tight crops
+BBOX_MIN_SIDE = 20         # drop bboxes whose smaller side is below this many px
+BBOX_MIN_AREA_FRAC = 0.005  # drop bboxes covering < 0.5% of image area
 
 BASE_DIR = Path("dataset/original")
 OUT_DIR = Path("dataset/cleaned")
@@ -20,27 +24,66 @@ HOTS_SCENE_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "scene"
 INSDET_DIR = BASE_DIR / "InsDet"
 
 
-def bbox_from_mask(mask_path: Path) -> list[int] | None:
-    mask = np.array(Image.open(mask_path).convert("L"))
-    rows = np.any(mask > 127, axis=1)
-    cols = np.any(mask > 127, axis=0)
-    if not rows.any():
+def _largest_component_bbox(mask: np.ndarray) -> list[int] | None:
+    """Bbox of the largest connected component of a binary mask.
+
+    Plain np.any-based bbox is contaminated by stray specks far from the
+    object; taking the largest component gives a tight, accurate bbox.
+    """
+    if not mask.any():
         return None
+    labels, n = ndimage.label(mask)  # type: ignore[misc]
+    if n == 0:
+        return None
+    # bincount[0] is the background — ignore it
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0
+    largest = int(sizes.argmax())
+    rows = np.any(labels == largest, axis=1)
+    cols = np.any(labels == largest, axis=0)
     y1, y2 = np.where(rows)[0][[0, -1]]
     x1, x2 = np.where(cols)[0][[0, -1]]
     return [int(x1), int(y1), int(x2), int(y2)]
+
+
+def _pad_bbox(bbox: list[int], img_size: tuple[int, int], frac: float = BBOX_PAD_FRAC) -> list[int]:
+    """Inflate bbox by ``frac`` of each side, clamped to image bounds."""
+    w, h = img_size
+    x1, y1, x2, y2 = bbox
+    px = int((x2 - x1) * frac)
+    py = int((y2 - y1) * frac)
+    return [max(0, x1 - px), max(0, y1 - py), min(w - 1, x2 + px), min(h - 1, y2 + py)]
+
+
+def _bbox_valid(bbox: list[int], img_size: tuple[int, int]) -> bool:
+    """Reject degenerate boxes (too thin, too small relative to image)."""
+    w, h = img_size
+    bw = bbox[2] - bbox[0]
+    bh = bbox[3] - bbox[1]
+    if bw < BBOX_MIN_SIDE or bh < BBOX_MIN_SIDE:
+        return False
+    return (bw * bh) / (w * h) >= BBOX_MIN_AREA_FRAC
+
+
+def bbox_from_mask(mask_path: Path) -> list[int] | None:
+    mask_arr = np.array(Image.open(mask_path).convert("L")) > 127
+    bbox = _largest_component_bbox(mask_arr)
+    if bbox is None:
+        return None
+    h, w = mask_arr.shape
+    bbox = _pad_bbox(bbox, (w, h))
+    return bbox if _bbox_valid(bbox, (w, h)) else None
 
 
 def bbox_from_image(img_path: Path, bg_thresh: int = 240) -> list[int] | None:
     img = np.array(Image.open(img_path).convert("RGB"))
-    is_bg = np.all(img > bg_thresh, axis=2)
-    rows = np.any(~is_bg, axis=1)
-    cols = np.any(~is_bg, axis=0)
-    if not rows.any():
+    fg = ~np.all(img > bg_thresh, axis=2)
+    bbox = _largest_component_bbox(fg)
+    if bbox is None:
         return None
-    y1, y2 = np.where(rows)[0][[0, -1]]
-    x1, x2 = np.where(cols)[0][[0, -1]]
-    return [int(x1), int(y1), int(x2), int(y2)]
+    h, w = fg.shape
+    bbox = _pad_bbox(bbox, (w, h))
+    return bbox if _bbox_valid(bbox, (w, h)) else None
 
 
 def _int_child(el: ET.Element, tag: str) -> int | None:
@@ -95,7 +138,7 @@ def collect_hots_instances() -> list[dict]:
             continue
         instances.append(
             {
-                "instance_id": f"hots_{cls}",
+                "instance_id": f"hots_{_normalize_name(cls)}",
                 "source": "hots",
                 "class_name": cls,
                 "support_images": support,
@@ -134,7 +177,7 @@ def collect_insdet_instances() -> list[dict]:
 
         instances.append(
             {
-                "instance_id": f"insdet_{obj_dir.name}",
+                "instance_id": f"insdet_{_normalize_name(obj_dir.name)}",
                 "source": "insdet",
                 "class_name": obj_dir.name,
                 "support_images": support,
@@ -143,6 +186,11 @@ def collect_insdet_instances() -> list[dict]:
         )
     print(f"insdet: {len(instances)} instances")
     return instances
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize an instance name for cross-file matching (case + whitespace)."""
+    return name.strip().lower().replace(" ", "_").replace("-", "_")
 
 
 def collect_hots_scene_queries() -> list[dict]:
@@ -158,7 +206,7 @@ def collect_hots_scene_queries() -> list[dict]:
         for o in parse_voc_xml(xml_p):
             out.append(
                 {
-                    "instance_id": f"hots_{o['name']}",
+                    "instance_id": f"hots_{_normalize_name(o['name'])}",
                     "path": str(img_p),
                     "bbox": o["bbox"],
                     "scene_type": "hots_scene",
@@ -183,10 +231,9 @@ def collect_insdet_scene_queries() -> list[dict]:
                 if not img_p.exists():
                     continue
                 for o in parse_voc_xml(xml_p):
-                    name = o["name"].strip().lower().replace(" ", "_")
                     out.append(
                         {
-                            "instance_id": f"insdet_{name}",
+                            "instance_id": f"insdet_{_normalize_name(o['name'])}",
                             "path": str(img_p),
                             "bbox": o["bbox"],
                             "scene_type": f"insdet_{difficulty}",
@@ -240,17 +287,26 @@ def filter_empty_instances(instances: list[dict]) -> list[dict]:
 
 
 def split_instances(instances: list[dict]) -> tuple[list, list, list]:
+    """Stratified 80/10/10 split — preserves the source ratio (HOTS/InsDet)
+    in each split. A pure random shuffle on a small dataset can put most of
+    one source in a single split, biasing val/test metrics."""
     rng = random.Random(SEED)
-    shuffled = instances[:]
-    rng.shuffle(shuffled)
-    n = len(shuffled)
-    n_train = int(n * TRAIN_RATIO)
-    n_val = int(n * VAL_RATIO)
-    return (
-        shuffled[:n_train],
-        shuffled[n_train : n_train + n_val],
-        shuffled[n_train + n_val :],
-    )
+    by_source: dict[str, list[dict]] = {}
+    for inst in instances:
+        by_source.setdefault(inst["source"], []).append(inst)
+
+    train, val, test = [], [], []
+    for source in sorted(by_source):
+        group = by_source[source][:]
+        rng.shuffle(group)
+        n = len(group)
+        n_train = int(n * TRAIN_RATIO)
+        n_val = int(n * VAL_RATIO)
+        train.extend(group[:n_train])
+        val.extend(group[n_train : n_train + n_val])
+        test.extend(group[n_train + n_val :])
+        print(f"  split[{source}]: train={n_train} val={n_val} test={n - n_train - n_val}")
+    return train, val, test
 
 
 def stage_images(splits: dict[str, list[dict]], negatives: list[str]) -> list[str]:

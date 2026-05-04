@@ -1,21 +1,25 @@
 """Export a trained checkpoint to TFLite via litert_torch.
 
-The exported model takes three positional tensor inputs:
-  support_imgs   (1, 5, 3, 224, 224)  float32
-  support_bboxes (1, 5, 4)            float32  xyxy in 224-px coords
-  query_img      (1, 3, 224, 224)     float32
+Two artefacts are exported for the on-device pipeline:
 
-And returns two outputs:
-  bbox   (1, 4)  float32  xyxy in 224-px coords
-  score  (1,)    float32  confidence in [0, 1]
+  prototype.tflite — runs once when the user provides their 5 supports.
+      input:  support_imgs (1, 5, 3, 224, 224)
+      output: prototype    (1, 64)
 
-By default INT8 dynamic-range quantization is applied (weights only),
-reducing model size from ~13 MB (float32) to ~4 MB.
+  detect.tflite — runs every camera frame, reusing the cached prototype.
+      input:  prototype    (1, 64)
+              query_img    (1, 3, 224, 224)
+      output: bbox         (1, 4)   xyxy in 224-px coords
+              score        (1,)     presence confidence in [0, 1]
+
+Splitting the pipeline avoids re-encoding 5 supports per frame at runtime —
+the prototype is cached client-side and the per-frame cost drops to just
+the query branch + detection head.
 
 Run:
     python -m modeling.export \
         --checkpoint model/best.pt \
-        --out        model/model.tflite
+        --out-dir    model/
 """
 
 from __future__ import annotations
@@ -29,45 +33,40 @@ import torch.nn as nn
 from modeling.model import FewShotLocalizer, decode
 
 
-class _ExportWrapper(nn.Module):
-    """Wraps FewShotLocalizer into a flat tensor-in / tensor-out interface
-    that litert_torch.convert (and torch.export) can handle."""
+class _PrototypeWrapper(nn.Module):
+    """Encodes 5 support images into a single prototype vector. Run once per session."""
+
+    def __init__(self, model: FewShotLocalizer) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, support_imgs: torch.Tensor) -> torch.Tensor:
+        proto, _ = self.model.encode_support(support_imgs)
+        return proto
+
+
+class _DetectWrapper(nn.Module):
+    """Per-frame detection: cached prototype + new query → (bbox, score)."""
 
     def __init__(self, model: FewShotLocalizer) -> None:
         super().__init__()
         self.model = model
 
     def forward(
-        self,
-        support_imgs: torch.Tensor,
-        support_bboxes: torch.Tensor,
-        query_img: torch.Tensor,
+        self, prototype: torch.Tensor, query_img: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        out = self.model(support_imgs, support_bboxes, query_img)
-        bbox, score = decode(out["reg"], out["conf"])
+        out = self.model.detect(prototype, query_img)
+        bbox, score = decode(out["reg"], out["conf"], presence_logit=out["presence_logit"])
         return bbox, score.unsqueeze(-1)
 
 
-def export(checkpoint: str | Path, out: str | Path, quantize: bool = True) -> None:
-    checkpoint = Path(checkpoint)
-    out = Path(out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"loading checkpoint: {checkpoint}")
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    base_model = FewShotLocalizer(pretrained=False)
-    base_model.load_state_dict(state["model"] if "model" in state else state)
-    base_model.eval()
-
-    wrapper = _ExportWrapper(base_model).eval()
-
-    sample_inputs = (
-        torch.zeros(1, 5, 3, 224, 224),
-        torch.zeros(1, 5, 4),
-        torch.zeros(1, 3, 224, 224),
-    )
-
-    print("converting to LiteRT edge model...")
+def _convert(
+    wrapper: nn.Module,
+    sample_inputs: tuple[torch.Tensor, ...],
+    out: Path,
+    quantize: bool,
+) -> None:
+    """Run litert_torch conversion + export, with optional INT8 weight quantization."""
     try:
         import litert_torch
     except ImportError as e:
@@ -76,9 +75,8 @@ def export(checkpoint: str | Path, out: str | Path, quantize: bool = True) -> No
         ) from e
 
     if quantize:
-        print("  applying INT8 dynamic-range quantization")
         try:
-            import tensorflow as tf
+            import tensorflow as tf  # type: ignore[import-untyped]
             tfl_flags = {"optimizations": [tf.lite.Optimize.DEFAULT]}
         except ImportError:
             print("  warning: tensorflow not found, exporting without quantization")
@@ -89,27 +87,58 @@ def export(checkpoint: str | Path, out: str | Path, quantize: bool = True) -> No
     else:
         edge_model = litert_torch.convert(wrapper, sample_inputs)
 
-    print(f"exporting to: {out}")
     edge_model.export(str(out))
-
     size_mb = out.stat().st_size / 1024 / 1024
-    print(f"done. model size: {size_mb:.1f} MB")
+    print(f"  {out.name}: {size_mb:.1f} MB")
+
+
+def export(checkpoint: str | Path, out_dir: str | Path, quantize: bool = True) -> None:
+    checkpoint = Path(checkpoint)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading checkpoint: {checkpoint}")
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    base_model = FewShotLocalizer(pretrained=False)
+    base_model.load_state_dict(state["model"] if "model" in state else state)
+    base_model.eval()
+
+    if quantize:
+        print("  applying INT8 dynamic-range quantization")
+
+    print("exporting prototype model (one-shot, runs when user uploads supports)...")
+    _convert(
+        _PrototypeWrapper(base_model).eval(),
+        (torch.zeros(1, 5, 3, 224, 224),),
+        out_dir / "prototype.tflite",
+        quantize,
+    )
+
+    print("exporting detect model (per-frame, runs on every camera frame)...")
+    _convert(
+        _DetectWrapper(base_model).eval(),
+        (torch.zeros(1, 64), torch.zeros(1, 3, 224, 224)),
+        out_dir / "detect.tflite",
+        quantize,
+    )
+
+    print("done.")
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True, help="path to best.pt")
-    p.add_argument("--out", default="model/model.tflite", help="output .tflite path")
+    p.add_argument("--out-dir", default="model", help="output directory for the two .tflite files")
     p.add_argument(
         "--no-quantize",
         action="store_true",
-        help="skip INT8 dynamic-range quantization (larger file, full float32)",
+        help="skip INT8 dynamic-range quantization (larger files, full float32)",
     )
     args = p.parse_args()
 
     export(
         checkpoint=args.checkpoint,
-        out=args.out,
+        out_dir=args.out_dir,
         quantize=not args.no_quantize,
     )
 
