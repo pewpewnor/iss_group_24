@@ -129,6 +129,54 @@ def sigmoid_focal_loss(
     return alpha_t * (1 - p_t).pow(gamma) * bce
 
 
+def nt_xent_loss(
+    prototypes: torch.Tensor,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """NT-Xent uniformity loss on the batch of prototype vectors.
+
+    Minimises log-sum-exp of all pairwise cosine similarities (diagonal excluded),
+    driving every prototype to be maximally distinct from the others.
+    Temperature 0.1 keeps the signal sharp on small batches.
+    """
+    B = prototypes.shape[0]
+    if B < 2:
+        return torch.zeros((), device=prototypes.device)
+
+    p = F.normalize(prototypes, dim=-1)
+    sim = torch.mm(p, p.T) / temperature  # (B, B)
+    # Mask diagonal so self-similarity doesn't dominate logsumexp
+    diag = torch.eye(B, dtype=torch.bool, device=prototypes.device)
+    sim = sim.masked_fill(diag, float("-inf"))
+    return torch.logsumexp(sim, dim=1).mean()
+
+
+def vicreg_loss(
+    prototypes: torch.Tensor,
+    gamma: float = 1.0,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """VICReg variance + covariance terms (invariance omitted — no two-view data).
+
+    Variance: keeps each of the 64 dims alive (std > gamma).
+    Covariance: decorrelates dims so they encode independent information.
+    """
+    B, D = prototypes.shape
+    if B < 2:
+        return torch.zeros((), device=prototypes.device)
+
+    z = prototypes - prototypes.mean(dim=0)
+
+    std = torch.sqrt(z.var(dim=0) + eps)
+    var_loss = F.relu(gamma - std).mean()
+
+    cov = (z.T @ z) / (B - 1)
+    off_diag = cov.pow(2).sum() - cov.diag().pow(2).sum()
+    cov_loss = off_diag / D
+
+    return var_loss + 0.04 * cov_loss
+
+
 def total_loss(
     pred: dict[str, torch.Tensor],
     gt_bbox: torch.Tensor,

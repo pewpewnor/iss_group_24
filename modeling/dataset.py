@@ -343,6 +343,8 @@ class EpisodeDataset(Dataset):
         self._support_aug = _Augment("support", train)
         self._query_aug = _Augment("query", train)
         self._rng_obj = random.Random(seed)
+        # Populated externally by build_proto_cache() each epoch for hard-negative mining.
+        self.hard_neg_cache: dict[str, Any] | None = None
 
     def __len__(self) -> int:
         return self.episodes_per_epoch
@@ -367,12 +369,39 @@ class EpisodeDataset(Dataset):
                 pool = instance["support_images"]
             q = rng.choice(pool)
             return self._resolve(q["path"]), list(q["bbox"]), True
-        # Negative episode: 50/50 between background image and foreign instance.
-        if self.negatives and rng.random() < 0.5:
+
+        # Negative episode — three tiers based on a secondary roll:
+        #   < 0.50 : easy negative (background image)
+        #   0.50–0.75 : random foreign instance
+        #   >= 0.75 : hard negative (most similar instance by prototype cosine sim)
+        r = rng.random()
+
+        if self.negatives and r < 0.5:
             return self._resolve(rng.choice(self.negatives)), None, False
+
         others = [i for i in self.instances if i["instance_id"] != instance["instance_id"]]
         if not others:
-            return self._resolve(rng.choice(self.negatives)), None, False
+            if self.negatives:
+                return self._resolve(rng.choice(self.negatives)), None, False
+            q = rng.choice(instance["support_images"])
+            return self._resolve(q["path"]), None, False
+
+        if r >= 0.75 and self.hard_neg_cache is not None:
+            anchor = self.hard_neg_cache.get(instance["instance_id"])
+            if anchor is not None:
+                sims = []
+                for inst in others:
+                    p = self.hard_neg_cache.get(inst["instance_id"])
+                    if p is not None:
+                        sim = F.cosine_similarity(anchor.unsqueeze(0), p.unsqueeze(0)).item()
+                        sims.append((sim, inst))
+                if sims:
+                    sims.sort(reverse=True)
+                    hard_inst = rng.choice(sims[: min(5, len(sims))])[1]
+                    pool = hard_inst["query_images"] + hard_inst["support_images"]
+                    q = rng.choice(pool)
+                    return self._resolve(q["path"]), None, False
+
         other = rng.choice(others)
         pool = other["query_images"] + other["support_images"]
         q = rng.choice(pool)

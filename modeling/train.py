@@ -18,8 +18,10 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from modeling.dataset import EpisodeDataset, collate
-from modeling.loss import giou, total_loss
+import random as _random
+
+from modeling.dataset import EpisodeDataset, _Augment, _load_image, collate
+from modeling.loss import giou, nt_xent_loss, total_loss, vicreg_loss
 from modeling.model import FewShotLocalizer, decode
 
 
@@ -83,6 +85,53 @@ def stage3_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
 
 
 # ---------------------------------------------------------------------------
+# Prototype cache for hard-negative mining
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def build_proto_cache(
+    model: FewShotLocalizer,
+    dataset: EpisodeDataset,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Compute one prototype per instance (eval augmentation, fixed seed).
+
+    Called once per epoch before the training loop so _sample_query can
+    find hard negatives by cosine similarity between prototype vectors.
+    """
+    was_training = model.training
+    model.eval()
+
+    aug = _Augment("support", train=False)
+    rng = _random.Random(0)
+    cache: dict[str, torch.Tensor] = {}
+
+    for instance in dataset.instances:
+        pool = instance["support_images"]
+        k = dataset.n_support
+        samples = [rng.choice(pool) for _ in range(k)] if len(pool) < k else rng.sample(pool, k)
+
+        imgs, bboxes = [], []
+        for s in samples:
+            img = _load_image(dataset._resolve(s["path"]))
+            t, bb = aug(img, list(s["bbox"]), rng)
+            imgs.append(t)
+            bboxes.append(bb)
+
+        support_imgs_t = torch.stack(imgs).unsqueeze(0).to(device)
+        support_bboxes_t = torch.stack(bboxes).unsqueeze(0).to(device)
+        proto = model.encode_support(support_imgs_t, support_bboxes_t)
+        cache[instance["instance_id"]] = proto.squeeze(0).cpu()
+
+    if was_training:
+        model.train()
+        model.backbone.eval()
+
+    return cache
+
+
+# ---------------------------------------------------------------------------
 # Loops
 # ---------------------------------------------------------------------------
 
@@ -135,16 +184,35 @@ def train_stage(
     out_dir: Path,
     best_val_iou: float,
     grad_clip: float = 1.0,
+    contrastive: bool = True,
+    contrastive_weight: float = 0.1,
+    contrastive_temp: float = 0.1,
+    vicreg: bool = True,
+    vicreg_weight: float = 0.05,
+    hard_neg_mining: bool = True,
 ) -> float:
+    # Cosine LR decay over all steps in this stage — smoother than step decay,
+    # prevents oscillation at the end of long stages.
+    total_steps = epochs * len(train_loader)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(total_steps, 1), eta_min=1e-7
+    )
+
     for epoch in range(1, epochs + 1):
+        # Build prototype cache for hard-negative mining at the start of each epoch.
+        if hard_neg_mining and hasattr(train_loader.dataset, "hard_neg_cache"):
+            train_loader.dataset.hard_neg_cache = build_proto_cache(
+                model, train_loader.dataset, device  # type: ignore[arg-type]
+            )
+
         model.train()
         # Keep backbone BN in eval mode — small episodic batches would
         # destabilise running stats if we let them update.
         model.backbone.eval()
 
         t0 = time.time()
-        running = {"loss": 0.0, "focal": 0.0, "box": 0.0}
-        for step, batch in enumerate(train_loader, start=1):
+        running = {"loss": 0.0, "focal": 0.0, "box": 0.0, "nt_xent": 0.0, "vicreg": 0.0}
+        for batch in train_loader:
             support_imgs = batch["support_imgs"].to(device)
             support_bboxes = batch["support_bboxes"].to(device)
             query_img = batch["query_img"].to(device)
@@ -153,25 +221,44 @@ def train_stage(
 
             out = model(support_imgs, support_bboxes, query_img)
             losses = total_loss(out, gt_bbox, is_present)
+            loss = losses["loss"]
+
+            nt_val, vr_val = 0.0, 0.0
+            if contrastive:
+                nt = nt_xent_loss(out["prototype"], temperature=contrastive_temp)
+                loss = loss + contrastive_weight * nt
+                nt_val = nt.detach().item()
+            if vicreg:
+                vr = vicreg_loss(out["prototype"])
+                loss = loss + vicreg_weight * vr
+                vr_val = vr.detach().item()
 
             optimizer.zero_grad(set_to_none=True)
-            losses["loss"].backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 [p for g in optimizer.param_groups for p in g["params"]], grad_clip
             )
             optimizer.step()
+            scheduler.step()
 
-            running["loss"] += losses["loss"].item()
+            running["loss"] += loss.item()
             running["focal"] += float(losses["focal"])
             running["box"] += float(losses["box"])
+            running["nt_xent"] += nt_val
+            running["vicreg"] += vr_val
 
         n = len(train_loader)
         avg = {k: v / max(n, 1) for k, v in running.items()}
         metrics = validate(model, val_loader, device)
         elapsed = time.time() - t0
+        reg_str = (
+            f" nt_xent={avg['nt_xent']:.4f} vicreg={avg['vicreg']:.4f}"
+            if (contrastive or vicreg)
+            else ""
+        )
         print(
             f"[{stage_name}] epoch {epoch}/{epochs} "
-            f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f}) "
+            f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f}{reg_str}) "
             f"val_loss={metrics['val_loss']:.4f} "
             f"val_iou={metrics['val_iou']:.4f} "
             f"val_presence={metrics['val_presence_acc']:.4f} "
@@ -209,14 +296,21 @@ def train(
     data_root: str | Path | None = None,
     out_dir: str | Path = "model",
     resume: str | Path | None = None,
-    episodes_per_epoch: int = 1000,
-    val_episodes: int = 200,
-    batch_size: int = 8,
+    episodes_per_epoch: int = 2000,
+    val_episodes: int = 500,
+    batch_size: int = 16,
     num_workers: int = 4,
-    stage1_epochs: int = 8,
-    stage2_epochs: int = 20,
+    stage1_epochs: int = 12,
+    stage2_epochs: int = 40,
     stage3_epochs: int = 10,
     stage3: bool = False,
+    contrastive: bool = True,
+    contrastive_weight_s1: float = 0.1,   # user: bump from 0.1 → 0.2 once backbone unfreezes
+    contrastive_weight_s2: float = 0.2,
+    contrastive_temp: float = 0.1,
+    vicreg: bool = True,
+    vicreg_weight: float = 0.05,
+    hard_neg_mining: bool = True,
     seed: int = 42,
     device: str | None = None,
     pretrained: bool = True,
@@ -242,6 +336,13 @@ def train(
         "stage2_epochs": stage2_epochs,
         "stage3_epochs": stage3_epochs,
         "stage3": stage3,
+        "contrastive": contrastive,
+        "contrastive_weight_s1": contrastive_weight_s1,
+        "contrastive_weight_s2": contrastive_weight_s2,
+        "contrastive_temp": contrastive_temp,
+        "vicreg": vicreg,
+        "vicreg_weight": vicreg_weight,
+        "hard_neg_mining": hard_neg_mining,
         "seed": seed,
         "device": device,
         "pretrained": pretrained,
@@ -304,6 +405,12 @@ def train(
         best = train_stage(
             model, opt, train_loader, val_loader, device_t,
             stage1_epochs, "stage1", out_dir, best,
+            contrastive=contrastive,
+            contrastive_weight=contrastive_weight_s1,
+            contrastive_temp=contrastive_temp,
+            vicreg=vicreg,
+            vicreg_weight=vicreg_weight,
+            hard_neg_mining=hard_neg_mining,
         )
 
     if stage2_epochs > 0:
@@ -312,6 +419,12 @@ def train(
         best = train_stage(
             model, opt, train_loader, val_loader, device_t,
             stage2_epochs, "stage2", out_dir, best,
+            contrastive=contrastive,
+            contrastive_weight=contrastive_weight_s2,
+            contrastive_temp=contrastive_temp,
+            vicreg=vicreg,
+            vicreg_weight=vicreg_weight,
+            hard_neg_mining=hard_neg_mining,
         )
 
     if stage3 and stage3_epochs > 0:
@@ -320,6 +433,12 @@ def train(
         best = train_stage(
             model, opt, train_loader, val_loader, device_t,
             stage3_epochs, "stage3", out_dir, best,
+            contrastive=contrastive,
+            contrastive_weight=contrastive_weight_s2,
+            contrastive_temp=contrastive_temp,
+            vicreg=vicreg,
+            vicreg_weight=vicreg_weight,
+            hard_neg_mining=hard_neg_mining,
         )
 
     print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")
@@ -346,6 +465,13 @@ def main() -> None:
     p.add_argument("--stage2-epochs", type=int, default=20)
     p.add_argument("--stage3-epochs", type=int, default=10)
     p.add_argument("--stage3", action="store_true", help="run optional Stage 3 full unfreeze")
+    p.add_argument("--no-contrastive", action="store_true", help="disable NT-Xent prototype loss")
+    p.add_argument("--contrastive-weight-s1", type=float, default=0.1)
+    p.add_argument("--contrastive-weight-s2", type=float, default=0.2)
+    p.add_argument("--contrastive-temp", type=float, default=0.1)
+    p.add_argument("--no-vicreg", action="store_true", help="disable VICReg regularisation")
+    p.add_argument("--vicreg-weight", type=float, default=0.05)
+    p.add_argument("--no-hard-neg", action="store_true", help="disable hard-negative mining")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default=None)
     p.add_argument("--no-pretrained", action="store_true")
@@ -366,6 +492,13 @@ def main() -> None:
         stage2_epochs=args.stage2_epochs,
         stage3_epochs=args.stage3_epochs,
         stage3=args.stage3,
+        contrastive=not args.no_contrastive,
+        contrastive_weight_s1=args.contrastive_weight_s1,
+        contrastive_weight_s2=args.contrastive_weight_s2,
+        contrastive_temp=args.contrastive_temp,
+        vicreg=not args.no_vicreg,
+        vicreg_weight=args.vicreg_weight,
+        hard_neg_mining=not args.no_hard_neg,
         seed=args.seed,
         device=args.device,
         pretrained=not args.no_pretrained,

@@ -88,16 +88,22 @@ class MobileNetBackbone(nn.Module):
 
 
 class Projection(nn.Module):
-    """1x1 conv (P5_C -> 64) + GAP. Produces a 64-d descriptor per support crop."""
+    """1x1 conv (P5_C -> 64) + GAP + LayerNorm.
+
+    LayerNorm normalises across the feature dimension, not the batch dimension,
+    so it stabilises training without homogenising inter-instance differences
+    (which BatchNorm would do, actively harming contrastive objectives).
+    """
 
     def __init__(self, in_c: int = P5_CHANNELS, out_c: int = PROTO_DIM) -> None:
         super().__init__()
         self.conv = nn.Conv2d(in_c, out_c, kernel_size=1, bias=False)
+        self.norm = nn.LayerNorm(out_c)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
         x = F.adaptive_avg_pool2d(x, 1)
-        return x.flatten(1)
+        return self.norm(x.flatten(1))
 
 
 class FPN(nn.Module):
