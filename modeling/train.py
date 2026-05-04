@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 import random as _random
 
 from modeling.dataset import EpisodeDataset, _Augment, _load_image, collate
+from modeling.evaluate import IOU_THRESHOLDS, _compute_pr_ap, _iou_xyxy
 from modeling.loss import giou, nt_xent_loss, total_loss, vicreg_loss
 from modeling.model import FewShotLocalizer, decode
 
@@ -184,6 +185,9 @@ def validate(
 ) -> dict[str, float]:
     model.eval()
     losses, ious, present_correct, n, n_pos = 0.0, 0.0, 0, 0, 0
+    all_scores: list[float] = []
+    all_ious: list[float] = []
+    all_present: list[bool] = []
     for batch in val_loader:
         support_imgs = batch["support_imgs"].to(device)
         support_bboxes = batch["support_bboxes"].to(device)
@@ -199,16 +203,36 @@ def validate(
         pred_present = pred_score > 0.5
         present_correct += (pred_present == is_present).sum().item()
 
+        plain_ious = _iou_xyxy(pred_box, gt_bbox)
+        for i in range(gt_bbox.shape[0]):
+            present = bool(is_present[i].item())
+            iou_v = float(plain_ious[i].item()) if present else 0.0
+            all_scores.append(float(pred_score[i].item()))
+            all_ious.append(iou_v)
+            all_present.append(present)
+
         pos = is_present
         if pos.any():
             ious_b = giou(pred_box[pos], gt_bbox[pos])
             ious += ious_b.clamp(min=0).sum().item()
             n_pos += int(pos.sum().item())
         n += gt_bbox.shape[0]
+
+    ap_vals = [
+        _compute_pr_ap(
+            all_scores,
+            [p and iou_v >= tau for p, iou_v in zip(all_present, all_ious)],
+            n_pos,
+        )
+        for tau in IOU_THRESHOLDS
+    ]
+    val_map = sum(ap_vals) / len(ap_vals) if ap_vals else 0.0
+
     model.train()
     return {
         "val_loss": losses / max(n, 1),
         "val_iou": ious / max(n_pos, 1),
+        "val_map": val_map,
         "val_presence_acc": present_correct / max(n, 1),
     }
 
@@ -320,6 +344,7 @@ def train_stage(
             f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f}{reg_str}) "
             f"val_loss={metrics['val_loss']:.4f} "
             f"val_iou={metrics['val_iou']:.4f} "
+            f"val_map={metrics['val_map']:.4f} "
             f"val_presence={metrics['val_presence_acc']:.4f} "
             f"time={elapsed:.1f}s"
         )
@@ -334,6 +359,7 @@ def train_stage(
             "vicreg": avg["vicreg"],
             "val_loss": metrics["val_loss"],
             "val_iou": metrics["val_iou"],
+            "val_map": metrics["val_map"],
             "val_presence_acc": metrics["val_presence_acc"],
         })
 
@@ -343,12 +369,13 @@ def train_stage(
                 {
                     "model": model.state_dict(),
                     "val_iou": best_val_iou,
+                    "val_map": metrics["val_map"],
                     "stage": stage_name,
                     "epoch": epoch,
                 },
                 out_dir / "best.pt",
             )
-            print(f"  saved best.pt (val_iou={best_val_iou:.4f})")
+            print(f"  saved best.pt (val_iou={best_val_iou:.4f} val_map={metrics['val_map']:.4f})")
 
         torch.save(
             _make_full_ckpt(
@@ -358,6 +385,21 @@ def train_stage(
             out_dir / "last.pt",
         )
         print(f"  saved last.pt ({stage_name} epoch {epoch}/{epochs})")
+
+    if epoch_history:
+        stage_path = out_dir / f"{stage_name}.pt"
+        last_metrics = epoch_history[-1]
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "stage": stage_name,
+                "epoch": last_metrics["epoch"],
+                "val_iou": last_metrics["val_iou"],
+                "val_map": last_metrics["val_map"],
+            },
+            stage_path,
+        )
+        print(f"  saved {stage_path.name} (final {stage_name} weights)")
 
     return best_val_iou, epoch_history
 
@@ -647,7 +689,7 @@ def train(
             )
             full_history.extend(hist)
 
-    print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")
+    print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")  # mAP also in best.pt
 
     history_path = analysis_dir / "train_history.json"
     with open(history_path, "w") as f:

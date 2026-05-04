@@ -3,7 +3,8 @@
 Reports:
 - mean IoU on positive episodes (object actually present)
 - presence accuracy: P(score > thr) matches is_present
-- AP@0.5: positive episode counted correct if IoU >= 0.5 AND score > thr
+- AP@0.5, AP@0.75: PR-curve AP at fixed IoU thresholds
+- mAP@[0.5:0.95]: COCO-style mean of AP at IoU 0.50, 0.55, ..., 0.95
 - per-source breakdown (hots / insdet)
 
 Run:
@@ -25,6 +26,46 @@ from torch.utils.data import DataLoader
 from modeling.dataset import EpisodeDataset, collate
 from modeling.loss import giou  # noqa: F401
 from modeling.model import FewShotLocalizer, decode
+
+
+IOU_THRESHOLDS: tuple[float, ...] = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
+
+
+def _compute_pr_ap(scores: list[float], is_tp: list[bool], n_gt: int) -> float:
+    """COCO-style 101-point interpolated AP from a ranked list of detections.
+
+    Each episode produces exactly one (score, is_tp) pair. ``n_gt`` is the
+    number of positive episodes. Returns 0.0 if there are no positives.
+    """
+    if n_gt == 0 or not scores:
+        return 0.0
+    order = sorted(range(len(scores)), key=lambda i: -scores[i])
+    tp = 0
+    fp = 0
+    precisions: list[float] = []
+    recalls: list[float] = []
+    for i in order:
+        if is_tp[i]:
+            tp += 1
+        else:
+            fp += 1
+        precisions.append(tp / (tp + fp))
+        recalls.append(tp / n_gt)
+
+    # Make precisions monotonically non-increasing as recall increases
+    # (interpolate from the right).
+    for k in range(len(precisions) - 2, -1, -1):
+        if precisions[k] < precisions[k + 1]:
+            precisions[k] = precisions[k + 1]
+
+    rec_thresholds = [i / 100.0 for i in range(101)]
+    ap_sum = 0.0
+    j = 0
+    for rt in rec_thresholds:
+        while j < len(recalls) and recalls[j] < rt:
+            j += 1
+        ap_sum += precisions[j] if j < len(precisions) else 0.0
+    return ap_sum / 101.0
 
 
 def _iou_xyxy(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -91,14 +132,26 @@ def evaluate(
         presence_correct = sum(
             ((s >= score_thr) == p) for s, p in zip(b["score"], b["is_present"])
         )
-        ap50 = sum(b["correct_at_iou"]) / max(n_pos, 1)
+        ap_per_iou: dict[str, float] = {}
+        for tau in IOU_THRESHOLDS:
+            is_tp = [
+                bool(p) and (iou_v >= tau)
+                for p, iou_v in zip(b["is_present"], b["iou"])
+            ]
+            ap_per_iou[f"{tau:.2f}"] = round(
+                _compute_pr_ap(b["score"], is_tp, n_pos), 4
+            )
+        map_5095 = sum(ap_per_iou.values()) / len(ap_per_iou)
         return {
             "n": n,
             "n_pos": n_pos,
             "n_neg": n_neg,
             "mean_iou_pos": round(mean_iou, 4),
             "presence_acc": round(presence_correct / n, 4),
-            "ap@iou=0.5": round(ap50, 4),
+            "ap@iou=0.5": ap_per_iou["0.50"],
+            "ap@iou=0.75": ap_per_iou["0.75"],
+            "map@[0.5:0.95]": round(map_5095, 4),
+            "ap_per_iou": ap_per_iou,
             "mean_score_pos": round(
                 sum(s for s, p in zip(b["score"], b["is_present"]) if p) / max(n_pos, 1),
                 4,

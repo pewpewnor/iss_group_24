@@ -135,6 +135,7 @@ def plot_training_curves(history: list[dict[str, Any]], out_dir: Path) -> None:
 
     ax = axes[3]
     ax.plot(epochs, _get("val_iou"), label="Val IoU", linewidth=1.6, color="#55A868")
+    ax.plot(epochs, _get("val_map"), label="Val mAP@[0.5:0.95]", linewidth=1.6, linestyle="-.", color="#2196F3")
     ax.plot(epochs, _get("val_presence_acc"), label="Val presence acc", linewidth=1.6, linestyle="--", color="#CCB974")
     _stage_spans(ax, boundaries, n)
     _draw_stage_vlines(ax, boundaries)
@@ -196,13 +197,15 @@ def plot_contrastive_learning(history: list[dict[str, Any]], out_dir: Path) -> N
     ax.legend(fontsize=9)
     ax.grid(True, linewidth=0.4, alpha=0.5)
 
+    val_map = [row.get("val_map", 0.0) for row in history]
+
     ax = axes[1]
-    color_iou = "#55A868"
-    ax.plot(epochs, val_iou, label="Val IoU", linewidth=1.8, color=color_iou)
+    ax.plot(epochs, val_iou, label="Val IoU", linewidth=1.8, color="#55A868")
+    ax.plot(epochs, val_map, label="Val mAP@[0.5:0.95]", linewidth=1.8, linestyle="-.", color="#2196F3")
     _stage_spans(ax, boundaries, n)
     _draw_stage_vlines(ax, boundaries)
     ax.set_xlabel("Epoch (absolute)")
-    ax.set_ylabel("Val IoU")
+    ax.set_ylabel("Val metric")
     ax.set_ylim(0, 1.05)
     ax.legend(fontsize=9)
     ax.grid(True, linewidth=0.4, alpha=0.5)
@@ -374,8 +377,20 @@ def plot_eval_report(report: dict[str, Any], out_dir: Path) -> None:
     overall = report.get("overall", {})
     by_source = report.get("by_source", {})
 
-    metric_keys = ["mean_iou_pos", "presence_acc", "ap@iou=0.5"]
-    metric_labels = ["Mean IoU (pos)", "Presence acc", "AP@IoU=0.5"]
+    metric_keys = [
+        "mean_iou_pos",
+        "presence_acc",
+        "ap@iou=0.5",
+        "ap@iou=0.75",
+        "map@[0.5:0.95]",
+    ]
+    metric_labels = [
+        "Mean IoU (pos)",
+        "Presence acc",
+        "AP@0.5",
+        "AP@0.75",
+        "mAP@[0.5:0.95]",
+    ]
 
     sources = ["overall"] + sorted(by_source.keys())
     source_data: dict[str, dict] = {"overall": overall}
@@ -387,7 +402,7 @@ def plot_eval_report(report: dict[str, Any], out_dir: Path) -> None:
         "insdet": "InsDet",
     }
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle("Evaluation metrics", fontsize=13, fontweight="bold")
 
     ax = axes[0]
@@ -414,7 +429,31 @@ def plot_eval_report(report: dict[str, Any], out_dir: Path) -> None:
     ax.grid(True, axis="y", linewidth=0.4, alpha=0.5)
     ax.set_title("Metrics by source", fontsize=10)
 
-    ax2 = axes[1]
+    ax_ap = axes[1]
+    for si, src in enumerate(sources):
+        ap_per_iou = source_data[src].get("ap_per_iou", {})
+        if not ap_per_iou:
+            continue
+        taus = sorted(float(k) for k in ap_per_iou.keys())
+        vals = [ap_per_iou[f"{t:.2f}"] for t in taus]
+        ax_ap.plot(
+            taus, vals, marker="o", linewidth=1.5,
+            label=source_display.get(src, src),
+            color=bar_colors[si % len(bar_colors)],
+        )
+        map_val = source_data[src].get("map@[0.5:0.95]", 0.0)
+        ax_ap.axhline(
+            map_val, linestyle="--", linewidth=0.7, alpha=0.4,
+            color=bar_colors[si % len(bar_colors)],
+        )
+    ax_ap.set_xlabel("IoU threshold")
+    ax_ap.set_ylabel("AP")
+    ax_ap.set_ylim(0, 1.05)
+    ax_ap.set_title("AP vs IoU threshold (dashed = mAP@[0.5:0.95])", fontsize=10)
+    ax_ap.legend(fontsize=8)
+    ax_ap.grid(True, linewidth=0.4, alpha=0.5)
+
+    ax2 = axes[2]
     pos_scores = [row.get("mean_score_pos", 0.0) for row in source_data.values() if row]
     neg_scores = [row.get("mean_score_neg", 0.0) for row in source_data.values() if row]
     src_labels = [source_display.get(s, s) for s in sources]
