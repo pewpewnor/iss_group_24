@@ -362,15 +362,17 @@ def _load_image(path: Path) -> Image.Image:
 
 
 class EpisodeDataset(Dataset):
-    # Maps an instance source to the negative-background pool it should draw
-    # from. HOTS and InsDet share a "hots_insdet" pool because the two
-    # datasets are visually closer to each other than either is to FSOD; the
-    # FSOD instances draw from a separate pool to keep the domain gap from
-    # making negatives trivially easy.
+    # Maps an instance source to the negative-background pool it draws from.
+    # vizwiz_base uses a same-domain pool (VizWiz phone shots not used as
+    # positives) so Phase 1 negatives can't be rejected by global image style.
+    # All Phase 2 sources share the "hope" pool (HOPE + InsDet Background +
+    # VizWiz query images), which is fine once the model is past the style-
+    # discrimination failure mode.
     _NEG_POOL_FOR_SOURCE: dict[str, str] = {
-        "hots": "hots_insdet",
-        "insdet": "hots_insdet",
-        "fsod": "fsod",
+        "vizwiz_base": "vizwiz_base",
+        "vizwiz_novel": "hope",
+        "hots": "hope",
+        "insdet": "hope",
     }
 
     def __init__(
@@ -404,7 +406,7 @@ class EpisodeDataset(Dataset):
         # Bucket negative-background entries by source. Supports both the new
         # dict-shape entries `{"path": ..., "source": ...}` and the legacy
         # flat list of strings (which all map to the hots_insdet pool — the
-        # only domain that pre-FSOD manifests covered).
+        # only domain that pre-VizWiz manifests covered).
         raw_negatives = self.manifest.get("negative_backgrounds", [])
         self._negatives_by_pool: dict[str, list[str]] = {}
         for entry in raw_negatives:
@@ -437,13 +439,14 @@ class EpisodeDataset(Dataset):
         return self._negatives_by_pool.get(pool_name, [])
 
     # ------------------------------------------------------------------
-    # FSOD-specific support synthesis: 4 rotations of the cropped bbox.
+    # Rotation-synthesis support: 4 crops of the bbox at 0/90/180/270°.
+    # Used by vizwiz_base and vizwiz_novel sources.
     # ------------------------------------------------------------------
 
-    _FSOD_ROTATIONS = (0, 90, 180, 270)
-    _FSOD_CROP_PAD = 0.10  # 10% bbox-side padding on the support crop
+    _ROTATION_ANGLES = (0, 90, 180, 270)
+    _ROTATION_CROP_PAD = 0.10  # 10% bbox-side padding on each support crop
 
-    def _fsod_supports(
+    def _rotation_supports(
         self,
         scene: Image.Image,
         bbox: list[float],
@@ -451,14 +454,13 @@ class EpisodeDataset(Dataset):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Synthesise 4 support tensors by cropping bbox + rotating four ways.
 
-        The crop is square-padded around the bbox so 90° rotations don't drop
-        content off the edges. Each rotated crop then runs through the normal
-        support augmentation pipeline so colour jitter / blur / etc. still
-        apply per support.
+        The crop is square-padded around the bbox so 90° rotations don't clip
+        corners. Each rotated crop runs through the standard support augmentation
+        pipeline (colour jitter, blur, erase) independently.
         """
         x1, y1, x2, y2 = bbox
         cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-        side = max(x2 - x1, y2 - y1) * (1.0 + 2 * self._FSOD_CROP_PAD)
+        side = max(x2 - x1, y2 - y1) * (1.0 + 2 * self._ROTATION_CROP_PAD)
         half = side * 0.5
         w_img, h_img = scene.size
         cx1 = max(0, int(cx - half))
@@ -471,28 +473,22 @@ class EpisodeDataset(Dataset):
 
         s_imgs: list[torch.Tensor] = []
         s_bboxes: list[torch.Tensor] = []
-        for angle in self._FSOD_ROTATIONS:
-            if angle == 0:
-                rotated = base_crop
-            else:
-                # expand=True grows the canvas so 90° / 270° don't crop the
-                # corners; the rotated image is pillarboxed into a larger frame
-                # only for 90/270, but support_aug resizes back to 224 anyway.
-                rotated = base_crop.rotate(angle, expand=True)
-            # The whole rotated crop is the object — bbox spans the full image.
+        for angle in self._ROTATION_ANGLES:
+            rotated = base_crop if angle == 0 else base_crop.rotate(angle, expand=True)
+            # After cropping + rotating, the object spans the whole image.
             full_bbox = [0.0, 0.0, float(rotated.width), float(rotated.height)]
             t, bb = self._support_aug(rotated, full_bbox, rng)
             s_imgs.append(t)
             s_bboxes.append(bb)
         return torch.stack(s_imgs), torch.stack(s_bboxes)
 
-    def _fsod_negative_query(
+    def _rotation_negative_query(
         self, instance: dict[str, Any], rng: random.Random
     ) -> Path:
-        """Pick a negative query for an FSOD episode (no double-rolling).
+        """Negative query for a rotation-synthesis episode (no double neg-roll).
 
-        Tier split mirrors `_sample_query` but skips the positive branch since
-        the caller has already committed to a negative episode.
+        Mirrors the negative tiers of _sample_query but skips the positive
+        branch since the caller has already committed to a negative episode.
         """
         same_source_negs = self._negatives_for(instance)
         same_source_others = [
@@ -500,7 +496,6 @@ class EpisodeDataset(Dataset):
             if i["instance_id"] != instance["instance_id"]
             and i.get("source") == instance.get("source")
         ]
-        # Easy-background tier (50%) → fall back to foreign-instance otherwise.
         if same_source_negs and (not same_source_others or rng.random() < 0.5):
             return self._resolve(rng.choice(same_source_negs))
         if same_source_others:
@@ -508,27 +503,24 @@ class EpisodeDataset(Dataset):
             pool = other["query_images"] + other["support_images"]
             q = rng.choice(pool)
             return self._resolve(q["path"])
-        # Pathological fallback — shouldn't trigger if FSOD has multiple cats.
         q = rng.choice(instance["support_images"])
         return self._resolve(q["path"])
 
-    def _fsod_episode(
+    def _rotation_episode(
         self, idx: int, instance: dict[str, Any], rng: random.Random
     ) -> dict[str, Any]:
-        """One FSOD episode: 4 rotated crops as supports, scene as query.
+        """One rotation-synthesis episode: 4 rotated crops → supports, scene → query.
 
-        Positive episodes use the *same* (scene, bbox) entry as both the
-        support source and the query — that turns FSOD's category-level
-        annotations into instance-level supervision (the model is asked to
-        find the specific object whose own crops it just saw, not "find an
-        object of this category"). Negative episodes route through the
-        existing negative-sampling path so they still respect source pools.
+        Positive episode: same (scene, bbox) entry drives both supports and
+        the query — turning a category-level annotation into instance-level
+        supervision (find the exact object whose crops were just shown).
+        Negative episode: query comes from the per-source negative pool.
         """
         anchor = rng.choice(instance["support_images"])
         scene_path = self._resolve(anchor["path"])
         scene = _load_image(scene_path)
         anchor_bbox = list(anchor["bbox"])
-        support_imgs, support_bboxes = self._fsod_supports(scene, anchor_bbox, rng)
+        support_imgs, support_bboxes = self._rotation_supports(scene, anchor_bbox, rng)
 
         is_negative = rng.random() < self.neg_prob
         q_bbox: list[float] | None
@@ -537,7 +529,7 @@ class EpisodeDataset(Dataset):
             q_bbox = anchor_bbox
             present = True
         else:
-            q_path = self._fsod_negative_query(instance, rng)
+            q_path = self._rotation_negative_query(instance, rng)
             q_img = _load_image(q_path) if q_path != scene_path else scene
             q_bbox = None
             present = False
@@ -673,13 +665,14 @@ class EpisodeDataset(Dataset):
 
         instance = rng.choice(self.instances)
 
-        # FSOD episodes synthesise supports from one scene (4 rotated crops),
-        # so they bypass the multi-shot pool sampling used by HOTS/InsDet.
-        if instance.get("source") == "fsod":
-            return self._fsod_episode(idx, instance, rng)
+        # VizWiz base + novel episodes use the rotation-synthesis path: one
+        # (scene, bbox) entry → 4 rotated crops as supports, same scene as
+        # query. This bypasses the multi-shot pool sampling used by HOTS/InsDet.
+        if instance.get("source") in ("vizwiz_base", "vizwiz_novel"):
+            return self._rotation_episode(idx, instance, rng)
 
         # Distractor instance for copy-paste and support mixup — same source
-        # as the anchor so we don't blend a HOTS shot with an FSOD scene.
+        # as the anchor so we don't blend a HOTS shot with a VizWiz scene.
         others = [
             i for i in self.instances
             if i["instance_id"] != instance["instance_id"]

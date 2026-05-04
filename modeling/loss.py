@@ -334,11 +334,9 @@ def total_loss(
       box:      1.0 (area-weighted GIoU on positive cells only)
       presence: 1.0 (BCE on (B,) presence_logit)
       attn:     0.5 (KL between aggregated support attention and bbox region).
-                Tuned down from 1.0 because FSOD episodes feed crop-around-the-
-                object support images where the bbox covers most of the input,
-                making the KL target nearly uniform and the loss has less to
-                teach. HOTS/InsDet supports still benefit but the auxiliary
-                doesn't need to dominate the matcher gradient.
+                Tuned down from 1.0 for Phase 1 (VizWiz rotation crops have a
+                full-image bbox target → near-uniform KL → low signal). Callers
+                pass 1.0 for Phase 2 (HOTS/InsDet) via train_stage(attn_loss_weight).
     """
     reg_pred = pred["reg"]
     conf_logits = pred["conf"]

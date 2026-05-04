@@ -1,7 +1,6 @@
 numpy>=2.0
 Pillow>=10.0
-torch>=2.2
-torchvision>=0.17
-litert-torch
-gdown
+torch>=2.4
+torchvision>=0.19
+litert-torch>=0.9.0
 matplotlib>=3.7
