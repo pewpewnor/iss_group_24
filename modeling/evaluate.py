@@ -183,6 +183,7 @@ def run(
     seed: int = 42,
     device: str | None = None,
     report: str | Path = "model/eval_report.json",
+    analysis_dir: str | Path = "analysis",
 ) -> dict:
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -221,7 +222,7 @@ def run(
     print(f"\nreport written to {out_path}")
 
     from modeling.plot import plot_eval_report
-    analysis_dir = Path("analysis")
+    analysis_dir = Path(analysis_dir)
     analysis_dir.mkdir(parents=True, exist_ok=True)
     plot_eval_report(result, analysis_dir)
 

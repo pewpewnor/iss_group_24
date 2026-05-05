@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader
 import random as _random
 
 from modeling.dataset import EpisodeDataset, _Augment, _load_image, collate
-from modeling.evaluate import IOU_THRESHOLDS, _compute_pr_ap, _iou_xyxy
+from modeling.evaluate import IOU_THRESHOLDS, _compute_pr_ap, _iou_xyxy, run as evaluate_run
 from modeling.loss import _containment_ratio
 from modeling.loss import nt_xent_loss, total_loss, triplet_loss, vicreg_loss
 from modeling.model import FewShotLocalizer, decode
@@ -536,6 +536,44 @@ def train_stage(
 
 
 # ---------------------------------------------------------------------------
+# Per-stage test evaluation
+# ---------------------------------------------------------------------------
+
+
+def _eval_stage(
+    stage_name: str,
+    out_dir: Path,
+    analysis_dir: Path,
+    manifest: str | Path,
+    data_root: str | Path | None,
+    val_episodes: int,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    device: str,
+) -> None:
+    ckpt = out_dir / f"{stage_name}.pt"
+    if not ckpt.exists():
+        return
+    stage_dir = analysis_dir / stage_name
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    print(f"=== Test evaluation: {stage_name} ===")
+    evaluate_run(
+        checkpoint=ckpt,
+        manifest=manifest,
+        split="test",
+        data_root=data_root,
+        episodes=val_episodes,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        seed=seed,
+        device=device,
+        report=stage_dir / "test_report.json",
+        analysis_dir=stage_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -785,6 +823,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
+            _eval_stage("stage1_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
 
     if phase1_partial_epochs > 0:
         skip, start_epoch, opt_state, sched_state = _resume_for("stage1_2", phase1_partial_epochs)
@@ -826,6 +865,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
+            _eval_stage("stage1_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
 
     # -----------------------------------------------------------------------
     # Phase 2: target-domain fine-tuning
@@ -868,6 +908,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
+            _eval_stage("stage2_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
 
     if phase2_partial_epochs > 0:
         skip, start_epoch, opt_state, sched_state = _resume_for("stage2_2", phase2_partial_epochs)
@@ -909,6 +950,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
+            _eval_stage("stage2_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
 
     if phase2_full_epochs > 0:
         skip, start_epoch, opt_state, sched_state = _resume_for("stage2_3", phase2_full_epochs)
@@ -951,6 +993,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
+            _eval_stage("stage2_3", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
 
     print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")
 
