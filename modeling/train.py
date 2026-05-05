@@ -589,7 +589,21 @@ def _eval_stage(
     num_workers: int,
     seed: int,
     device: str,
+    full_history: list[dict] | None = None,
 ) -> None:
+    """Run test eval for a stage and write per-stage analysis artefacts.
+
+    Per-stage outputs land in ``analysis/<stage_name>/``:
+      test_report.json       — eval metrics on the held-out test set
+      eval_metrics.png       — bar/score-distribution from the test report
+      train_history.json     — slice of full_history for this stage only
+      training_curves.png    — per-epoch losses + val metrics, this stage only
+      contrastive_learning.png
+      ap_per_iou.png
+
+    The global versions (covering all stages) are still produced once at the
+    end of training by ``_generate_plots``.
+    """
     ckpt = out_dir / f"{stage_name}.pt"
     if not ckpt.exists():
         return
@@ -609,6 +623,23 @@ def _eval_stage(
         report=stage_dir / "test_report.json",
         analysis_dir=stage_dir,
     )
+    # Per-stage training-history slice + plots so each stage folder is a
+    # self-contained snapshot of how that stage trained.
+    if full_history:
+        stage_history = [r for r in full_history if r.get("stage") == stage_name]
+        if stage_history:
+            history_path = stage_dir / "train_history.json"
+            with open(history_path, "w") as f:
+                json.dump(stage_history, f, indent=2)
+            print(f"saved {history_path}")
+            from modeling.plot import (
+                plot_ap_per_iou,
+                plot_contrastive_learning,
+                plot_training_curves,
+            )
+            plot_training_curves(stage_history, stage_dir)
+            plot_contrastive_learning(stage_history, stage_dir)
+            plot_ap_per_iou(stage_history, stage_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +912,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
-            _eval_stage("stage1_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
+            _eval_stage("stage1_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     if phase1_partial_epochs > 0:
         skip, start_epoch, opt_state, sched_state = _resume_for("stage1_2", phase1_partial_epochs)
@@ -925,7 +956,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
-            _eval_stage("stage1_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
+            _eval_stage("stage1_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     # -----------------------------------------------------------------------
     # Phase 2: target-domain fine-tuning
@@ -970,7 +1001,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
-            _eval_stage("stage2_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
+            _eval_stage("stage2_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     if phase2_partial_epochs > 0:
         skip, start_epoch, opt_state, sched_state = _resume_for("stage2_2", phase2_partial_epochs)
@@ -1014,7 +1045,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
-            _eval_stage("stage2_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
+            _eval_stage("stage2_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     if phase2_full_epochs > 0:
         skip, start_epoch, opt_state, sched_state = _resume_for("stage2_3", phase2_full_epochs)
@@ -1059,7 +1090,7 @@ def train(
                 prior_history=full_history,
             )
             full_history.extend(hist)
-            _eval_stage("stage2_3", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device)
+            _eval_stage("stage2_3", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")
 
