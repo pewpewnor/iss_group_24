@@ -312,38 +312,88 @@ class AttentionPool(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class CrossAttentionHead(nn.Module):
-    """Every spatial position in the query feature map attends to the K*M
-    support tokens via multi-head attention.
+class _DropPath(nn.Module):
+    """Stochastic-depth on a residual branch (per-sample drop).
 
-    Replaces the single-vector dot-product correlation + channel-gating scheme.
-    With 20 support tokens (K=5, M=4) the query gets a far richer matching
-    signal than against a single 64-d prototype.
+    During training, with probability `p` the entire residual contribution
+    is zeroed for that sample. Acts as ensembling regularisation; well-
+    validated for transformers trained on small data.
     """
 
-    def __init__(self, dim: int = DIM, n_heads: int = N_HEADS) -> None:
+    def __init__(self, p: float = 0.0) -> None:
+        super().__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        keep = 1.0 - self.p
+        # Per-sample mask, shape (B, 1, 1) for (B, N, D) tensors
+        shape = (x.shape[0],) + (1,) * (x.dim() - 1)
+        mask = (torch.rand(shape, device=x.device, dtype=x.dtype) < keep).to(x.dtype)
+        # Inverted-dropout scaling so expected value is unchanged at eval
+        return x * (mask / keep)
+
+
+class CrossAttentionHead(nn.Module):
+    """1-layer DETR-style decoder block: SelfAttn(query) → CrossAttn(query→supports) → FFN.
+
+    Why upgrade from the previous single cross-attention pass:
+      The query positions previously had no way to share information with each
+      other before deciding where to attend on the support side. Self-attention
+      lets a query cell consult its neighbours ("does this region look like
+      part of the same object as that one?") given the support context, then
+      re-attend to supports with the refined query.
+      A 2D learnable PE is added by the parent module before this block — without
+      it the self-attention is permutation-equivariant over grid cells.
+
+    DropPath p=0.1 on each residual branch gives well-validated regularisation
+    at our ~400-instance scale; a single layer (rather than 2-3) keeps the
+    overfitting risk low given the small data.
+    """
+
+    def __init__(
+        self,
+        dim: int = DIM,
+        n_heads: int = N_HEADS,
+        drop_path: float = 0.1,
+    ) -> None:
         super().__init__()
         self.dim = dim
-        self.norm_q = nn.LayerNorm(dim)
+        # Self-attention over query positions
+        self.norm_q1 = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.drop_self = _DropPath(drop_path)
+        # Cross-attention from query to supports
+        self.norm_q2 = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.drop_cross = _DropPath(drop_path)
+        # FFN
         self.norm_ffn = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 2),
             nn.GELU(),
             nn.Linear(dim * 2, dim),
         )
+        self.drop_ffn = _DropPath(drop_path)
 
     def forward(
         self, q_feat: torch.Tensor, support_tokens: torch.Tensor
     ) -> torch.Tensor:
         b, c, h, w = q_feat.shape
-        q = q_feat.flatten(2).transpose(1, 2)               # (B, H*W, dim)
-        q_n = self.norm_q(q)
+        q = q_feat.flatten(2).transpose(1, 2)                       # (B, H*W, dim)
+        # Self-attention
+        q_n = self.norm_q1(q)
+        q_self, _ = self.self_attn(q_n, q_n, q_n, need_weights=False)
+        q = q + self.drop_self(q_self)
+        # Cross-attention to supports
+        q_n = self.norm_q2(q)
         kv_n = self.norm_kv(support_tokens)
-        attended, _ = self.attn(q_n, kv_n, kv_n)
-        q = q + attended
-        q = q + self.ffn(self.norm_ffn(q))
+        q_cross, _ = self.cross_attn(q_n, kv_n, kv_n, need_weights=False)
+        q = q + self.drop_cross(q_cross)
+        # FFN
+        q = q + self.drop_ffn(self.ffn(self.norm_ffn(q)))
         return q.transpose(1, 2).view(b, c, h, w)
 
 
@@ -421,7 +471,23 @@ class FewShotLocalizer(nn.Module):
         # for small-object instances or down where P3 hurts.
         self.p3_lat = nn.Conv2d(P3_CHANNELS, DIM, kernel_size=1, bias=False)
         self.p3_gate = nn.Parameter(torch.zeros(1, DIM, 1, 1))
-        self.cross_attn = CrossAttentionHead()
+        # 2D learnable positional encoding for the query feature map. Required
+        # for the QueryDecoder's self-attention (otherwise permutation-
+        # equivariant over the grid) and helps cross-attention map back to
+        # spatial coordinates in the regression head.
+        self.query_pe = nn.Parameter(torch.zeros(1, DIM, GRID, GRID))
+        nn.init.trunc_normal_(self.query_pe, std=0.02)
+        # [ABSENT] learnable token appended to the support bag at cross-
+        # attention time. Query positions that don't match any real support
+        # can attend to this token, which gives the model an explicit "no-
+        # match" outlet — directly improves present/absent differentiation
+        # because spurious matches no longer have to soak into real support
+        # tokens. (DETR's no-object class equivalent.) Excluded from the
+        # bag-level support_pool so the support summary represents the
+        # object, not "no-match".
+        self.absent_token = nn.Parameter(torch.zeros(1, 1, DIM))
+        nn.init.trunc_normal_(self.absent_token, std=0.02)
+        self.query_decoder = CrossAttentionHead()  # 1-layer DETR-style decoder
         self.det_head = DetectionHead()
         self.presence_head = PresenceHead()
 
@@ -489,7 +555,14 @@ class FewShotLocalizer(nn.Module):
         b = q_feat.shape[0]
         if support_tokens.shape[0] != b:
             support_tokens = support_tokens.expand(b, -1, -1)
-        enriched = self.cross_attn(q_feat, support_tokens)      # (B, dim, 14, 14)
+        # Add 2D PE before any attention so query positions know where they are.
+        q_feat = q_feat + self.query_pe
+        # Append [ABSENT] sink token to the support bag for cross-attention only.
+        # Bag-level pooling (support_summary) keeps the original tokens so the
+        # prototype represents the object, not the no-match sink.
+        absent = self.absent_token.expand(b, -1, -1)
+        cross_kv = torch.cat([support_tokens, absent], dim=1)   # (B, K*M+1, dim)
+        enriched = self.query_decoder(q_feat, cross_kv)         # (B, dim, 14, 14)
         reg, conf = self.det_head(enriched)
         q_gap = enriched.mean(dim=(2, 3))                       # (B, dim)
         support_summary = self.support_pool(support_tokens)     # (B, dim)

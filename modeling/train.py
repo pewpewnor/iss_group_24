@@ -42,7 +42,13 @@ import random as _random
 from modeling.dataset import EpisodeDataset, _Augment, _load_image, collate
 from modeling.evaluate import IOU_THRESHOLDS, _compute_pr_ap, _iou_xyxy, run as evaluate_run
 from modeling.loss import _containment_ratio
-from modeling.loss import nt_xent_loss, total_loss, triplet_loss, vicreg_loss
+from modeling.loss import (
+    barlow_twins_loss,
+    nt_xent_loss,
+    total_loss,
+    triplet_loss,
+    vicreg_loss,
+)
 from modeling.model import FewShotLocalizer, decode
 
 
@@ -69,56 +75,35 @@ def _heads(model: FewShotLocalizer) -> list:
         + list(model.fpn.parameters())
         + list(model.p3_lat.parameters())
         + [model.p3_gate]
-        + list(model.cross_attn.parameters())
+        + [model.query_pe]
+        + [model.absent_token]
+        + list(model.query_decoder.parameters())
         + list(model.det_head.parameters())
         + list(model.presence_head.parameters())
     )
 
 
-# LR notes (2026-05 architecture):
-#   The heads now contain three attention modules (slot tokenizer +
-#   SupportFusion transformer + AttentionPool), all of which are far more
-#   sensitive to LR than the previous DWSep stack. We drop the head peak LR
-#   from 1e-3 → 5e-4 in stage1_1 to avoid attention collapse, and from 5e-4
-#   → 3e-4 once the backbone joins so the two LRs stay roughly an order of
-#   magnitude apart. Backbone LRs are unchanged — they're already gentle.
+# LR notes (2026-05 architecture, post query-decoder):
+#   The heads now contain SIX attention modules: SupportTokenizer slot attn,
+#   2× SupportFusion encoder attn, AttentionPool query, and the QueryDecoder's
+#   self-attn + cross-attn. Plus DropPath p=0.1 on three decoder branches
+#   adds gradient noise. We drop stage1_1 head LR another step (5e-4 → 3e-4)
+#   to avoid attention collapse on the new self-attn, and stage1_2 → 2e-4
+#   once the backbone joins. Stage 2.x heads stay at 2.5e-4 — they're already
+#   warmed and the target-domain task primarily exercises the cross-attn
+#   path, which is more LR-tolerant than fresh self-attn.
 
 
 def phase1_frozen_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 1.1: backbone fully frozen, heads at 5e-4 (transformer-friendly)."""
-    model.backbone.freeze_all()
-    return torch.optim.AdamW(
-        [{"params": _heads(model), "lr": 5e-4, "weight_decay": 1e-4}]
-    )
-
-
-def phase1_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 1.2: features[7:] @ 1e-5, heads at 3e-4."""
-    model.backbone.freeze_lower(freeze_idx_exclusive=7)
-    upper = [
-        p
-        for i, blk in enumerate(model.backbone.features)
-        if i >= 7
-        for p in blk.parameters()
-    ]
-    return torch.optim.AdamW(
-        [
-            {"params": upper, "lr": 1e-5, "weight_decay": 1e-4},
-            {"params": _heads(model), "lr": 3e-4, "weight_decay": 1e-4},
-        ]
-    )
-
-
-def phase2_frozen_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.1: re-freeze backbone, heads at 3e-4 (warmed heads, smaller LR)."""
+    """Stage 1.1: backbone fully frozen, heads at 3e-4 (six attention blocks)."""
     model.backbone.freeze_all()
     return torch.optim.AdamW(
         [{"params": _heads(model), "lr": 3e-4, "weight_decay": 1e-4}]
     )
 
 
-def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.2: features[7:] @ 1e-5, heads at 3e-4."""
+def phase1_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
+    """Stage 1.2: features[7:] @ 1e-5, heads at 2e-4."""
     model.backbone.freeze_lower(freeze_idx_exclusive=7)
     upper = [
         p
@@ -129,7 +114,32 @@ def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
         [
             {"params": upper, "lr": 1e-5, "weight_decay": 1e-4},
-            {"params": _heads(model), "lr": 3e-4, "weight_decay": 1e-4},
+            {"params": _heads(model), "lr": 2e-4, "weight_decay": 1e-4},
+        ]
+    )
+
+
+def phase2_frozen_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
+    """Stage 2.1: re-freeze backbone, heads at 2.5e-4 (warmed heads)."""
+    model.backbone.freeze_all()
+    return torch.optim.AdamW(
+        [{"params": _heads(model), "lr": 2.5e-4, "weight_decay": 1e-4}]
+    )
+
+
+def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
+    """Stage 2.2: features[7:] @ 1e-5, heads at 2.5e-4."""
+    model.backbone.freeze_lower(freeze_idx_exclusive=7)
+    upper = [
+        p
+        for i, blk in enumerate(model.backbone.features)
+        if i >= 7
+        for p in blk.parameters()
+    ]
+    return torch.optim.AdamW(
+        [
+            {"params": upper, "lr": 1e-5, "weight_decay": 1e-4},
+            {"params": _heads(model), "lr": 2.5e-4, "weight_decay": 1e-4},
         ]
     )
 
@@ -358,6 +368,8 @@ def train_stage(
     contrastive_temp: float = 0.1,
     vicreg: bool = True,
     vicreg_weight: float = 0.05,
+    barlow: bool = True,
+    barlow_weight: float = 0.005,
     triplet: bool = False,
     triplet_weight: float = 0.05,
     hard_neg_mining: bool = True,
@@ -407,7 +419,7 @@ def train_stage(
         running = {
             "loss": 0.0, "focal": 0.0, "box": 0.0,
             "presence": 0.0, "attn": 0.0,
-            "nt_xent": 0.0, "vicreg": 0.0, "triplet": 0.0,
+            "nt_xent": 0.0, "vicreg": 0.0, "barlow": 0.0, "triplet": 0.0,
         }
         for batch in train_loader:
             support_imgs = batch["support_imgs"].to(device)
@@ -424,13 +436,13 @@ def train_stage(
             )
             loss = losses["loss"]
 
-            nt_val, vr_val, trip_val = 0.0, 0.0, 0.0
-            # Prefer per-shot prototypes (B, K, D) for nt_xent / vicreg —
+            nt_val, vr_val, bt_val, trip_val = 0.0, 0.0, 0.0, 0.0
+            # Prefer per-shot prototypes (B, K, D) for nt_xent / vicreg / barlow —
             # supervised contrastive over B*K vectors with same-episode
-            # positives is far stronger than uniformity over B prototypes.
-            con_target = out.get("per_shot_prototype")
-            if con_target is None:
-                con_target = out["prototype"]
+            # positives is far stronger than uniformity over B prototypes,
+            # and Barlow Twins genuinely needs paired views (shot 0 vs shots 1..K-1).
+            per_shot = out.get("per_shot_prototype")
+            con_target = per_shot if per_shot is not None else out["prototype"]
             if contrastive:
                 nt = nt_xent_loss(con_target, temperature=contrastive_temp)
                 loss = loss + contrastive_weight * nt
@@ -439,6 +451,10 @@ def train_stage(
                 vr = vicreg_loss(con_target)
                 loss = loss + vicreg_weight * vr
                 vr_val = vr.detach().item()
+            if barlow and per_shot is not None:
+                bt = barlow_twins_loss(per_shot)
+                loss = loss + barlow_weight * bt
+                bt_val = bt.detach().item()
             if triplet:
                 # Triplet still consumes the (B, dim) bag-level summary —
                 # one anchor per episode is what its instance_id grouping expects.
@@ -461,6 +477,7 @@ def train_stage(
             running["attn"] += float(losses.get("attn", 0.0))
             running["nt_xent"] += nt_val
             running["vicreg"] += vr_val
+            running["barlow"] += bt_val
             running["triplet"] += trip_val
 
         nb = len(train_loader)
@@ -470,6 +487,8 @@ def train_stage(
         reg_str = ""
         if contrastive or vicreg:
             reg_str += f" nt_xent={avg['nt_xent']:.4f} vicreg={avg['vicreg']:.4f}"
+        if barlow:
+            reg_str += f" barlow={avg['barlow']:.4f}"
         if triplet:
             reg_str += f" triplet={avg['triplet']:.4f}"
         print(
@@ -496,6 +515,7 @@ def train_stage(
             "attn": avg["attn"],
             "nt_xent": avg["nt_xent"],
             "vicreg": avg["vicreg"],
+            "barlow": avg["barlow"],
             "triplet": avg["triplet"],
             "val_loss": metrics["val_loss"],
             "val_iou": metrics["val_iou"],
@@ -527,6 +547,7 @@ def train_stage(
             )
             print(
                 f"  saved best.pt (val_iou={best_val_iou:.4f} "
+                f"val_map50={metrics['val_map_50']:.4f} "
                 f"val_map5095={metrics['val_map_5095']:.4f} "
                 f"val_f1_50={metrics['val_f1_50']:.4f})"
             )
@@ -607,19 +628,20 @@ def train(
     batch_size: int = 16,
     num_workers: int = 4,
     # Phase 1: VizWiz base pretraining.
-    #   Stage 1.1 bumped 15 → 20: slot attention + SupportFusion need more
-    #     warmup before they stabilise (3 attention modules, lower LR).
-    #   Stage 1.2 kept at 30: the backbone fine-tune ceiling already saturates
-    #     here, and Stage 2 will redo the work on the target domain anyway.
-    phase1_frozen_epochs: int = 20,
-    phase1_partial_epochs: int = 30,
+    #   Stage 1.1 bumped 20 → 22: query decoder adds a self-attn module and
+    #     DropPath p=0.1 drops ~10% of residuals — both slow convergence by
+    #     a small constant.
+    #   Stage 1.2 bumped 30 → 32: same DropPath effect.
+    phase1_frozen_epochs: int = 22,
+    phase1_partial_epochs: int = 32,
     # Phase 2: target-domain fine-tuning.
-    #   Stage 2.1 dropped 15 → 12: Phase 1 now produces stronger support
-    #     representations, so adapting the heads to HOTS/InsDet is faster.
-    #   Stage 2.2 kept at 50 — main work happens here (hard-neg mining is on).
-    #   Stage 2.3 dropped 15 → 10: full unfreeze is mostly polish; longer
-    #     runs at this stage tend to drift into ImageNet-feature forgetting.
-    phase2_frozen_epochs: int = 12,
+    #   Stage 2.1 bumped 12 → 14: re-warming the decoder under the new
+    #     domain (HOTS/InsDet) wants a couple more epochs given the stronger
+    #     query-side machinery.
+    #   Stage 2.2 kept at 50 — main work; hard-neg mining is on.
+    #   Stage 2.3 kept at 10 — polish stage, longer runs drift into
+    #     ImageNet-feature forgetting.
+    phase2_frozen_epochs: int = 14,
     phase2_partial_epochs: int = 50,
     phase2_full_epochs: int = 10,
     # Regularisation. nt_xent now runs SupCon over B*K=80 anchors with same-
@@ -633,6 +655,8 @@ def train(
     contrastive_temp: float = 0.07,
     vicreg: bool = True,
     vicreg_weight: float = 0.05,
+    barlow: bool = True,
+    barlow_weight: float = 0.005,
     triplet: bool = False,
     triplet_weight: float = 0.05,
     hard_neg_mining: bool = True,
@@ -673,6 +697,8 @@ def train(
         "contrastive_temp": contrastive_temp,
         "vicreg": vicreg,
         "vicreg_weight": vicreg_weight,
+        "barlow": barlow,
+        "barlow_weight": barlow_weight,
         "hard_neg_mining": hard_neg_mining,
         "seed": seed,
         "device": device,
@@ -822,7 +848,7 @@ def train(
             "name": "stage1_1",
             "epochs": phase1_frozen_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
-            "param_groups": [{"label": "heads", "lr": 5e-4}],
+            "param_groups": [{"label": "heads", "lr": 3e-4}],
         })
         if skip:
             print("=== Stage 1.1: skipped ===")
@@ -843,6 +869,8 @@ def train(
                 contrastive_temp=contrastive_temp,
                 vicreg=vicreg,
                 vicreg_weight=vicreg_weight,
+                barlow=barlow,
+                barlow_weight=barlow_weight,
                 triplet=triplet,
                 triplet_weight=triplet_weight,
                 hard_neg_mining=False,
@@ -863,7 +891,7 @@ def train(
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [
                 {"label": "backbone upper", "lr": 1e-5},
-                {"label": "heads", "lr": 3e-4},
+                {"label": "heads", "lr": 2e-4},
             ],
         })
         if skip:
@@ -885,6 +913,8 @@ def train(
                 contrastive_temp=contrastive_temp,
                 vicreg=vicreg,
                 vicreg_weight=vicreg_weight,
+                barlow=barlow,
+                barlow_weight=barlow_weight,
                 triplet=triplet,
                 triplet_weight=triplet_weight,
                 hard_neg_mining=False,
@@ -907,7 +937,7 @@ def train(
             "name": "stage2_1",
             "epochs": phase2_frozen_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
-            "param_groups": [{"label": "heads", "lr": 3e-4}],
+            "param_groups": [{"label": "heads", "lr": 2.5e-4}],
         })
         if skip:
             print("=== Stage 2.1: skipped ===")
@@ -928,6 +958,8 @@ def train(
                 contrastive_temp=contrastive_temp,
                 vicreg=vicreg,
                 vicreg_weight=vicreg_weight,
+                barlow=barlow,
+                barlow_weight=barlow_weight,
                 triplet=triplet,
                 triplet_weight=triplet_weight,
                 hard_neg_mining=hard_neg_mining,
@@ -948,7 +980,7 @@ def train(
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [
                 {"label": "backbone upper", "lr": 1e-5},
-                {"label": "heads", "lr": 3e-4},
+                {"label": "heads", "lr": 2.5e-4},
             ],
         })
         if skip:
@@ -970,6 +1002,8 @@ def train(
                 contrastive_temp=contrastive_temp,
                 vicreg=vicreg,
                 vicreg_weight=vicreg_weight,
+                barlow=barlow,
+                barlow_weight=barlow_weight,
                 triplet=triplet,
                 triplet_weight=triplet_weight,
                 hard_neg_mining=hard_neg_mining,
@@ -1013,6 +1047,8 @@ def train(
                 contrastive_temp=contrastive_temp,
                 vicreg=vicreg,
                 vicreg_weight=vicreg_weight,
+                barlow=barlow,
+                barlow_weight=barlow_weight,
                 triplet=triplet,
                 triplet_weight=triplet_weight,
                 hard_neg_mining=hard_neg_mining,
@@ -1093,10 +1129,10 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
     # Phase 1 epoch counts (set to 0 to skip a stage)
-    p.add_argument("--phase1-frozen-epochs", type=int, default=20)
-    p.add_argument("--phase1-partial-epochs", type=int, default=30)
+    p.add_argument("--phase1-frozen-epochs", type=int, default=22)
+    p.add_argument("--phase1-partial-epochs", type=int, default=32)
     # Phase 2 epoch counts
-    p.add_argument("--phase2-frozen-epochs", type=int, default=12)
+    p.add_argument("--phase2-frozen-epochs", type=int, default=14)
     p.add_argument("--phase2-partial-epochs", type=int, default=50)
     p.add_argument("--phase2-full-epochs", type=int, default=10)
     p.add_argument(
@@ -1111,6 +1147,8 @@ def main() -> None:
     p.add_argument("--contrastive-temp", type=float, default=0.07)
     p.add_argument("--no-vicreg", action="store_true")
     p.add_argument("--vicreg-weight", type=float, default=0.05)
+    p.add_argument("--no-barlow", action="store_true")
+    p.add_argument("--barlow-weight", type=float, default=0.005)
     p.add_argument("--no-hard-neg", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default=None)
@@ -1144,6 +1182,8 @@ def main() -> None:
         contrastive_temp=args.contrastive_temp,
         vicreg=not args.no_vicreg,
         vicreg_weight=args.vicreg_weight,
+        barlow=not args.no_barlow,
+        barlow_weight=args.barlow_weight,
         hard_neg_mining=not args.no_hard_neg,
         start_stage=args.start_stage,
         seed=args.seed,

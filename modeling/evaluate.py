@@ -139,6 +139,9 @@ def evaluate(
                 _compute_pr_ap(b["score"], is_tp, n_pos), 4
             )
         map_5095 = sum(ap_per_iou.values()) / len(ap_per_iou)
+        # For single-class detection AP@0.5 is mAP@0.5; alias the key so it
+        # reads symmetrically alongside map@[0.5:0.95].
+        map_50 = ap_per_iou["0.50"]
         return {
             "n": n,
             "n_pos": n_pos,
@@ -148,6 +151,7 @@ def evaluate(
             "presence_acc": round(presence_correct / n, 4),
             "ap@iou=0.5": ap_per_iou["0.50"],
             "ap@iou=0.75": ap_per_iou["0.75"],
+            "map@0.5": map_50,
             "map@[0.5:0.95]": round(map_5095, 4),
             "ap_per_iou": ap_per_iou,
             "mean_score_pos": round(
