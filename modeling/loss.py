@@ -196,7 +196,37 @@ def area_weighted_giou_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tenso
 
 
 def nt_xent_loss(prototypes: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
-    """NT-Xent uniformity loss — drives all prototypes to be maximally distinct."""
+    """NT-Xent — uniformity (B,D) or supervised (B,K,D) variant.
+
+    (B, D)   : pure uniformity — pushes all B prototypes apart. Same behaviour
+               as the original implementation; one prototype per episode means
+               B≈16 vectors per step, which is too few to learn from.
+    (B, K, D): supervised contrastive — flattens to (B*K, D) and treats the K
+               shots from the same episode as positives, all other shots as
+               negatives. This is the right signal for the problem: "different
+               views of the same instance should embed close, different
+               instances should embed far". With B=16, K=5 we get B*K=80 anchors
+               per step instead of 16 — a 5x signal density bump that directly
+               addresses the K=5 plateau.
+    """
+    if prototypes.dim() == 3:
+        b, k, d = prototypes.shape
+        if b * k < 2 or k < 2:
+            return torch.zeros((), device=prototypes.device)
+        z = F.normalize(prototypes.reshape(b * k, d), dim=-1)
+        sim = z @ z.T / temperature                                     # (BK, BK)
+        eye = torch.eye(b * k, dtype=torch.bool, device=z.device)
+        # Use a large negative (not -inf) to avoid 0*-inf=NaN downstream when
+        # pos_mask zeroes out the diagonal entries of log_prob.
+        sim = sim.masked_fill(eye, -1e9)
+        # positive mask: same episode, not self
+        ep_idx = torch.arange(b, device=z.device).repeat_interleave(k)
+        pos_mask = (ep_idx.unsqueeze(0) == ep_idx.unsqueeze(1)) & ~eye  # (BK, BK)
+        # SupCon: for each anchor, log-sum-exp over all, minus mean log-prob of positives.
+        log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+        pos_count = pos_mask.sum(dim=1).clamp(min=1)
+        loss = -(log_prob * pos_mask.float()).sum(dim=1) / pos_count
+        return loss.mean()
     B = prototypes.shape[0]
     if B < 2:
         return torch.zeros((), device=prototypes.device)
@@ -211,7 +241,17 @@ def vicreg_loss(
     gamma: float = 1.0,
     eps: float = 1e-4,
 ) -> torch.Tensor:
-    """VICReg variance + covariance terms (no invariance — single-view setup)."""
+    """VICReg variance + covariance terms.
+
+    Accepts (B, D) or (B, K, D). For the 3D case the per-shot prototypes are
+    flattened across the B*K axis so VICReg fights collapse over a much larger
+    sample (80 vs 16 with B=16, K=5), and crucially the *within-episode*
+    variance contributes to the variance term — directly penalising the
+    failure mode where the K shots produce near-identical summaries.
+    """
+    if prototypes.dim() == 3:
+        b, k, d = prototypes.shape
+        prototypes = prototypes.reshape(b * k, d)
     B, D = prototypes.shape
     if B < 2:
         return torch.zeros((), device=prototypes.device)

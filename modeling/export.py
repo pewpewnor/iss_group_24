@@ -43,7 +43,7 @@ class _PrototypeWrapper(nn.Module):
         self.model = model
 
     def forward(self, support_imgs: torch.Tensor) -> torch.Tensor:
-        tokens, _ = self.model.encode_support(support_imgs)
+        tokens, _, _ = self.model.encode_support(support_imgs)
         return tokens
 
 
