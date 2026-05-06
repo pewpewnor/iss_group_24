@@ -989,6 +989,7 @@ def train(
             num_workers=num_workers,
             collate_fn=collate,
             pin_memory=(device_t.type == "cuda"),
+            persistent_workers=(num_workers > 0),
         )
 
     def _build_train_loader(sources: list[str]) -> tuple[EpisodeDataset, DataLoader]:
@@ -1008,6 +1009,7 @@ def train(
             collate_fn=collate,
             pin_memory=(device_t.type == "cuda"),
             drop_last=True,
+            persistent_workers=(num_workers > 0),
         )
         return ds, loader
 
