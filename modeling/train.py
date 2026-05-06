@@ -888,16 +888,18 @@ def train(
     phase1_frozen_epochs: int = 15,
     phase1_partial_epochs: int = 40,
     # Phase 2: target-domain fine-tuning.
-    #   Stage 2.1 set to 10: with K-fold CV in play the per-fold val pool is
-    #     already noisy, so additional re-warmup epochs at frozen-backbone
-    #     don't move the needle. Heads adapt fast under the new domain.
-    #   Stage 2.2 set to 30 — main work; hard-neg mining is on.
-    #   Stage 2.3 set to 15 — polish stage; bumped from 10 for a small
-    #     extra polish budget while keeping ImageNet-feature drift in the
-    #     lower backbone bounded (5e-6 × 15 epochs is still controlled).
-    phase2_frozen_epochs: int = 10,
-    phase2_partial_epochs: int = 30,
-    phase2_full_epochs: int = 15,
+    # Defaults are sized for 3-fold CV (phase2_cv_folds=3).
+    # Each CV epoch trains all 3 folds (~90 instances each), so 1 CV epoch
+    # covers ~2.2× the data of a single-run epoch over the full 123-instance
+    # pool. Budgets are scaled down accordingly from the single-run baselines
+    # (10→5, 30→15, 15→8) so total gradient exposure stays comparable.
+    #   Stage 2.1 (5 CV epochs): re-warmup with frozen backbone; heads adapt
+    #     fast so a short budget is fine.
+    #   Stage 2.2 (15 CV epochs): main fine-tuning with hard-neg mining on.
+    #   Stage 2.3 (8 CV epochs): full-unfreeze polish at very low LR.
+    phase2_frozen_epochs: int = 5,
+    phase2_partial_epochs: int = 15,
+    phase2_full_epochs: int = 8,
     # K-fold cross-validation for Phase 2. With ~14 HOTS+InsDet instances the
     # fixed val split (~3 instances) is too small to give a stable signal —
     # CV pools the existing train+val splits back together and rotates a held-
@@ -971,6 +973,24 @@ def train(
 
     device_t = torch.device(device)
 
+    # Workers spawned via "forkserver" start from a minimal template process —
+    # no model weights, no PyTorch CUDA context, no parent-process RAM
+    # inherited. This avoids the OOM-kill seen on Colab T4 with default fork
+    # (each worker would copy the entire parent address space, ~3-4 GB with
+    # the model loaded). prefetch_factor=2 keeps the queue small.
+    _mp_ctx = "forkserver" if num_workers > 0 else None
+    _loader_kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "collate_fn": collate,
+        "pin_memory": (device_t.type == "cuda"),
+    }
+    if num_workers > 0:
+        _loader_kwargs.update({
+            "multiprocessing_context": _mp_ctx,
+            "persistent_workers": True,
+            "prefetch_factor": 2,
+        })
+
     def _make_val_loader(sources: list[str]) -> DataLoader:
         ds = EpisodeDataset(
             manifest_path=str(manifest),
@@ -986,10 +1006,7 @@ def train(
             ds,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            collate_fn=collate,
-            pin_memory=(device_t.type == "cuda"),
-            persistent_workers=(num_workers > 0),
+            **_loader_kwargs,
         )
 
     def _build_train_loader(sources: list[str]) -> tuple[EpisodeDataset, DataLoader]:
@@ -1005,11 +1022,8 @@ def train(
             ds,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=num_workers,
-            collate_fn=collate,
-            pin_memory=(device_t.type == "cuda"),
             drop_last=True,
-            persistent_workers=(num_workers > 0),
+            **_loader_kwargs,
         )
         return ds, loader
 
