@@ -23,6 +23,7 @@ Query images:
 
 from __future__ import annotations
 
+import functools
 import json
 import random
 from pathlib import Path
@@ -352,6 +353,7 @@ class _Augment:
         return t, bbox_t
 
 
+@functools.lru_cache(maxsize=None)
 def _load_image(path: Path) -> Image.Image:
     return Image.open(path).convert("RGB")
 

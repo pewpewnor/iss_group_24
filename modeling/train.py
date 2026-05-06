@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,47 @@ from modeling.loss import (
     vicreg_loss,
 )
 from modeling.model import FewShotLocalizer, decode
+
+
+# ---------------------------------------------------------------------------
+# Async checkpoint helper
+# ---------------------------------------------------------------------------
+
+_CKPT_TMP_DIR = Path("/tmp/opencode/ckpts")
+_ckpt_copy_lock = threading.Lock()
+_pending_copies: list[threading.Thread] = []
+
+
+def _save_checkpoint_async(payload: dict, drive_path: Path) -> None:
+    """Write checkpoint to /tmp first (fast), then copy to Drive in background.
+
+    The caller must invoke _flush_pending_copies() before the training function
+    returns so Drive is always up-to-date before the next Colab cell starts.
+    """
+    _CKPT_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _CKPT_TMP_DIR / drive_path.name
+    torch.save(payload, tmp)
+
+    def _copy() -> None:
+        try:
+            drive_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(tmp, drive_path)
+        except Exception as exc:
+            print(f"  warn: async ckpt copy to {drive_path} failed: {exc}")
+
+    t = threading.Thread(target=_copy, daemon=True)
+    with _ckpt_copy_lock:
+        _pending_copies.append(t)
+    t.start()
+
+
+def _flush_pending_copies(timeout: float = 120.0) -> None:
+    """Wait for all in-flight Drive copy threads to finish."""
+    with _ckpt_copy_lock:
+        threads = list(_pending_copies)
+        _pending_copies.clear()
+    for t in threads:
+        t.join(timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +239,13 @@ def build_proto_cache(
     model: FewShotLocalizer,
     dataset: EpisodeDataset,
     device: torch.device,
+    batch_size: int = 16,
 ) -> dict[str, torch.Tensor]:
     """Compute one prototype per instance (eval augmentation, fixed seed).
 
     Called once per epoch before the training loop so _sample_query can
     find hard negatives by cosine similarity between prototype vectors.
+    Instances are processed in batches of `batch_size` to reduce GPU overhead.
     """
     was_training = model.training
     model.eval()
@@ -209,23 +254,31 @@ def build_proto_cache(
     rng = _random.Random(0)
     cache: dict[str, torch.Tensor] = {}
 
-    for instance in dataset.instances:
-        pool = instance["support_images"]
-        k = dataset.n_support
-        samples = [rng.choice(pool) for _ in range(k)] if len(pool) < k else rng.sample(pool, k)
+    k = dataset.n_support
+    instances = dataset.instances
 
-        imgs = []
-        for s in samples:
-            img = _load_image(dataset._resolve(s["path"]))
-            t, _ = aug(img, list(s["bbox"]), rng)
-            imgs.append(t)
+    for start in range(0, len(instances), batch_size):
+        batch_instances = instances[start : start + batch_size]
+        batch_support: list[torch.Tensor] = []
+        for instance in batch_instances:
+            pool = instance["support_images"]
+            samples = (
+                [rng.choice(pool) for _ in range(k)]
+                if len(pool) < k
+                else rng.sample(pool, k)
+            )
+            imgs = []
+            for s in samples:
+                img = _load_image(dataset._resolve(s["path"]))
+                t, _ = aug(img, list(s["bbox"]), rng)
+                imgs.append(t)
+            batch_support.append(torch.stack(imgs))
 
-        support_imgs_t = torch.stack(imgs).unsqueeze(0).to(device)
+        support_imgs_t = torch.stack(batch_support).to(device)
         tokens, _, _ = model.encode_support(support_imgs_t)
-        # Use the attention-pooled bag summary so the cached vector is in the
-        # same space as out["prototype"] — matches the inner-product semantics
-        # the hard-negative miner relies on.
-        cache[instance["instance_id"]] = model.support_pool(tokens).squeeze(0).cpu()
+        prototypes = model.support_pool(tokens)
+        for i, instance in enumerate(batch_instances):
+            cache[instance["instance_id"]] = prototypes[i].cpu()
 
     if was_training:
         model.train()
@@ -396,6 +449,7 @@ def train_stage(
     start_epoch: int = 1,
     scheduler_state: dict | None = None,
     prior_history: list[dict] | None = None,
+    fold_label: str | None = None,
 ) -> tuple[float, list[dict]]:
     total_steps = max(epochs * len(train_loader), 1)
     # 5% warmup, capped at 500 steps (was 200). Transformer modules in the
@@ -509,17 +563,14 @@ def train_stage(
             reg_str += f" barlow={avg['barlow']:.4f}"
         if triplet:
             reg_str += f" triplet={avg['triplet']:.4f}"
+        prefix = f"  [{fold_label}]" if fold_label else f"[{stage_name}] epoch {epoch}/{epochs}"
         print(
-            f"[{stage_name}] epoch {epoch}/{epochs} "
+            f"{prefix} "
             f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f} "
             f"presence={avg['presence']:.4f} attn={avg['attn']:.4f}{reg_str}) "
-            f"val_loss={metrics['val_loss']:.4f} "
             f"val_iou={metrics['val_iou']:.4f} "
-            f"val_contain={metrics['val_contain']:.4f} "
             f"val_map50={metrics['val_map_50']:.4f} "
-            f"val_map5095={metrics['val_map_5095']:.4f} "
             f"val_f1_50={metrics['val_f1_50']:.4f} "
-            f"val_presence={metrics['val_presence_acc']:.4f} "
             f"time={elapsed:.1f}s"
         )
 
@@ -549,7 +600,7 @@ def train_stage(
 
         if metrics["val_iou"] > best_val_iou:
             best_val_iou = metrics["val_iou"]
-            torch.save(
+            _save_checkpoint_async(
                 {
                     "model": model.state_dict(),
                     "val_iou": best_val_iou,
@@ -570,24 +621,26 @@ def train_stage(
                 f"val_f1_50={metrics['val_f1_50']:.4f})"
             )
 
-        # Two rolling full-state writes per epoch:
-        #   last.pt          — the global "most recent" pointer (used by default
-        #                       auto-resume across the whole pipeline)
-        #   <stage_name>.pt  — the per-stage rolling snapshot. After this write
-        #                       it always reflects the latest completed epoch of
-        #                       that stage, so killing the run mid-stage and
-        #                       passing --resume model/<stage>.pt restores
-        #                       optimizer + scheduler + rng + history exactly.
-        full_ckpt = _make_full_ckpt(
-            model, optimizer, scheduler, stage_name, epoch, epochs,
-            best_val_iou, prior + epoch_history,
-        )
-        torch.save(full_ckpt, out_dir / "last.pt")
-        torch.save(full_ckpt, out_dir / f"{stage_name}.pt")
-        print(
-            f"  saved last.pt + {stage_name}.pt ({stage_name} epoch {epoch}/{epochs})"
-        )
+        if not fold_label:
+            # Two rolling full-state writes per epoch:
+            #   last.pt          — the global "most recent" pointer (used by default
+            #                       auto-resume across the whole pipeline)
+            #   <stage_name>.pt  — the per-stage rolling snapshot. After this write
+            #                       it always reflects the latest completed epoch of
+            #                       that stage, so killing the run mid-stage and
+            #                       passing --resume model/<stage>.pt restores
+            #                       optimizer + scheduler + rng + history exactly.
+            full_ckpt = _make_full_ckpt(
+                model, optimizer, scheduler, stage_name, epoch, epochs,
+                best_val_iou, prior + epoch_history,
+            )
+            _save_checkpoint_async(full_ckpt, out_dir / "last.pt")
+            _save_checkpoint_async(full_ckpt, out_dir / f"{stage_name}.pt")
+            print(
+                f"  saved last.pt + {stage_name}.pt ({stage_name} epoch {epoch}/{epochs})"
+            )
 
+    _flush_pending_copies()
     return best_val_iou, epoch_history
 
 
@@ -1312,75 +1365,213 @@ def train(
         folds = _build_phase2_cv_folds(
             manifest_path=manifest, k=phase2_cv_folds, seed=seed
         )
+        n_total_instances = sum(len(f["val_ids"]) for f in folds)
         print(
             f"=== Phase 2 K-fold CV: {phase2_cv_folds} folds over "
-            f"{sum(len(f['val_ids']) for f in folds)} HOTS+InsDet instances ==="
+            f"{n_total_instances} HOTS+InsDet instances ==="
         )
-        cv_results: list[dict] = []
-        best_fold_iou = -1.0
-        best_fold_idx = -1
+
+        # Build all fold loaders up front and print a single size summary.
+        fold_structs: list[dict] = []
         for fold_idx, fold in enumerate(folds):
             train_ids = set(fold["train_ids"])
             val_ids = set(fold["val_ids"])
-            print(
-                f"\n--- Fold {fold_idx + 1}/{phase2_cv_folds}: "
-                f"train_ids={len(train_ids)} val_ids={len(val_ids)} "
-                f"(val={sorted(val_ids)}) ---"
-            )
-            # Reset model to post-Phase-1 state for this fold.
             model.load_state_dict(phase1_state)
-            # Build fold-specific train + val loaders. Phase 2 train pulls
-            # from all PHASE2 sources; vizwiz_novel passes through untouched
-            # while hots/insdet are restricted to the fold's train_ids.
             fold_train_ds, fold_train_loader = _build_train_loader(PHASE2_SOURCES)
             _filter_dataset_for_fold(fold_train_ds, train_ids=train_ids)
             fold_val_loader = _make_val_loader(list(PHASE2_VAL_SOURCES))
             _filter_dataset_for_fold(fold_val_loader.dataset, val_ids=val_ids)  # type: ignore[arg-type]
-            print(
-                f"  fold dataset sizes: train={len(fold_train_ds.instances)} "
-                f"val={len(fold_val_loader.dataset.instances)}"  # type: ignore[attr-defined]
-            )
-
-            fold_history: list[dict] = []
-            fold_best = best
-            if phase2_frozen_epochs > 0:
-                fold_best, hist = _run_phase2_stage_2_1(
-                    fold_train_loader, fold_val_loader, fold_best, fold_history
-                )
-                fold_history.extend(hist)
-            if phase2_partial_epochs > 0:
-                fold_best, hist = _run_phase2_stage_2_2(
-                    fold_train_loader, fold_val_loader, fold_best, fold_history
-                )
-                fold_history.extend(hist)
-            if phase2_full_epochs > 0:
-                fold_best, hist = _run_phase2_stage_2_3(
-                    fold_train_loader, fold_val_loader, fold_best, fold_history
-                )
-                fold_history.extend(hist)
-
-            cv_results.append({
-                "fold": fold_idx,
+            fold_structs.append({
+                "fold_idx": fold_idx,
                 "train_ids": sorted(train_ids),
                 "val_ids": sorted(val_ids),
-                "history": fold_history,
+                "train_loader": fold_train_loader,
+                "train_ds": fold_train_ds,
+                "val_loader": fold_val_loader,
+                "history": [],
+                "best": best,
+                "model_state": {k: v.detach().clone() for k, v in model.state_dict().items()},
             })
-            full_history.extend(fold_history)
-            if fold_best > best_fold_iou:
-                best_fold_iou = fold_best
-                best_fold_idx = fold_idx
+            n_train = len(fold_train_ds.instances)
+            n_val = len(fold_val_loader.dataset.instances)  # type: ignore[attr-defined]
+            print(f"  fold {fold_idx + 1}/{phase2_cv_folds}: {n_train} train, {n_val} val")
 
-            # Per-fold rolling checkpoints under analysis/cv/fold_<i>/.
-            fold_dir = analysis_dir / "cv" / f"fold_{fold_idx}"
-            fold_dir.mkdir(parents=True, exist_ok=True)
-            with open(fold_dir / "history.json", "w") as f:
-                json.dump(fold_history, f, indent=2)
+        cv_results: list[dict] = []
+        best_fold_iou = -1.0
+        best_fold_idx = -1
+
+        def _run_cv_stage(
+            stage_name: str,
+            stage_epochs: int,
+            setup_fold_fn: Any,
+        ) -> None:
+            """Run `stage_epochs` CV epochs for one stage.
+
+            Each CV epoch trains every fold for exactly 1 epoch, then prints
+            a summary line with the mean val metrics across folds.
+
+            `setup_fold_fn(fold_struct)` is called once per fold before the
+            first epoch to build the optimizer, configure hard-neg ratio, etc.
+            It must return (optimizer, neg_prob_schedule, attn_loss_weight,
+            contrastive_weight_local).
+            """
+            nonlocal best, best_fold_iou, best_fold_idx
+
+            print(f"\n=== {stage_name} CV: {stage_epochs} epochs × {phase2_cv_folds} folds ===")
+
+            # Per-fold optimizer + scheduler, built once and reused across epochs.
+            fold_opts: list[dict] = []
+            logged_trainable = False
+            for fs in fold_structs:
+                model.load_state_dict(fs["model_state"])
+                opt, neg_sched, attn_w, cont_w = setup_fold_fn(fs)
+                if not logged_trainable:
+                    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                    print(f"  trainable params: {n_train / 1e6:.2f}M")
+                    logged_trainable = True
+                total_steps = max(stage_epochs * len(fs["train_loader"]), 1)
+                warmup_steps = max(1, min(500, total_steps // 20))
+                warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                    opt, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+                )
+                cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-7
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    opt, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps]
+                )
+                fold_opts.append({
+                    "opt": opt,
+                    "scheduler": scheduler,
+                    "sched_state": None,
+                    "neg_sched": neg_sched,
+                    "attn_w": attn_w,
+                    "cont_w": cont_w,
+                })
+
+            for cv_epoch in range(1, stage_epochs + 1):
+                print(f"\n  CV epoch {cv_epoch}/{stage_epochs}")
+                epoch_val_ious: list[float] = []
+                epoch_val_map50s: list[float] = []
+
+                for fi, (fs, fo) in enumerate(zip(fold_structs, fold_opts)):
+                    fold_label = f"fold {fi + 1}/{phase2_cv_folds}"
+                    model.load_state_dict(fs["model_state"])
+
+                    _, hist = train_stage(
+                        model=model,
+                        optimizer=fo["opt"],
+                        train_loader=fs["train_loader"],
+                        val_loader=fs["val_loader"],
+                        device=device_t,
+                        epochs=stage_epochs,
+                        stage_name=stage_name,
+                        out_dir=out_dir,
+                        best_val_iou=fs["best"],
+                        contrastive=contrastive,
+                        contrastive_weight=fo["cont_w"],
+                        contrastive_temp=contrastive_temp,
+                        vicreg=vicreg,
+                        vicreg_weight=vicreg_weight,
+                        barlow=barlow,
+                        barlow_weight=barlow_weight,
+                        triplet=triplet,
+                        triplet_weight=triplet_weight,
+                        hard_neg_mining=hard_neg_mining,
+                        neg_prob_schedule=fo["neg_sched"],
+                        attn_loss_weight=fo["attn_w"],
+                        start_epoch=cv_epoch,
+                        scheduler_state=fo["sched_state"],
+                        prior_history=fs["history"],
+                        fold_label=fold_label,
+                    )
+                    for _ in range(len(fs["train_loader"])):
+                        fo["scheduler"].step()
+                    fo["sched_state"] = fo["scheduler"].state_dict()
+                    fs["model_state"] = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                    if hist:
+                        row = hist[0]
+                        fs["history"].append(row)
+                        v_iou = row["val_iou"]
+                        epoch_val_ious.append(v_iou)
+                        epoch_val_map50s.append(row["val_map_50"])
+                        if v_iou > fs["best"]:
+                            fs["best"] = v_iou
+
+                mean_iou = sum(epoch_val_ious) / len(epoch_val_ious) if epoch_val_ious else 0.0
+                mean_map50 = sum(epoch_val_map50s) / len(epoch_val_map50s) if epoch_val_map50s else 0.0
+                fold_ious_str = "  ".join(f"f{i+1}:{v:.4f}" for i, v in enumerate(epoch_val_ious))
+                print(
+                    f"  mean val_iou={mean_iou:.4f}  mean val_map50={mean_map50:.4f}"
+                    f"  ({fold_ious_str})"
+                )
+
+                # After each CV epoch, save rolling checkpoints (last fold's model state).
+                model.load_state_dict(fold_structs[-1]["model_state"])
+                full_ckpt = _make_full_ckpt(
+                    model, fold_opts[-1]["opt"], fold_opts[-1]["scheduler"],
+                    stage_name, cv_epoch, stage_epochs,
+                    max(fs["best"] for fs in fold_structs),
+                    full_history,
+                )
+                _save_checkpoint_async(full_ckpt, out_dir / "last.pt")
+                _save_checkpoint_async(full_ckpt, out_dir / f"{stage_name}.pt")
+                print(
+                    f"  saved last.pt + {stage_name}.pt (cv epoch {cv_epoch}/{stage_epochs})"
+                )
+
+            _flush_pending_copies()
+
+            for fi, fs in enumerate(fold_structs):
+                fold_best = fs["best"]
+                stage_history = list(fs["history"])
+                cv_results.append({
+                    "fold": fi,
+                    "stage": stage_name,
+                    "train_ids": fs["train_ids"],
+                    "val_ids": fs["val_ids"],
+                    "history": stage_history,
+                })
+                full_history.extend(stage_history)
+                fs["history"] = []
+                if fold_best > best_fold_iou:
+                    best_fold_iou = fold_best
+                    best_fold_idx = fi
+                fold_dir = analysis_dir / "cv" / f"fold_{fi}"
+                fold_dir.mkdir(parents=True, exist_ok=True)
+                with open(fold_dir / f"history_{stage_name}.json", "w") as f:
+                    json.dump(stage_history, f, indent=2)
+
+            best = max(best, best_fold_iou)
+
+        if phase2_frozen_epochs > 0:
+            def _setup_2_1(fs: dict) -> tuple:
+                model.load_state_dict(fs["model_state"])
+                fs["train_loader"].dataset.set_hard_neg_ratio(0.25)  # type: ignore[attr-defined]
+                opt = phase2_frozen_optimizer(model)
+                return opt, {1: 0.0, 4: 0.15}, 1.0, contrastive_weight_p1
+            _run_cv_stage("stage2_1", phase2_frozen_epochs, _setup_2_1)
+
+        if phase2_partial_epochs > 0:
+            def _setup_2_2(fs: dict) -> tuple:
+                model.load_state_dict(fs["model_state"])
+                fs["train_loader"].dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
+                opt = phase2_partial_optimizer(model)
+                return opt, {1: 0.1, 8: 0.3}, 1.0, contrastive_weight_p2
+            _run_cv_stage("stage2_2", phase2_partial_epochs, _setup_2_2)
+
+        if phase2_full_epochs > 0:
+            def _setup_2_3(fs: dict) -> tuple:
+                model.load_state_dict(fs["model_state"])
+                fs["train_loader"].dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
+                opt = phase2_full_optimizer(model)
+                return opt, {1: 0.3}, 1.0, contrastive_weight_p2
+            _run_cv_stage("stage2_3", phase2_full_epochs, _setup_2_3)
 
         print(
-            f"\n=== Phase 2 CV done. best fold = {best_fold_idx} "
+            f"\n=== Phase 2 CV done. best fold = {best_fold_idx + 1}/{phase2_cv_folds} "
             f"(val_iou={best_fold_iou:.4f}) ==="
         )
-        best = max(best, best_fold_iou)
         _save_cv_results(cv_results, analysis_dir)
         # Rebuild an unfiltered Phase-2 train_ds so the end-of-run prototype
         # similarity plot covers the entire instance pool, not the last fold.
