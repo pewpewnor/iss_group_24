@@ -83,15 +83,19 @@ def _heads(model: FewShotLocalizer) -> list:
     )
 
 
-# LR notes (2026-05 architecture, post query-decoder):
+# LR notes (2026-05 architecture, post query-decoder + Phase-2 K-fold CV):
 #   The heads now contain SIX attention modules: SupportTokenizer slot attn,
 #   2× SupportFusion encoder attn, AttentionPool query, and the QueryDecoder's
 #   self-attn + cross-attn. Plus DropPath p=0.1 on three decoder branches
 #   adds gradient noise. We drop stage1_1 head LR another step (5e-4 → 3e-4)
 #   to avoid attention collapse on the new self-attn, and stage1_2 → 2e-4
-#   once the backbone joins. Stage 2.x heads stay at 2.5e-4 — they're already
-#   warmed and the target-domain task primarily exercises the cross-attn
-#   path, which is more LR-tolerant than fresh self-attn.
+#   once the backbone joins. Stage 2.1 heads stay at 2.5e-4 (frozen-backbone
+#   re-warmup is short, 10 epochs). Stage 2.2 heads dropped 2.5e-4 → 2e-4:
+#   K-fold CV trains each fold on ~10-11 HOTS+InsDet instances (+ 16 vizwiz
+#   novel), so the smaller per-fold dataset wants slightly cooler heads to
+#   avoid overfitting noise. Stage 2.3 backbone dropped 5e-6 → 3e-6: epoch
+#   budget went 10 → 15 (+50%), so we offset the longer cosine schedule to
+#   keep cumulative low-level ImageNet-feature drift bounded.
 
 
 def phase1_frozen_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
@@ -128,7 +132,13 @@ def phase2_frozen_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
 
 
 def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.2: features[7:] @ 1e-5, heads at 2.5e-4."""
+    """Stage 2.2: features[7:] @ 1e-5, heads at 2e-4.
+
+    Heads dropped 2.5e-4 → 2e-4: with K-fold CV active, each fold trains on
+    only ~10-11 HOTS+InsDet instances (plus 16 vizwiz_novel). At that scale
+    2.5e-4 over 30 epochs risks overfitting noise on the small fold; 2e-4
+    gives cleaner gradients while staying productive.
+    """
     model.backbone.freeze_lower(freeze_idx_exclusive=7)
     upper = [
         p
@@ -139,13 +149,21 @@ def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
         [
             {"params": upper, "lr": 1e-5, "weight_decay": 1e-4},
-            {"params": _heads(model), "lr": 2.5e-4, "weight_decay": 1e-4},
+            {"params": _heads(model), "lr": 2e-4, "weight_decay": 1e-4},
         ]
     )
 
 
 def phase2_full_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.3: full unfreeze. Lower layers at 5e-6 to preserve ImageNet features."""
+    """Stage 2.3: full unfreeze. Backbone at 3e-6 to preserve ImageNet features.
+
+    Backbone dropped 5e-6 → 3e-6: epoch budget went 10 → 15 (+50%), so the
+    cumulative gradient flow through `features[0:7]` (low-level ImageNet
+    filters) grows proportionally. Lowering the backbone LR offsets the
+    longer schedule and keeps low-level feature drift bounded. Heads stay
+    at 5e-5 — heads are not the catastrophic-forgetting risk and need the
+    polish budget.
+    """
     model.backbone.unfreeze_all()
     lower = [
         p
@@ -161,8 +179,8 @@ def phase2_full_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
     ]
     return torch.optim.AdamW(
         [
-            {"params": lower, "lr": 5e-6, "weight_decay": 1e-4},
-            {"params": upper, "lr": 5e-6, "weight_decay": 1e-4},
+            {"params": lower, "lr": 3e-6, "weight_decay": 1e-4},
+            {"params": upper, "lr": 3e-6, "weight_decay": 1e-4},
             {"params": _heads(model), "lr": 5e-5, "weight_decay": 1e-4},
         ]
     )
@@ -643,6 +661,156 @@ def _eval_stage(
 
 
 # ---------------------------------------------------------------------------
+# K-fold cross-validation helpers (Phase 2 only)
+# ---------------------------------------------------------------------------
+
+
+PHASE2_CV_SOURCES = ("hots", "insdet")
+
+
+def _build_phase2_cv_folds(
+    manifest_path: str | Path,
+    k: int,
+    seed: int,
+) -> list[dict[str, list[str]]]:
+    """Pool HOTS+InsDet instances from the manifest's train+val splits and
+    partition their instance_ids into K folds.
+
+    Each fold is `{"train_ids": [...], "val_ids": [...]}` covering only the
+    HOTS+InsDet instances. vizwiz_novel and Phase-1 sources are unaffected
+    (vizwiz_novel always remains fully in training across all folds).
+    """
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    pool: list[str] = []
+    for inst in manifest["instances"]:
+        if inst.get("source") in PHASE2_CV_SOURCES and inst.get("split") in ("train", "val"):
+            pool.append(inst["instance_id"])
+    pool = sorted(set(pool))
+    rng = _random.Random(seed)
+    rng.shuffle(pool)
+    n = len(pool)
+    if k <= 1 or n < k:
+        raise ValueError(
+            f"phase2_cv_folds={k} requires k>=2 and pool>=k; got pool={n}"
+        )
+    # Even-sized fold partition (last folds absorb the remainder).
+    fold_sizes = [n // k] * k
+    for i in range(n % k):
+        fold_sizes[i] += 1
+    folds: list[dict[str, list[str]]] = []
+    cursor = 0
+    for fs in fold_sizes:
+        val_ids = pool[cursor : cursor + fs]
+        train_ids = [x for x in pool if x not in set(val_ids)]
+        folds.append({"train_ids": train_ids, "val_ids": val_ids})
+        cursor += fs
+    return folds
+
+
+def _filter_dataset_for_fold(
+    ds: EpisodeDataset,
+    train_ids: set[str] | None = None,
+    val_ids: set[str] | None = None,
+) -> None:
+    """In-place filter of `ds.instances` to a fold-specific subset.
+
+    For training datasets pass `train_ids` — vizwiz_novel instances are kept
+    automatically (they never enter CV). For validation datasets pass
+    `val_ids` — the dataset is restricted to exactly those instance ids.
+    """
+    if val_ids is not None:
+        ds.instances = [i for i in ds.instances if i["instance_id"] in val_ids]
+        return
+    if train_ids is not None:
+        keep: list[dict[str, Any]] = []
+        for inst in ds.instances:
+            if inst.get("source") == "vizwiz_novel":
+                keep.append(inst)
+            elif inst["instance_id"] in train_ids:
+                keep.append(inst)
+        ds.instances = keep
+
+
+def _save_cv_results(
+    cv_results: list[dict],
+    analysis_dir: Path,
+) -> None:
+    """Write per-fold + aggregated CV results to analysis/cv_results.json.
+
+    Schema:
+      {
+        "n_folds": K,
+        "folds": [{"fold": i, "val_ids": [...], "history": [...]}, ...],
+        "aggregate": {
+            "stage2_1": {"epoch_1": {"val_iou_mean": ..., ...}, ...},
+            "stage2_2": {...},
+            "stage2_3": {...},
+        }
+      }
+    """
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    aggregate: dict[str, dict[str, dict[str, float]]] = {}
+    metric_keys = (
+        "val_loss",
+        "val_iou",
+        "val_contain",
+        "val_map_50",
+        "val_map_5095",
+        "val_f1_50",
+        "val_presence_acc",
+    )
+    # Group every (stage, epoch) pair across folds.
+    by_key: dict[tuple[str, int], dict[str, list[float]]] = {}
+    for fold in cv_results:
+        for row in fold["history"]:
+            stage = row.get("stage")
+            epoch = int(row.get("epoch", 0))
+            if not stage or not epoch:
+                continue
+            bucket = by_key.setdefault((stage, epoch), {k: [] for k in metric_keys})
+            for k in metric_keys:
+                v = row.get(k)
+                if isinstance(v, (int, float)):
+                    bucket[k].append(float(v))
+    for (stage, epoch), vals in by_key.items():
+        stage_dict = aggregate.setdefault(stage, {})
+        epoch_dict: dict[str, float] = {}
+        for k, lst in vals.items():
+            if lst:
+                epoch_dict[f"{k}_mean"] = sum(lst) / len(lst)
+                epoch_dict[f"{k}_min"] = min(lst)
+                epoch_dict[f"{k}_max"] = max(lst)
+        epoch_dict["n_folds"] = len(next(iter(vals.values())))
+        stage_dict[f"epoch_{epoch}"] = epoch_dict
+
+    payload = {
+        "n_folds": len(cv_results),
+        "folds": cv_results,
+        "aggregate": aggregate,
+    }
+    p = analysis_dir / "cv_results.json"
+    with open(p, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"  cv results -> {p}")
+
+    # Pretty summary printed to console: final-epoch val_iou mean per stage.
+    print("CV summary (mean across folds, final epoch of each stage):")
+    for stage in ("stage2_1", "stage2_2", "stage2_3"):
+        stage_agg = aggregate.get(stage)
+        if not stage_agg:
+            continue
+        last = max(int(k.split("_")[1]) for k in stage_agg)
+        m = stage_agg[f"epoch_{last}"]
+        print(
+            f"  {stage} (epoch {last}, n_folds={int(m['n_folds'])}): "
+            f"val_iou={m.get('val_iou_mean', 0):.4f} "
+            f"val_map50={m.get('val_map_50_mean', 0):.4f} "
+            f"val_f1_50={m.get('val_f1_50_mean', 0):.4f}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -662,19 +830,27 @@ def train(
     #   Stage 1.1 bumped 20 → 22: query decoder adds a self-attn module and
     #     DropPath p=0.1 drops ~10% of residuals — both slow convergence by
     #     a small constant.
-    #   Stage 1.2 bumped 30 → 32: same DropPath effect.
+    #   Stage 1.2 bumped 30 → 40: extended to allow fuller convergence.
     phase1_frozen_epochs: int = 22,
-    phase1_partial_epochs: int = 32,
+    phase1_partial_epochs: int = 40,
     # Phase 2: target-domain fine-tuning.
-    #   Stage 2.1 bumped 12 → 14: re-warming the decoder under the new
-    #     domain (HOTS/InsDet) wants a couple more epochs given the stronger
-    #     query-side machinery.
-    #   Stage 2.2 kept at 50 — main work; hard-neg mining is on.
-    #   Stage 2.3 kept at 10 — polish stage, longer runs drift into
-    #     ImageNet-feature forgetting.
-    phase2_frozen_epochs: int = 14,
-    phase2_partial_epochs: int = 50,
-    phase2_full_epochs: int = 10,
+    #   Stage 2.1 set to 10: with K-fold CV in play the per-fold val pool is
+    #     already noisy, so additional re-warmup epochs at frozen-backbone
+    #     don't move the needle. Heads adapt fast under the new domain.
+    #   Stage 2.2 set to 30 — main work; hard-neg mining is on.
+    #   Stage 2.3 set to 15 — polish stage; bumped from 10 for a small
+    #     extra polish budget while keeping ImageNet-feature drift in the
+    #     lower backbone bounded (5e-6 × 15 epochs is still controlled).
+    phase2_frozen_epochs: int = 10,
+    phase2_partial_epochs: int = 30,
+    phase2_full_epochs: int = 15,
+    # K-fold cross-validation for Phase 2. With ~14 HOTS+InsDet instances the
+    # fixed val split (~3 instances) is too small to give a stable signal —
+    # CV pools the existing train+val splits back together and rotates a held-
+    # out val fold across runs. Val metrics are monitored only (no early
+    # stopping, no checkpoint gating). vizwiz_novel always stays in training.
+    # Set to 0 to disable (single-run, current behaviour).
+    phase2_cv_folds: int = 0,
     # Regularisation. nt_xent now runs SupCon over B*K=80 anchors with same-
     # episode positives instead of uniformity over B=16 prototypes — the
     # gradient density is ~5x higher per step, so the contrastive loss
@@ -722,6 +898,7 @@ def train(
         "phase2_frozen_epochs": phase2_frozen_epochs,
         "phase2_partial_epochs": phase2_partial_epochs,
         "phase2_full_epochs": phase2_full_epochs,
+        "phase2_cv_folds": phase2_cv_folds,
         "contrastive": contrastive,
         "contrastive_weight_p1": contrastive_weight_p1,
         "contrastive_weight_p2": contrastive_weight_p2,
@@ -960,135 +1137,280 @@ def train(
 
     # -----------------------------------------------------------------------
     # Phase 2: target-domain fine-tuning
+    #
+    # When phase2_cv_folds > 0, the HOTS+InsDet instances pooled from the
+    # manifest's existing train+val splits are partitioned into K folds.
+    # For each fold the model is reset to its post-Phase-1 state and all
+    # three Phase-2 stages run end-to-end with that fold's val held out.
+    # Val metrics are MONITORED ONLY — no early stopping, no checkpoint
+    # gating on val. vizwiz_novel always stays in training across folds.
     # -----------------------------------------------------------------------
 
+    # Stage configs registered once regardless of CV (used by the LR plot).
     if phase2_frozen_epochs > 0:
-        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_1", phase2_frozen_epochs)
         stage_configs_for_lr.append({
             "name": "stage2_1",
             "epochs": phase2_frozen_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [{"label": "heads", "lr": 2.5e-4}],
         })
-        if skip:
-            print("=== Stage 2.1: skipped ===")
-        else:
-            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-            print(f"=== Stage 2.1: HOTS+InsDet+VizWiz novel, backbone re-frozen{resume_str} ===")
-            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
-            train_ds.set_hard_neg_ratio(0.25)
-            opt = phase2_frozen_optimizer(model)
-            _log_trainable("stage2_1")
-            if opt_state is not None:
-                opt.load_state_dict(opt_state)
-            best, hist = train_stage(
-                model, opt, train_loader, val_loader_p2, device_t,
-                phase2_frozen_epochs, "stage2_1", out_dir, best,
-                contrastive=contrastive,
-                contrastive_weight=contrastive_weight_p1,
-                contrastive_temp=contrastive_temp,
-                vicreg=vicreg,
-                vicreg_weight=vicreg_weight,
-                barlow=barlow,
-                barlow_weight=barlow_weight,
-                triplet=triplet,
-                triplet_weight=triplet_weight,
-                hard_neg_mining=hard_neg_mining,
-                neg_prob_schedule={1: 0.0, 4: 0.15},
-                attn_loss_weight=1.0,
-                start_epoch=start_epoch,
-                scheduler_state=sched_state,
-                prior_history=full_history,
-            )
-            full_history.extend(hist)
-            _eval_stage("stage2_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
-
     if phase2_partial_epochs > 0:
-        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_2", phase2_partial_epochs)
         stage_configs_for_lr.append({
             "name": "stage2_2",
             "epochs": phase2_partial_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [
                 {"label": "backbone upper", "lr": 1e-5},
-                {"label": "heads", "lr": 2.5e-4},
+                {"label": "heads", "lr": 2e-4},
             ],
         })
-        if skip:
-            print("=== Stage 2.2: skipped ===")
-        else:
-            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-            print(f"=== Stage 2.2: HOTS+InsDet+VizWiz novel, features[7:] @ 1e-5{resume_str} ===")
-            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
-            train_ds.set_hard_neg_ratio(0.5)
-            opt = phase2_partial_optimizer(model)
-            _log_trainable("stage2_2")
-            if opt_state is not None:
-                opt.load_state_dict(opt_state)
-            best, hist = train_stage(
-                model, opt, train_loader, val_loader_p2, device_t,
-                phase2_partial_epochs, "stage2_2", out_dir, best,
-                contrastive=contrastive,
-                contrastive_weight=contrastive_weight_p2,
-                contrastive_temp=contrastive_temp,
-                vicreg=vicreg,
-                vicreg_weight=vicreg_weight,
-                barlow=barlow,
-                barlow_weight=barlow_weight,
-                triplet=triplet,
-                triplet_weight=triplet_weight,
-                hard_neg_mining=hard_neg_mining,
-                neg_prob_schedule={1: 0.1, 8: 0.3},
-                attn_loss_weight=1.0,
-                start_epoch=start_epoch,
-                scheduler_state=sched_state,
-                prior_history=full_history,
-            )
-            full_history.extend(hist)
-            _eval_stage("stage2_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
-
     if phase2_full_epochs > 0:
-        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_3", phase2_full_epochs)
         stage_configs_for_lr.append({
             "name": "stage2_3",
             "epochs": phase2_full_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [
-                {"label": "backbone lower", "lr": 5e-6},
-                {"label": "backbone upper", "lr": 5e-6},
+                {"label": "backbone lower", "lr": 3e-6},
+                {"label": "backbone upper", "lr": 3e-6},
                 {"label": "heads", "lr": 5e-5},
             ],
         })
+
+    def _run_phase2_stage_2_1(
+        train_loader_local: DataLoader,
+        val_loader_local: DataLoader,
+        best_local: float,
+        history_local: list[dict],
+    ) -> tuple[float, list[dict]]:
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_1", phase2_frozen_epochs)
+        if skip:
+            print("=== Stage 2.1: skipped ===")
+            return best_local, []
+        resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+        print(f"=== Stage 2.1: HOTS+InsDet+VizWiz novel, backbone re-frozen{resume_str} ===")
+        train_loader_local.dataset.set_hard_neg_ratio(0.25)  # type: ignore[attr-defined]
+        opt = phase2_frozen_optimizer(model)
+        _log_trainable("stage2_1")
+        if opt_state is not None:
+            opt.load_state_dict(opt_state)
+        return train_stage(
+            model, opt, train_loader_local, val_loader_local, device_t,
+            phase2_frozen_epochs, "stage2_1", out_dir, best_local,
+            contrastive=contrastive,
+            contrastive_weight=contrastive_weight_p1,
+            contrastive_temp=contrastive_temp,
+            vicreg=vicreg,
+            vicreg_weight=vicreg_weight,
+            barlow=barlow,
+            barlow_weight=barlow_weight,
+            triplet=triplet,
+            triplet_weight=triplet_weight,
+            hard_neg_mining=hard_neg_mining,
+            neg_prob_schedule={1: 0.0, 4: 0.15},
+            attn_loss_weight=1.0,
+            start_epoch=start_epoch,
+            scheduler_state=sched_state,
+            prior_history=history_local,
+        )
+
+    def _run_phase2_stage_2_2(
+        train_loader_local: DataLoader,
+        val_loader_local: DataLoader,
+        best_local: float,
+        history_local: list[dict],
+    ) -> tuple[float, list[dict]]:
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_2", phase2_partial_epochs)
+        if skip:
+            print("=== Stage 2.2: skipped ===")
+            return best_local, []
+        resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+        print(f"=== Stage 2.2: HOTS+InsDet+VizWiz novel, features[7:] @ 1e-5{resume_str} ===")
+        train_loader_local.dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
+        opt = phase2_partial_optimizer(model)
+        _log_trainable("stage2_2")
+        if opt_state is not None:
+            opt.load_state_dict(opt_state)
+        return train_stage(
+            model, opt, train_loader_local, val_loader_local, device_t,
+            phase2_partial_epochs, "stage2_2", out_dir, best_local,
+            contrastive=contrastive,
+            contrastive_weight=contrastive_weight_p2,
+            contrastive_temp=contrastive_temp,
+            vicreg=vicreg,
+            vicreg_weight=vicreg_weight,
+            barlow=barlow,
+            barlow_weight=barlow_weight,
+            triplet=triplet,
+            triplet_weight=triplet_weight,
+            hard_neg_mining=hard_neg_mining,
+            neg_prob_schedule={1: 0.1, 8: 0.3},
+            attn_loss_weight=1.0,
+            start_epoch=start_epoch,
+            scheduler_state=sched_state,
+            prior_history=history_local,
+        )
+
+    def _run_phase2_stage_2_3(
+        train_loader_local: DataLoader,
+        val_loader_local: DataLoader,
+        best_local: float,
+        history_local: list[dict],
+    ) -> tuple[float, list[dict]]:
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_3", phase2_full_epochs)
         if skip:
             print("=== Stage 2.3: skipped ===")
-        else:
-            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-            print(f"=== Stage 2.3: full unfreeze (all @ 5e-6){resume_str} ===")
-            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
-            train_ds.set_hard_neg_ratio(0.5)
-            opt = phase2_full_optimizer(model)
-            _log_trainable("stage2_3")
-            if opt_state is not None:
-                opt.load_state_dict(opt_state)
-            best, hist = train_stage(
-                model, opt, train_loader, val_loader_p2, device_t,
-                phase2_full_epochs, "stage2_3", out_dir, best,
-                contrastive=contrastive,
-                contrastive_weight=contrastive_weight_p2,
-                contrastive_temp=contrastive_temp,
-                vicreg=vicreg,
-                vicreg_weight=vicreg_weight,
-                barlow=barlow,
-                barlow_weight=barlow_weight,
-                triplet=triplet,
-                triplet_weight=triplet_weight,
-                hard_neg_mining=hard_neg_mining,
-                neg_prob_schedule={1: 0.3},
-                attn_loss_weight=1.0,
-                start_epoch=start_epoch,
-                scheduler_state=sched_state,
-                prior_history=full_history,
+            return best_local, []
+        resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+        print(f"=== Stage 2.3: full unfreeze (all @ 5e-6){resume_str} ===")
+        train_loader_local.dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
+        opt = phase2_full_optimizer(model)
+        _log_trainable("stage2_3")
+        if opt_state is not None:
+            opt.load_state_dict(opt_state)
+        return train_stage(
+            model, opt, train_loader_local, val_loader_local, device_t,
+            phase2_full_epochs, "stage2_3", out_dir, best_local,
+            contrastive=contrastive,
+            contrastive_weight=contrastive_weight_p2,
+            contrastive_temp=contrastive_temp,
+            vicreg=vicreg,
+            vicreg_weight=vicreg_weight,
+            barlow=barlow,
+            barlow_weight=barlow_weight,
+            triplet=triplet,
+            triplet_weight=triplet_weight,
+            hard_neg_mining=hard_neg_mining,
+            neg_prob_schedule={1: 0.3},
+            attn_loss_weight=1.0,
+            start_epoch=start_epoch,
+            scheduler_state=sched_state,
+            prior_history=history_local,
+        )
+
+    if phase2_cv_folds > 0 and (
+        phase2_frozen_epochs > 0
+        or phase2_partial_epochs > 0
+        or phase2_full_epochs > 0
+    ):
+        # CV runs always start each fold from the post-Phase-1 weights —
+        # mid-Phase-2 resume across folds is ill-defined (whose fold's
+        # optimizer state? whose val IDs?). Disable per-stage resume so
+        # _resume_for() returns "fresh" for stages 2.x in every fold.
+        if resume_state is not None and resume_state.get("stage") in (
+            "stage2_1",
+            "stage2_2",
+            "stage2_3",
+        ):
+            print(
+                "  CV mode: discarding mid-Phase-2 resume state "
+                f"(was stage={resume_state.get('stage')}, epoch={resume_state.get('epoch')})"
             )
+            resume_state = None
+        # Snapshot the post-Phase-1 weights so each fold starts identically.
+        phase1_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        folds = _build_phase2_cv_folds(
+            manifest_path=manifest, k=phase2_cv_folds, seed=seed
+        )
+        print(
+            f"=== Phase 2 K-fold CV: {phase2_cv_folds} folds over "
+            f"{sum(len(f['val_ids']) for f in folds)} HOTS+InsDet instances ==="
+        )
+        cv_results: list[dict] = []
+        best_fold_iou = -1.0
+        best_fold_idx = -1
+        for fold_idx, fold in enumerate(folds):
+            train_ids = set(fold["train_ids"])
+            val_ids = set(fold["val_ids"])
+            print(
+                f"\n--- Fold {fold_idx + 1}/{phase2_cv_folds}: "
+                f"train_ids={len(train_ids)} val_ids={len(val_ids)} "
+                f"(val={sorted(val_ids)}) ---"
+            )
+            # Reset model to post-Phase-1 state for this fold.
+            model.load_state_dict(phase1_state)
+            # Build fold-specific train + val loaders. Phase 2 train pulls
+            # from all PHASE2 sources; vizwiz_novel passes through untouched
+            # while hots/insdet are restricted to the fold's train_ids.
+            fold_train_ds, fold_train_loader = _build_train_loader(PHASE2_SOURCES)
+            _filter_dataset_for_fold(fold_train_ds, train_ids=train_ids)
+            fold_val_loader = _make_val_loader(list(PHASE2_VAL_SOURCES))
+            _filter_dataset_for_fold(fold_val_loader.dataset, val_ids=val_ids)  # type: ignore[arg-type]
+            print(
+                f"  fold dataset sizes: train={len(fold_train_ds.instances)} "
+                f"val={len(fold_val_loader.dataset.instances)}"  # type: ignore[attr-defined]
+            )
+
+            fold_history: list[dict] = []
+            fold_best = best
+            if phase2_frozen_epochs > 0:
+                fold_best, hist = _run_phase2_stage_2_1(
+                    fold_train_loader, fold_val_loader, fold_best, fold_history
+                )
+                fold_history.extend(hist)
+            if phase2_partial_epochs > 0:
+                fold_best, hist = _run_phase2_stage_2_2(
+                    fold_train_loader, fold_val_loader, fold_best, fold_history
+                )
+                fold_history.extend(hist)
+            if phase2_full_epochs > 0:
+                fold_best, hist = _run_phase2_stage_2_3(
+                    fold_train_loader, fold_val_loader, fold_best, fold_history
+                )
+                fold_history.extend(hist)
+
+            cv_results.append({
+                "fold": fold_idx,
+                "train_ids": sorted(train_ids),
+                "val_ids": sorted(val_ids),
+                "history": fold_history,
+            })
+            full_history.extend(fold_history)
+            if fold_best > best_fold_iou:
+                best_fold_iou = fold_best
+                best_fold_idx = fold_idx
+
+            # Per-fold rolling checkpoints under analysis/cv/fold_<i>/.
+            fold_dir = analysis_dir / "cv" / f"fold_{fold_idx}"
+            fold_dir.mkdir(parents=True, exist_ok=True)
+            with open(fold_dir / "history.json", "w") as f:
+                json.dump(fold_history, f, indent=2)
+
+        print(
+            f"\n=== Phase 2 CV done. best fold = {best_fold_idx} "
+            f"(val_iou={best_fold_iou:.4f}) ==="
+        )
+        best = max(best, best_fold_iou)
+        _save_cv_results(cv_results, analysis_dir)
+        # Rebuild an unfiltered Phase-2 train_ds so the end-of-run prototype
+        # similarity plot covers the entire instance pool, not the last fold.
+        train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
+    else:
+        # Single-run (non-CV) Phase 2 — original behaviour. Uses the manifest's
+        # fixed val split and writes test-set evaluation per stage.
+        if phase2_frozen_epochs > 0:
+            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
+            best_new, hist = _run_phase2_stage_2_1(
+                train_loader, val_loader_p2, best, full_history
+            )
+            best = best_new
+            full_history.extend(hist)
+            _eval_stage("stage2_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
+
+        if phase2_partial_epochs > 0:
+            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
+            best_new, hist = _run_phase2_stage_2_2(
+                train_loader, val_loader_p2, best, full_history
+            )
+            best = best_new
+            full_history.extend(hist)
+            _eval_stage("stage2_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
+
+        if phase2_full_epochs > 0:
+            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
+            best_new, hist = _run_phase2_stage_2_3(
+                train_loader, val_loader_p2, best, full_history
+            )
+            best = best_new
             full_history.extend(hist)
             _eval_stage("stage2_3", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
@@ -1161,11 +1483,17 @@ def main() -> None:
     p.add_argument("--num-workers", type=int, default=4)
     # Phase 1 epoch counts (set to 0 to skip a stage)
     p.add_argument("--phase1-frozen-epochs", type=int, default=22)
-    p.add_argument("--phase1-partial-epochs", type=int, default=32)
+    p.add_argument("--phase1-partial-epochs", type=int, default=40)
     # Phase 2 epoch counts
-    p.add_argument("--phase2-frozen-epochs", type=int, default=14)
-    p.add_argument("--phase2-partial-epochs", type=int, default=50)
-    p.add_argument("--phase2-full-epochs", type=int, default=10)
+    p.add_argument("--phase2-frozen-epochs", type=int, default=10)
+    p.add_argument("--phase2-partial-epochs", type=int, default=30)
+    p.add_argument("--phase2-full-epochs", type=int, default=15)
+    p.add_argument(
+        "--phase2-cv-folds",
+        type=int,
+        default=0,
+        help="K-fold cross-validation for Phase 2 (0 disables; e.g. 4 for 4-fold)",
+    )
     p.add_argument(
         "--start-stage",
         choices=list(STAGE_ORDER),
@@ -1207,6 +1535,7 @@ def main() -> None:
         phase2_frozen_epochs=args.phase2_frozen_epochs,
         phase2_partial_epochs=args.phase2_partial_epochs,
         phase2_full_epochs=args.phase2_full_epochs,
+        phase2_cv_folds=args.phase2_cv_folds,
         contrastive=not args.no_contrastive,
         contrastive_weight_p1=args.contrastive_weight_p1,
         contrastive_weight_p2=args.contrastive_weight_p2,
