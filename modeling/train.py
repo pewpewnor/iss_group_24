@@ -450,24 +450,30 @@ def train_stage(
     scheduler_state: dict | None = None,
     prior_history: list[dict] | None = None,
     fold_label: str | None = None,
+    external_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> tuple[float, list[dict]]:
-    total_steps = max(epochs * len(train_loader), 1)
-    # 5% warmup, capped at 500 steps (was 200). Transformer modules in the
-    # support pipeline benefit from a longer warmup before LR peaks; with
-    # ~125 steps/epoch (2000 episodes / B=16) the cap matters mainly for
-    # multi-stage runs at the high end.
-    warmup_steps = max(1, min(500, total_steps // 20))
-    warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
-    )
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-7
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
-    )
-    if scheduler_state is not None:
-        scheduler.load_state_dict(scheduler_state)
+    if external_scheduler is not None:
+        # Caller owns the scheduler — used by the CV loop where one scheduler
+        # spans all (cv_epoch, fold) calls so the LR curve stays continuous.
+        scheduler = external_scheduler
+    else:
+        total_steps = max(epochs * len(train_loader), 1)
+        # 5% warmup, capped at 500 steps (was 200). Transformer modules in the
+        # support pipeline benefit from a longer warmup before LR peaks; with
+        # ~125 steps/epoch (2000 episodes / B=16) the cap matters mainly for
+        # multi-stage runs at the high end.
+        warmup_steps = max(1, min(500, total_steps // 20))
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-7
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
+        )
+        if scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
 
     prior = list(prior_history) if prior_history else []
     epoch_history: list[dict] = []
@@ -879,27 +885,21 @@ def train(
     val_episodes: int = 500,
     batch_size: int = 16,
     num_workers: int = 4,
-    # Phase 1: VizWiz base pretraining.
-    #   Stage 1.1 set to 15: heads-only warmup with frozen backbone converges
-    #     fast on the diverse VizWiz pool; extra epochs at this stage have
-    #     diminishing returns since the bulk of head adaptation happens once
-    #     the backbone joins in Stage 1.2.
-    #   Stage 1.2 bumped 30 → 40: extended to allow fuller convergence.
-    phase1_frozen_epochs: int = 15,
-    phase1_partial_epochs: int = 40,
-    # Phase 2: target-domain fine-tuning.
-    # Defaults are sized for 3-fold CV (phase2_cv_folds=3).
-    # Each CV epoch trains all 3 folds (~90 instances each), so 1 CV epoch
-    # covers ~2.2× the data of a single-run epoch over the full 123-instance
-    # pool. Budgets are scaled down accordingly from the single-run baselines
-    # (10→5, 30→15, 15→8) so total gradient exposure stays comparable.
-    #   Stage 2.1 (5 CV epochs): re-warmup with frozen backbone; heads adapt
-    #     fast so a short budget is fine.
-    #   Stage 2.2 (15 CV epochs): main fine-tuning with hard-neg mining on.
-    #   Stage 2.3 (8 CV epochs): full-unfreeze polish at very low LR.
-    phase2_frozen_epochs: int = 5,
-    phase2_partial_epochs: int = 15,
-    phase2_full_epochs: int = 8,
+    # Phase 1: VizWiz base pretraining. Defaults are 0 — each notebook cell
+    # explicitly turns on exactly one stage. Single-run users should pass
+    # phase1_frozen_epochs=15, phase1_partial_epochs=40 to match the
+    # historical baseline.
+    phase1_frozen_epochs: int = 0,
+    phase1_partial_epochs: int = 0,
+    # Phase 2: target-domain fine-tuning. Defaults are 0 so each notebook
+    # cell must explicitly turn on exactly one stage — this prevents
+    # accidental multi-stage runs when users call train() with only one
+    # phase2_*_epochs argument set. The notebook cells override one stage
+    # at a time using CV-scaled budgets (5/15/8 for 3-fold CV); single-run
+    # users should pass 10/30/15 explicitly to match the historical baseline.
+    phase2_frozen_epochs: int = 0,
+    phase2_partial_epochs: int = 0,
+    phase2_full_epochs: int = 0,
     # K-fold cross-validation for Phase 2. With ~14 HOTS+InsDet instances the
     # fixed val split (~3 instances) is too small to give a stable signal —
     # CV pools the existing train+val splits back together and rotates a held-
@@ -1459,7 +1459,6 @@ def train(
                 fold_opts.append({
                     "opt": opt,
                     "scheduler": scheduler,
-                    "sched_state": None,
                     "neg_sched": neg_sched,
                     "attn_w": attn_w,
                     "cont_w": cont_w,
@@ -1471,7 +1470,7 @@ def train(
                 epoch_val_map50s: list[float] = []
 
                 for fi, (fs, fo) in enumerate(zip(fold_structs, fold_opts)):
-                    fold_label = f"fold {fi + 1}/{phase2_cv_folds}"
+                    fold_label = f"fold {fi + 1}/{phase2_cv_folds} (cv_epoch {cv_epoch}/{stage_epochs})"
                     model.load_state_dict(fs["model_state"])
 
                     _, hist = train_stage(
@@ -1480,7 +1479,7 @@ def train(
                         train_loader=fs["train_loader"],
                         val_loader=fs["val_loader"],
                         device=device_t,
-                        epochs=stage_epochs,
+                        epochs=cv_epoch,
                         stage_name=stage_name,
                         out_dir=out_dir,
                         best_val_iou=fs["best"],
@@ -1497,13 +1496,11 @@ def train(
                         neg_prob_schedule=fo["neg_sched"],
                         attn_loss_weight=fo["attn_w"],
                         start_epoch=cv_epoch,
-                        scheduler_state=fo["sched_state"],
+                        scheduler_state=None,
                         prior_history=fs["history"],
                         fold_label=fold_label,
+                        external_scheduler=fo["scheduler"],
                     )
-                    for _ in range(len(fs["train_loader"])):
-                        fo["scheduler"].step()
-                    fo["sched_state"] = fo["scheduler"].state_dict()
                     fs["model_state"] = {k: v.detach().clone() for k, v in model.state_dict().items()}
                     if hist:
                         row = hist[0]
