@@ -827,11 +827,12 @@ def train(
     batch_size: int = 16,
     num_workers: int = 4,
     # Phase 1: VizWiz base pretraining.
-    #   Stage 1.1 bumped 20 → 22: query decoder adds a self-attn module and
-    #     DropPath p=0.1 drops ~10% of residuals — both slow convergence by
-    #     a small constant.
+    #   Stage 1.1 set to 15: heads-only warmup with frozen backbone converges
+    #     fast on the diverse VizWiz pool; extra epochs at this stage have
+    #     diminishing returns since the bulk of head adaptation happens once
+    #     the backbone joins in Stage 1.2.
     #   Stage 1.2 bumped 30 → 40: extended to allow fuller convergence.
-    phase1_frozen_epochs: int = 22,
+    phase1_frozen_epochs: int = 15,
     phase1_partial_epochs: int = 40,
     # Phase 2: target-domain fine-tuning.
     #   Stage 2.1 set to 10: with K-fold CV in play the per-fold val pool is
@@ -1482,7 +1483,7 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
     # Phase 1 epoch counts (set to 0 to skip a stage)
-    p.add_argument("--phase1-frozen-epochs", type=int, default=22)
+    p.add_argument("--phase1-frozen-epochs", type=int, default=15)
     p.add_argument("--phase1-partial-epochs", type=int, default=40)
     # Phase 2 epoch counts
     p.add_argument("--phase2-frozen-epochs", type=int, default=10)
