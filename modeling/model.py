@@ -734,15 +734,21 @@ class FewShotLocalizer(nn.Module):
         if support_tokens.shape[0] != b:
             support_tokens = support_tokens.expand(b, -1, -1)
 
-        # Add learnable + sinusoidal PE to query at stride 16.
+        # Add learnable + sinusoidal PE to query at stride 16. The learnable
+        # PE is stored at the canonical 14×14 grid; it's bilinearly resized
+        # to whatever grid the current input produced (multi-scale training,
+        # 2-scale TTA, etc.).
+        h, w = q_feat_p4.shape[-2:]
+        learn_pe = self.query_pe_p4
+        if learn_pe.shape[-2:] != (h, w):
+            learn_pe = F.interpolate(
+                learn_pe, size=(h, w), mode="bilinear", align_corners=False
+            )
         sin_pe = _sinusoidal_2d_pe(
-            q_feat_p4.shape[1],
-            q_feat_p4.shape[2],
-            q_feat_p4.shape[3],
-            device=q_feat_p4.device,
-            dtype=q_feat_p4.dtype,
+            q_feat_p4.shape[1], h, w,
+            device=q_feat_p4.device, dtype=q_feat_p4.dtype,
         )
-        q = q_feat_p4 + self.query_pe_p4 + sin_pe
+        q = q_feat_p4 + learn_pe + sin_pe
 
         # [ABSENT] sink token; token-dropout during training.
         absent = self.absent_token.expand(b, -1, -1)
