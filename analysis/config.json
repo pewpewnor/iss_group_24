@@ -3,8 +3,8 @@
   "data_root": "./dataset/cleaned",
   "out_dir": "./model",
   "analysis_dir": "./analysis",
-  "stage1_epochs": 5,
-  "stage2_epochs": 0,
+  "stage1_epochs": 0,
+  "stage2_epochs": 10,
   "stage3_epochs": 0,
   "folds": 3,
   "fold_seed": 42,
@@ -48,10 +48,16 @@
   "hard_neg_ratio_s2": 0.3,
   "hard_neg_ratio_s3": 0.5,
   "source_mix": {
-    "vizwiz_base": 4,
-    "vizwiz_novel": 2,
+    "vizwiz_base": 3,
+    "vizwiz_novel": 3,
     "hots": 5,
     "insdet": 5
+  },
+  "source_loss_weights": {
+    "vizwiz_base": 0.5,
+    "vizwiz_novel": 1.5,
+    "hots": 1.5,
+    "insdet": 1.5
   },
   "augment": true,
   "augment_strength": 1.0,
@@ -69,7 +75,7 @@
     224,
     288
   ],
-  "resume": true,
+  "resume": "./model/stage1_complete.pt",
   "seed": 42,
   "device": "cuda",
   "img_size": 224

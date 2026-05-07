@@ -1,12 +1,20 @@
 {
   "best_by": {
     "stage1.val.map_50": {
-      "epoch": 2,
-      "value": 0.0164
+      "epoch": 1,
+      "value": 0.0192
     },
     "stage1.val.iou_mean": {
-      "epoch": 2,
-      "value": 0.0814
+      "epoch": 5,
+      "value": 0.0965
+    },
+    "stage2.val.map_50": {
+      "epoch": 1,
+      "value": 0.0151
+    },
+    "stage2.val.iou_mean": {
+      "epoch": 5,
+      "value": 0.077
     }
   }
 }

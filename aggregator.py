@@ -544,8 +544,10 @@ def filter_empty_instances(instances: list[dict]) -> list[dict]:
 def split_instances(instances: list[dict]) -> tuple[list, list]:
     """Split instances per source into train (80%) / test (20%).
 
-    vizwiz_novel is exempt — only 16 instances, all kept in train.
-    The trainer derives K-fold CV from the train pool at Stage 3.
+    Every source — including ``vizwiz_novel`` — gets at least a 1-instance
+    test slice so post-stage evaluation reports per-source metrics for all
+    four sources. With only 16 vizwiz_novel instances we cap its test slice
+    at the standard 20% (rounded up) so ~3 go to test and ~13 to train.
     """
     rng = random.Random(SEED)
     by_source: dict[str, list[dict]] = {}
@@ -558,14 +560,12 @@ def split_instances(instances: list[dict]) -> tuple[list, list]:
         group = by_source[source][:]
         rng.shuffle(group)
         n = len(group)
-        if source == "vizwiz_novel":
-            train.extend(group)
-            print(
-                f"  split[vizwiz_novel]: train={n} test=0  (train-only, only {n} instances)"
-            )
-            continue
         n_train = int(round(n * TRAIN_RATIO))
-        n_train = max(1, min(n - 1, n_train)) if n > 1 else n
+        # Guarantee at least 1 instance in each split when n > 1.
+        if n > 1:
+            n_train = max(1, min(n - 1, n_train))
+        else:
+            n_train = n
         train.extend(group[:n_train])
         test.extend(group[n_train:])
         print(

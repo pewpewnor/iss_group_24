@@ -153,15 +153,28 @@ def task_aligned_assign(
     beta: float = 6.0,
     center_radius: float = 1.5,
     topk_iou: int = 10,
+    iou_floor: float = 0.05,
+    cold_start_iou_thr: float = 0.10,
+    cold_start_topq: int = 9,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """TOOD positive assignment.
+    """TOOD positive assignment with a center-sampling fallback for cold-start.
 
     For each present-episode GT box:
       1) Restrict candidate cells to those whose centre lies within `center_radius * stride`
          of the GT centre AND inside the GT bbox.
-      2) Compute alignment metric t = σ(conf)^α · IoU^β over candidates.
-      3) Pick top-q cells by t, where q = round(sum of top-`topk_iou` IoU values),
-         clamped to [1, len(candidates)].
+      2) If the *best* IoU across candidates is below ``cold_start_iou_thr``,
+         the regressor hasn't started learning. TOOD's alignment metric
+         ``σ(conf)^α · IoU^β`` is uninformative in that regime — IoU^6 with
+         IoU≈0 collapses to numerical zero and the assigner picks effectively
+         random cells. Fall back to plain center-sampling: take the
+         ``cold_start_topq`` candidates closest to the GT centre.
+      3) Otherwise: compute alignment metric ``t = σ(conf)^α · (IoU+ε)^β``
+         over candidates, pick top-q cells by t, where q = round(sum of
+         top-``topk_iou`` IoU values), clamped to [1, len(candidates)].
+
+    The ε floor (``iou_floor``) keeps the alignment score well-conditioned
+    even when IoU is small but non-zero — without it β=6 makes the score
+    range vary by 12+ orders of magnitude across cells.
 
     Args:
         decoded_boxes : (B, 4, H, W) decoded xyxy boxes in image coords.
@@ -213,10 +226,21 @@ def task_aligned_assign(
     cell_iou_masked = torch.where(candidate, cell_iou, cell_iou.new_zeros(()))
 
     conf_prob = torch.sigmoid(conf_logits.squeeze(1))                         # (B, H, W)
-    align = (conf_prob.detach() ** alpha) * (cell_iou_masked ** beta)
+    # ε-floored alignment metric. IoU+ε keeps the score well-conditioned in
+    # the cold-start regime where every IoU is ~0.
+    iou_term = (cell_iou_masked + iou_floor) ** beta
+    align = (conf_prob.detach() ** alpha) * iou_term
     align = torch.where(candidate, align, align.new_zeros(()))
 
     pos_mask = torch.zeros_like(candidate, dtype=torch.bool)
+
+    # Centre-distance score (cells closer to GT centre score higher) — used
+    # for the cold-start fallback. Negative L1 distance so torch.topk picks
+    # the closest candidates.
+    dx = (cx_grid - gx).abs()
+    dy = (cy_grid - gy).abs()
+    centre_score = -(dx + dy)
+    centre_score = torch.where(candidate, centre_score, centre_score.new_full((), float("-inf")))
 
     HW = grid_h * grid_w
     for bi in range(B):
@@ -231,16 +255,25 @@ def task_aligned_assign(
             i_c = int(min(max(i_c, 0), grid_h - 1))
             pos_mask[bi, i_c, j_c] = True
             continue
+
         flat_iou = cell_iou_masked[bi].view(-1)
-        flat_align = align[bi].view(-1)
         n_cand = int(cand.sum().item())
-        # Adaptive q from top-K IoU values.
-        topk = min(topk_iou, n_cand)
-        top_iou = torch.topk(flat_iou, k=topk).values
-        q = int(top_iou.sum().clamp(min=1.0).round().item())
-        q = max(1, min(q, n_cand, HW))
-        # Top-q cells by alignment metric.
-        topq = torch.topk(flat_align, k=q).indices
+
+        best_iou = float(flat_iou.max().item())
+        if best_iou < cold_start_iou_thr:
+            # Cold-start path: pure center-sampling. Take up to
+            # ``cold_start_topq`` cells closest to the GT centre.
+            q = max(1, min(cold_start_topq, n_cand, HW))
+            flat_centre = centre_score[bi].view(-1)
+            topq = torch.topk(flat_centre, k=q).indices
+        else:
+            flat_align = align[bi].view(-1)
+            topk = min(topk_iou, n_cand)
+            top_iou = torch.topk(flat_iou, k=topk).values
+            q = int(top_iou.sum().clamp(min=1.0).round().item())
+            q = max(1, min(q, n_cand, HW))
+            topq = torch.topk(flat_align, k=q).indices
+
         pos_flat = pos_mask[bi].view(-1).clone()
         pos_flat[topq] = True
         pos_mask[bi] = pos_flat.view(grid_h, grid_w)
@@ -509,7 +542,7 @@ def attention_bbox_loss(
     attn_map: torch.Tensor,
     support_bboxes: torch.Tensor,
     img_size: int = 224,
-    stride: int = 32,
+    stride: int | None = None,
 ) -> torch.Tensor:
     if attn_map.dim() == 5:
         agg = attn_map.sum(dim=2)
@@ -522,6 +555,10 @@ def attention_bbox_loss(
     b, k, h, w = agg.shape
     device = agg.device
     dtype = agg.dtype
+    # Derive stride from img_size / h so the function works at any input size
+    # (multi-scale training: 192 → P5 6×6, 224 → 7×7, 256 → 8×8).
+    if stride is None:
+        stride = img_size / float(h)
     cy = (torch.arange(h, device=device, dtype=dtype) + 0.5) * stride
     cx = (torch.arange(w, device=device, dtype=dtype) + 0.5) * stride
     bb = support_bboxes.reshape(b * k, 4).to(dtype)
@@ -545,6 +582,155 @@ def attention_bbox_loss(
 
 
 # ---------------------------------------------------------------------------
+# Discrimination + anti-collapse losses (Phase 0 last-resort)
+# ---------------------------------------------------------------------------
+
+
+def presence_aware_contrastive(
+    enriched_query: torch.Tensor,
+    prototype: torch.Tensor,
+    gt_bbox: torch.Tensor,
+    is_present: torch.Tensor,
+    img_size: int = 224,
+    margin: float = 0.5,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """InfoNCE between query features and support prototype, presence-aware.
+
+    For PRESENT episodes:
+      - positive query feature = mean over enriched_query cells inside the GT bbox.
+      - target: positive_query_feat ↔ prototype should be close (cosine sim ~ 1).
+      - negatives: every OTHER episode's prototype in the batch.
+
+    For ABSENT episodes:
+      - "anti-positive": GAP(enriched_query) should be FAR from prototype
+        (cosine sim ≤ -margin or at least small).
+      - This directly attacks ``presence_acc_neg ≈ 0.5``: the only way the
+        presence head can distinguish absent from present is if the
+        feature space already does.
+
+    Args:
+        enriched_query: (B, D, H, W) cross-attention output (the query feature
+            the detection head sees).
+        prototype:      (B, D) bag-level support summary.
+        gt_bbox:        (B, 4) xyxy in image coords.
+        is_present:     (B,) bool.
+
+    Returns scalar loss.
+    """
+    B, D, H, W = enriched_query.shape
+    device = enriched_query.device
+    dtype = enriched_query.dtype
+
+    # Pool query feature inside GT bbox for present episodes (else GAP).
+    stride = img_size / float(H)
+    cy = (torch.arange(H, device=device, dtype=dtype) + 0.5) * stride
+    cx = (torch.arange(W, device=device, dtype=dtype) + 0.5) * stride
+    cy_grid = cy.view(1, H, 1).expand(B, H, W)
+    cx_grid = cx.view(1, 1, W).expand(B, H, W)
+
+    x1 = gt_bbox[:, 0].view(B, 1, 1)
+    y1 = gt_bbox[:, 1].view(B, 1, 1)
+    x2 = gt_bbox[:, 2].view(B, 1, 1)
+    y2 = gt_bbox[:, 3].view(B, 1, 1)
+    inside = (cx_grid >= x1) & (cx_grid <= x2) & (cy_grid >= y1) & (cy_grid <= y2)
+    inside_f = inside.to(dtype)
+
+    # GAP fallback for absent / empty inside-mask.
+    gap = enriched_query.mean(dim=(2, 3))                                     # (B, D)
+    inside_sum = inside_f.sum(dim=(1, 2)).clamp(min=1.0)
+    inside_mean = (
+        enriched_query * inside_f.unsqueeze(1)
+    ).sum(dim=(2, 3)) / inside_sum.unsqueeze(1)                               # (B, D)
+    use_inside = is_present & (inside.flatten(1).sum(dim=1) > 0)
+    q_feat = torch.where(use_inside.view(B, 1), inside_mean, gap)             # (B, D)
+
+    # Cosine sims.
+    q_n = F.normalize(q_feat, dim=-1)
+    p_n = F.normalize(prototype, dim=-1)
+    sim = (q_n * p_n).sum(dim=-1)                                             # (B,)
+
+    # InfoNCE for present: positive = same-episode prototype, negatives = all others.
+    pos_mask = is_present
+    if pos_mask.any():
+        # Diag = positive sim. Off-diag = negative sims.
+        sim_matrix = q_n @ p_n.t() / temperature                              # (B, B)
+        log_prob = sim_matrix - torch.logsumexp(sim_matrix, dim=1, keepdim=True)
+        pos_diag = log_prob.diagonal()                                        # (B,)
+        nce_loss = -(pos_diag * pos_mask.to(pos_diag.dtype)).sum() / pos_mask.sum().clamp(min=1).to(pos_diag.dtype)
+    else:
+        nce_loss = sim.new_zeros(())
+
+    # Absent: hinge-style penalty if cosine sim > -margin.
+    abs_mask = ~is_present
+    if abs_mask.any():
+        abs_term = F.relu(sim + margin) * abs_mask.to(sim.dtype)
+        abs_loss = abs_term.sum() / abs_mask.sum().clamp(min=1).to(sim.dtype)
+    else:
+        abs_loss = sim.new_zeros(())
+
+    return nce_loss + abs_loss
+
+
+def feature_spread_reg(enriched_query: torch.Tensor) -> torch.Tensor:
+    """VICReg-variance-style hinge on the spatial std of the cross-attention output.
+
+    The conf-map flatness diagnosis (``conf_map_std_pos ≈ 0.03``) traces back
+    to the cross-attention producing near-uniform spatial features. This term
+    penalises low spatial std per channel, encouraging the decoder to produce
+    discriminative locations.
+
+    Loss = ReLU(γ - sqrt(spatial_var + ε)).mean()  per channel, then averaged.
+    """
+    B, D, H, W = enriched_query.shape
+    if H * W < 4:
+        return enriched_query.new_zeros(())
+    flat = enriched_query.flatten(2)                                          # (B, D, HW)
+    var = flat.var(dim=2)                                                     # (B, D)
+    std = (var + 1e-4).sqrt()
+    target = 1.0
+    return F.relu(target - std).mean()
+
+
+def hardness_weighted_focal_bce(
+    pred_logits: torch.Tensor,
+    target: torch.Tensor,
+    gamma: float = 2.5,
+    base_alpha: float = 0.5,
+    hardness_scale: float = 1.0,
+) -> torch.Tensor:
+    """Class-balanced focal BCE that boosts the *currently-misclassified* class.
+
+    Computes per-class accuracy on this batch; boosts α for the worse class.
+    Acts as an automatic re-balancer when the presence head is biased toward
+    one direction (which is the failure we keep seeing).
+    """
+    with torch.no_grad():
+        p = torch.sigmoid(pred_logits)
+        pred_pos = p > 0.5
+        gt_pos = target > 0.5
+        gt_neg = ~gt_pos
+        n_pos = gt_pos.sum().clamp(min=1).to(pred_logits.dtype)
+        n_neg = gt_neg.sum().clamp(min=1).to(pred_logits.dtype)
+        acc_pos = (pred_pos & gt_pos).sum().to(pred_logits.dtype) / n_pos
+        acc_neg = ((~pred_pos) & gt_neg).sum().to(pred_logits.dtype) / n_neg
+        # Worse-class boost: α scales toward the class with lower accuracy.
+        # If acc_pos < acc_neg, α_pos > 0.5 (favour pos gradient); vice versa.
+        diff = (acc_neg - acc_pos).clamp(-1.0, 1.0)                           # >0 ⇒ pos worse
+        alpha_pos = (base_alpha + hardness_scale * diff * 0.25).clamp(0.1, 0.9)
+        alpha_neg = 1.0 - alpha_pos
+
+    p = torch.sigmoid(pred_logits)
+    pt = p * target + (1 - p) * (1 - target)
+    focal_w = (1 - pt).clamp(min=1e-6).pow(gamma)
+    bce = F.binary_cross_entropy_with_logits(pred_logits, target, reduction="none")
+    raw = focal_w * bce
+    pos_term = (raw * (target > 0.5).to(raw.dtype)).sum() / n_pos
+    neg_term = (raw * (target <= 0.5).to(raw.dtype)).sum() / n_neg
+    return alpha_pos * pos_term + alpha_neg * neg_term
+
+
+# ---------------------------------------------------------------------------
 # Per-scale dense loss
 # ---------------------------------------------------------------------------
 
@@ -558,13 +744,21 @@ def _dense_loss_one_scale(
     stride: int,
     grid_h: int,
     grid_w: int,
+    pred_iou_logits: torch.Tensor | None = None,
     qfl_beta: float = 2.0,
     neg_qfl_weight: float = 0.5,
     centerness_weight: float = 1.0,
     dfl_weight: float = 0.25,
     giou_weight: float = 2.0,
+    pred_iou_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Compute QFL + neg_qfl + centerness + DFL + GIoU on one FPN scale."""
+    """Compute QFL + neg_qfl + centerness + DFL + GIoU + pred_iou on one FPN scale.
+
+    ``pred_iou_logits`` is the IoU-Aware FCOS / VarifocalNet ranking head:
+    a per-cell sigmoid that's trained with L1 loss against the actual
+    ``IoU(decoded_pred, gt).detach()`` on positive cells. Multiplied into
+    the inference score for an extra independent ranking signal.
+    """
     B = conf_logits.shape[0]
     device = conf_logits.device
 
@@ -620,6 +814,14 @@ def _dense_loss_one_scale(
         dfl_term = conf_logits.new_zeros(())
         giou = conf_logits.new_zeros(())
 
+    # Predicted-IoU head: L1 against detached cell_iou on positive cells.
+    if pred_iou_logits is not None and pos_mask.any():
+        target_iou = cell_iou[pos_mask].detach().clamp(0.0, 1.0)
+        pred_iou = torch.sigmoid(pred_iou_logits.squeeze(1))[pos_mask]
+        piou = F.l1_loss(pred_iou, target_iou, reduction="mean") * pred_iou_weight
+    else:
+        piou = conf_logits.new_zeros(())
+
     # Conf-map entropy regulariser.
     ent_reg = conf_entropy_reg(conf_logits, pos_mask, is_present)
 
@@ -632,6 +834,7 @@ def _dense_loss_one_scale(
         "centerness": ctr,
         "dfl": dfl_term,
         "giou": giou,
+        "pred_iou": piou,
         "entropy_reg": ent_reg,
         "reg_l2_prior": reg_l2,
         "num_pos": num_pos.detach(),
@@ -657,41 +860,65 @@ def total_loss(
     entropy_reg_weight: float = 0.01,
     reg_l2_prior_weight: float = 1e-3,
     proto_norm_weight: float = 1e-3,
+    # Phase 0 last-resort discrimination + anti-collapse weights.
+    contrastive_presence_weight: float = 0.5,
+    feature_spread_weight: float = 0.1,
+    use_hardness_weighted_presence: bool = True,
+    sample_loss_weight: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Combined loss across stride-16 + stride-8 + aux + presence + auxiliaries."""
+    """Combined loss across stride-16 + stride-8 + aux + presence + auxiliaries.
+
+    Grid sizes are derived from the prediction tensors so multi-scale training
+    (input 192 → P4 12×12 / P3 24×24, 256 → P4 16×16 / P3 32×32) works without
+    any hard-coded 14/28 assumptions. Per-scale stride is derived as
+    ``img_size / grid`` to keep cell-centre coords consistent with the GT
+    bboxes (which are always in input-image px).
+    """
+    p4_h, p4_w = pred["conf_p4"].shape[-2:]
+    p3_h, p3_w = pred["conf_p3"].shape[-2:]
+    stride_p4 = img_size / float(p4_h)
+    stride_p3 = img_size / float(p3_h)
     grids = [
-        ("p4", pred["reg_p4_logits"], pred["conf_p4"], pred["ctr_p4"], STRIDE_P4, GRID_P4, GRID_P4),
-        ("p3", pred["reg_p3_logits"], pred["conf_p3"], pred["ctr_p3"], STRIDE_P3, GRID_P3, GRID_P3),
+        ("p4", pred["reg_p4_logits"], pred["conf_p4"], pred["ctr_p4"],
+         pred.get("pred_iou_p4"), stride_p4, p4_h, p4_w),
+        ("p3", pred["reg_p3_logits"], pred["conf_p3"], pred["ctr_p3"],
+         pred.get("pred_iou_p3"), stride_p3, p3_h, p3_w),
     ]
     qfl_sum = pred["conf_p4"].new_zeros(())
     neg_qfl_sum = qfl_sum.clone()
     ctr_sum = qfl_sum.clone()
     dfl_sum = qfl_sum.clone()
     giou_sum = qfl_sum.clone()
+    piou_sum = qfl_sum.clone()
     ent_sum = qfl_sum.clone()
     regl2_sum = qfl_sum.clone()
-    for name, rl, cl, ctl, stride, gh, gw in grids:
+    for name, rl, cl, ctl, piou_l, stride, gh, gw in grids:
         terms = _dense_loss_one_scale(
-            rl, cl, ctl, gt_bbox, is_present, stride=stride, grid_h=gh, grid_w=gw
+            rl, cl, ctl, gt_bbox, is_present,
+            stride=stride, grid_h=gh, grid_w=gw,
+            pred_iou_logits=piou_l,
         )
         qfl_sum = qfl_sum + terms["qfl"]
         neg_qfl_sum = neg_qfl_sum + terms["neg_qfl"]
         ctr_sum = ctr_sum + terms["centerness"]
         dfl_sum = dfl_sum + terms["dfl"]
         giou_sum = giou_sum + terms["giou"]
+        piou_sum = piou_sum + terms["pred_iou"]
         ent_sum = ent_sum + terms["entropy_reg"]
         regl2_sum = regl2_sum + terms["reg_l2_prior"]
 
-    # Aux head (stride-16 only).
+    # Aux head (decoder layer-0 output).
+    aux_h, aux_w = pred["conf_aux"].shape[-2:]
     aux_terms = _dense_loss_one_scale(
         pred["reg_aux_logits"],
         pred["conf_aux"],
         pred["ctr_aux"],
         gt_bbox,
         is_present,
-        stride=STRIDE_P4,
-        grid_h=GRID_P4,
-        grid_w=GRID_P4,
+        stride=img_size / float(aux_h),
+        grid_h=aux_h,
+        grid_w=aux_w,
+        pred_iou_logits=pred.get("pred_iou_aux"),
     )
     aux_loss = (
         aux_terms["qfl"]
@@ -699,12 +926,32 @@ def total_loss(
         + aux_terms["centerness"]
         + aux_terms["dfl"]
         + aux_terms["giou"]
+        + aux_terms["pred_iou"]
     )
 
-    # Presence (class-balanced focal-BCE).
-    presence_loss = class_balanced_focal_bce(
-        pred["presence_logit"], is_present.to(pred["presence_logit"].dtype)
-    )
+    # Presence loss — hardness-weighted (auto-rebalances toward whichever
+    # class the head is currently misclassifying) or plain class-balanced.
+    presence_target = is_present.to(pred["presence_logit"].dtype)
+    if use_hardness_weighted_presence:
+        presence_loss = hardness_weighted_focal_bce(
+            pred["presence_logit"], presence_target
+        )
+    else:
+        presence_loss = class_balanced_focal_bce(
+            pred["presence_logit"], presence_target
+        )
+
+    # Presence-aware contrastive loss + feature-spread regulariser.
+    contrastive_loss = qfl_sum.new_zeros(())
+    spread_loss = qfl_sum.new_zeros(())
+    enriched = pred.get("enriched_p4")
+    proto = pred.get("prototype")
+    if enriched is not None and proto is not None and contrastive_presence_weight > 0:
+        contrastive_loss = presence_aware_contrastive(
+            enriched, proto, gt_bbox, is_present, img_size=img_size
+        )
+    if enriched is not None and feature_spread_weight > 0:
+        spread_loss = feature_spread_reg(enriched)
 
     # Attention bbox loss.
     attn_loss = qfl_sum.new_zeros(())
@@ -722,13 +969,25 @@ def total_loss(
         + ctr_sum
         + dfl_sum
         + giou_sum
+        + piou_sum
         + entropy_reg_weight * ent_sum
         + reg_l2_prior_weight * regl2_sum
         + presence_weight * presence_loss
         + attn_loss_weight * attn_loss
         + aux_weight * aux_loss
         + proto_norm_weight * pn
+        + contrastive_presence_weight * contrastive_loss
+        + feature_spread_weight * spread_loss
     )
+
+    # Per-source loss scaling: multiply the total by the batch-mean of the
+    # per-sample weights provided by the trainer. This shifts the gradient
+    # mass between sources without changing intra-batch balance — combined
+    # with the source-balanced batch sampler it gives two independent levers
+    # for emphasising the harder target-domain sources.
+    if sample_loss_weight is not None and sample_loss_weight.numel() > 0:
+        batch_w = sample_loss_weight.to(total.dtype).mean()
+        total = total * batch_w
 
     return {
         "loss": total,
@@ -737,10 +996,13 @@ def total_loss(
         "centerness": ctr_sum.detach(),
         "dfl": dfl_sum.detach(),
         "giou": giou_sum.detach(),
+        "pred_iou": piou_sum.detach(),
         "entropy_reg": ent_sum.detach(),
         "reg_l2_prior": regl2_sum.detach(),
         "presence": presence_loss.detach(),
         "attn": attn_loss.detach(),
         "aux": aux_loss.detach(),
         "proto_norm": pn.detach(),
+        "contrastive_presence": contrastive_loss.detach(),
+        "feature_spread": spread_loss.detach(),
     }

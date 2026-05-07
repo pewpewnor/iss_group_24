@@ -183,6 +183,16 @@ def _scale_boxes(boxes: torch.Tensor, src: int, dst: int) -> torch.Tensor:
     return boxes * s
 
 
+def _hflip_boxes(boxes: torch.Tensor, img_size: int) -> torch.Tensor:
+    """Flip xyxy boxes horizontally about an image of size ``img_size``."""
+    if boxes.numel() == 0:
+        return boxes
+    flipped = boxes.clone()
+    flipped[:, 0] = img_size - boxes[:, 2]
+    flipped[:, 2] = img_size - boxes[:, 0]
+    return flipped
+
+
 @torch.no_grad()
 def predict_topk_tta(
     model: FewShotLocalizer,
@@ -193,14 +203,14 @@ def predict_topk_tta(
     top_k: int = 100,
     conf_thr: float = 0.05,
     nms_iou: float = 0.5,
+    use_hflip: bool = True,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], dict]:
-    """Two-scale TTA: decode at each resolution, scale boxes back to base_size,
-    merge with class-agnostic NMS.
+    """Multi-scale + horizontal-flip TTA. Decode at each (scale, flip) combo,
+    transform boxes back to ``base_size`` un-flipped coords, NMS-merge.
 
-    Returns:
-      boxes_per_image  : list[B] of (N_i, 4)
-      scores_per_image : list[B] of (N_i,)
-      diagnostics      : dict of per-batch statistics for the JSON metric set.
+    Args:
+        use_hflip: if True, run a second pass with the query (and supports for
+            consistency) horizontally flipped, then mirror the boxes back.
     """
     diags: dict[str, Any] = {"presence_score": None, "conf_map_p4": None,
                              "argmax_cell": None, "support_proto_norm": None}
@@ -213,28 +223,39 @@ def predict_topk_tta(
         out = model(support_imgs, q)
         if ti == 0:
             diags["presence_score"] = torch.sigmoid(out["presence_logit"]).detach().cpu()
-            cp4 = out["conf_p4"].detach().sigmoid().cpu()                          # (B,1,H,W)
+            cp4 = out["conf_p4"].detach().sigmoid().cpu()
             diags["conf_map_p4"] = cp4
-            # Argmax cell over union of scales (same shape: just use p4 here for the entropy diag).
             B, _, H, W = cp4.shape
             flat = cp4.view(B, -1)
-            am = flat.argmax(dim=1)                                                 # (B,)
-            diags["argmax_cell"] = am
+            diags["argmax_cell"] = flat.argmax(dim=1)
             diags["support_proto_norm"] = out["prototype"].detach().norm(dim=-1).cpu()
         boxes_pi, scores_pi = decode_topk(
             out, img_size=sz, top_k=top_k, conf_thr=conf_thr, nms_iou=nms_iou
         )
-        # Scale boxes back to base_size for cross-scale merge.
         boxes_pi = [_scale_boxes(b, src=sz, dst=base_size) for b in boxes_pi]
         all_boxes.append(boxes_pi)
         all_scores.append(scores_pi)
 
+        if use_hflip:
+            q_flip = torch.flip(q, dims=(-1,))
+            support_flip = torch.flip(support_imgs, dims=(-1,))
+            out_f = model(support_flip, q_flip)
+            boxes_pi_f, scores_pi_f = decode_topk(
+                out_f, img_size=sz, top_k=top_k, conf_thr=conf_thr, nms_iou=nms_iou
+            )
+            # Mirror boxes back to the un-flipped frame, then scale to base_size.
+            boxes_pi_f = [_hflip_boxes(b, sz) for b in boxes_pi_f]
+            boxes_pi_f = [_scale_boxes(b, src=sz, dst=base_size) for b in boxes_pi_f]
+            all_boxes.append(boxes_pi_f)
+            all_scores.append(scores_pi_f)
+
     B = len(all_boxes[0])
     out_boxes: list[torch.Tensor] = []
     out_scores: list[torch.Tensor] = []
+    n_passes = len(all_boxes)
     for i in range(B):
-        bx = torch.cat([all_boxes[t][i] for t in range(len(tta_sizes))], dim=0)
-        sc = torch.cat([all_scores[t][i] for t in range(len(tta_sizes))], dim=0)
+        bx = torch.cat([all_boxes[t][i] for t in range(n_passes)], dim=0)
+        sc = torch.cat([all_scores[t][i] for t in range(n_passes)], dim=0)
         if bx.numel() == 0:
             out_boxes.append(bx)
             out_scores.append(sc)
@@ -286,8 +307,9 @@ def evaluate(
     img_size: int = 224,
     use_tta: bool = True,
     tta_sizes: tuple[int, ...] = (224, 288),
+    use_hflip: bool = True,
     top_k: int = 100,
-    conf_thr: float = 0.05,
+    conf_thr: float = 0.03,
     nms_iou: float = 0.5,
     near_corner_px: int = 16,
     tiny_box_frac: float = 0.05,
@@ -322,6 +344,7 @@ def evaluate(
                 top_k=top_k,
                 conf_thr=conf_thr,
                 nms_iou=nms_iou,
+                use_hflip=use_hflip,
             )
         else:
             out = model(support_imgs, query_img)

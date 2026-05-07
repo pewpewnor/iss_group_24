@@ -47,11 +47,29 @@ SUPPORT_CROP_SCALES = (0.4, 0.6, 0.8, 1.0)
 # Default per-batch source mix (sums to 16). The trainer uses this when
 # `source_mix=None`. If a source pool is empty, its quota is redistributed
 # proportionally to the remaining sources.
+#
+# vizwiz_base's pool is ~38% of the train set but it's also the easiest /
+# most-pretrained-like distribution (object-centric phone shots). We
+# deliberately under-represent it here so the heads spend more gradient on
+# the harder target-domain sources (HOTS scene RGBs, InsDet products,
+# VizWiz novel categories). The complementary lever is `source_loss_weights`
+# which scales each sample's loss by source — see ``total_loss``.
+# User-stated priority: InsDet ≳ vizwiz_novel ≳ HOTS, vizwiz_base least.
+# vizwiz_novel has only ~13 train instances so the per-batch slot is generous
+# (over-represents in training relative to its tiny pool). The matching
+# loss-weight ladder reinforces the same priority on gradient magnitude.
 DEFAULT_SOURCE_MIX: dict[str, int] = {
-    "vizwiz_base": 4,
-    "vizwiz_novel": 2,
-    "hots": 5,
-    "insdet": 5,
+    "vizwiz_base": 2,
+    "vizwiz_novel": 4,
+    "hots": 4,
+    "insdet": 6,
+}
+
+DEFAULT_SOURCE_LOSS_WEIGHTS: dict[str, float] = {
+    "vizwiz_base": 0.3,
+    "vizwiz_novel": 1.7,
+    "hots": 1.5,
+    "insdet": 1.8,
 }
 
 
@@ -537,7 +555,16 @@ class EpisodeDataset(Dataset):
             q_bbox = None
             present = False
 
-        q_t, q_bbox_t = self._query_aug(q_img, q_bbox, rng, img_size=self.img_size)
+        # vizwiz_novel: with only 1 image per category, support and query
+        # share the underlying scene → trivial pixel-match risk. Use a
+        # boosted-strength query aug so support↔query are decorrelated.
+        is_novel = instance.get("source") == "vizwiz_novel"
+        if is_novel and self.train and self.augment:
+            boost = max(1.5, self.augment_strength * 1.5)
+            novel_aug = _Augment("query", train=True, augment=True, strength=boost)
+            q_t, q_bbox_t = novel_aug(q_img, q_bbox, rng, img_size=self.img_size)
+        else:
+            q_t, q_bbox_t = self._query_aug(q_img, q_bbox, rng, img_size=self.img_size)
 
         return {
             "support_imgs": support_imgs,

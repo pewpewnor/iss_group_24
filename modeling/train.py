@@ -48,12 +48,13 @@ from modeling._proto_cache import build_proto_cache
 from modeling._train_loop import train_one_pass
 from modeling.dataset import (
     DEFAULT_IMG_SIZE,
+    DEFAULT_SOURCE_LOSS_WEIGHTS,
     DEFAULT_SOURCE_MIX,
     SourceBalancedBatchSampler,
     collate,
 )
 from modeling.evaluate import evaluate
-from modeling.model import FewShotLocalizer
+from modeling.model import FewShotLocalizer, ModelEMA
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +81,59 @@ def _build_cfg(local_args: dict) -> dict:
             cfg[k] = v
     if cfg.get("source_mix") is None:
         cfg["source_mix"] = dict(DEFAULT_SOURCE_MIX)
+    if cfg.get("source_loss_weights") is None:
+        cfg["source_loss_weights"] = dict(DEFAULT_SOURCE_LOSS_WEIGHTS)
     for k in ("multi_scale_sizes", "val_tta_sizes"):
         if isinstance(cfg.get(k), tuple):
             cfg[k] = list(cfg[k])
     return cfg
+
+
+def _make_ema_and_scaler(
+    model, cfg: dict, device: torch.device
+) -> tuple[ModelEMA | None, "torch.cuda.amp.GradScaler | None", bool]:
+    """Build the EMA wrapper and AMP GradScaler from cfg flags."""
+    ema = None
+    if cfg.get("use_ema", True):
+        ema = ModelEMA(model, decay=float(cfg.get("ema_decay", 0.999)))
+        # Move shadow tensors to the model device.
+        for k, v in ema.shadow.items():
+            ema.shadow[k] = v.to(device)
+    use_amp = bool(cfg.get("use_amp", True)) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    return ema, scaler, use_amp
+
+
+def _evaluate_with_ema(
+    model, ema: ModelEMA | None, val_loader, device: torch.device, cfg: dict
+) -> dict:
+    """Evaluate using EMA weights when available, then restore live weights."""
+    if ema is None:
+        return evaluate(
+            model, val_loader, device,
+            use_tta=cfg["val_use_tta"], tta_sizes=tuple(cfg["val_tta_sizes"]),
+            img_size=cfg["img_size"],
+        )
+    backup = ema.apply_to(model)
+    try:
+        return evaluate(
+            model, val_loader, device,
+            use_tta=cfg["val_use_tta"], tta_sizes=tuple(cfg["val_tta_sizes"]),
+            img_size=cfg["img_size"],
+        )
+    finally:
+        ModelEMA.restore(model, backup)
+
+
+def _epoch_progress_for_anneal(epoch: int, total_epochs: int, anneal_epochs: int) -> float:
+    """Linear progress 0..1 for the source-weight annealing schedule.
+
+    ``epoch`` is 1-indexed. Returns 0.0 at epoch 1 and 1.0 once we've passed
+    ``anneal_epochs``.
+    """
+    if anneal_epochs <= 0:
+        return 1.0
+    return min(1.0, max(0.0, (epoch - 1) / max(1, anneal_epochs)))
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +172,9 @@ def _run_stage1(
     total_steps = steps_per_epoch * cfg["stage1_epochs"]
     sched = build_scheduler(opt, total_steps=total_steps, warmup_frac=cfg["warmup_frac"])
 
+    ema, scaler, use_amp = _make_ema_and_scaler(model, cfg, device)
+    anneal_epochs = int(cfg.get("source_weight_anneal_epochs_s1", cfg["stage1_epochs"]))
+
     if start["stage"] == 1 and loaded_opt is not None and not rebuild:
         try:
             opt.load_state_dict(loaded_opt)
@@ -134,15 +187,14 @@ def _run_stage1(
     start_epoch = start["epoch"] if start["stage"] == 1 else 1
     for epoch in range(start_epoch, cfg["stage1_epochs"] + 1):
         t0 = time.time()
+        progress = _epoch_progress_for_anneal(epoch, cfg["stage1_epochs"], anneal_epochs)
         train_metrics = train_one_pass(
             model=model, optimizer=opt, scheduler=sched, loader=train_loader,
             device=device, cfg=cfg, multi_scale=False,
+            ema=ema, scaler=scaler, use_amp=use_amp,
+            epoch_progress=progress,
         )
-        val_metrics = evaluate(
-            model, val_loader, device,
-            use_tta=cfg["val_use_tta"], tta_sizes=tuple(cfg["val_tta_sizes"]),
-            img_size=cfg["img_size"],
-        )
+        val_metrics = _evaluate_with_ema(model, ema, val_loader, device, cfg)
         epoch_payload = {
             "stage": 1, "epoch": epoch, "fold": None,
             "wall_clock_seconds": round(time.time() - t0, 2),
@@ -157,6 +209,7 @@ def _run_stage1(
             "stage_completed": (epoch == cfg["stage1_epochs"]),
             "global_step": sched.last_epoch,
             "model": model.state_dict(),
+            "ema": ema.state_dict() if ema is not None else None,
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
             "rng": capture_rng(),
@@ -183,11 +236,15 @@ def _run_stage1(
         )
 
     if cfg["save_stage_completion"]:
+        # Stage-completion checkpoint: store EMA weights as the primary model
+        # state_dict so downstream stages start from the EMA-stabilised model.
+        primary_state = ema.shadow if ema is not None else model.state_dict()
         ckpt = {
             "stage": 1, "epoch": cfg["stage1_epochs"], "fold": None,
             "stage_completed": True,
             "global_step": sched.last_epoch,
-            "model": model.state_dict(),
+            "model": primary_state,
+            "ema": ema.state_dict() if ema is not None else None,
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
             "rng": capture_rng(),
@@ -241,6 +298,9 @@ def _run_stage2(
     total_steps = steps_per_epoch * cfg["stage2_epochs"]
     sched = build_scheduler(opt, total_steps=total_steps, warmup_frac=cfg["warmup_frac"])
 
+    ema, scaler, use_amp = _make_ema_and_scaler(model, cfg, device)
+    anneal_epochs = int(cfg.get("source_weight_anneal_epochs_s2", cfg["stage2_epochs"]))
+
     if start["stage"] == 2 and loaded_opt is not None and not rebuild:
         try:
             opt.load_state_dict(loaded_opt)
@@ -254,16 +314,15 @@ def _run_stage2(
     for epoch in range(start_epoch, cfg["stage2_epochs"] + 1):
         t0 = time.time()
         train_ds.hard_neg_cache = build_proto_cache(model, train_ds, device, batch_size=cfg["batch_size"])
+        progress = _epoch_progress_for_anneal(epoch, cfg["stage2_epochs"], anneal_epochs)
         train_metrics = train_one_pass(
             model=model, optimizer=opt, scheduler=sched, loader=train_loader,
             device=device, cfg=cfg, multi_scale=cfg["multi_scale_s2"],
             multi_scale_sizes=tuple(cfg["multi_scale_sizes"]),
+            ema=ema, scaler=scaler, use_amp=use_amp,
+            epoch_progress=progress,
         )
-        val_metrics = evaluate(
-            model, val_loader, device,
-            use_tta=cfg["val_use_tta"], tta_sizes=tuple(cfg["val_tta_sizes"]),
-            img_size=cfg["img_size"],
-        )
+        val_metrics = _evaluate_with_ema(model, ema, val_loader, device, cfg)
         epoch_payload = {
             "stage": 2, "epoch": epoch, "fold": None,
             "wall_clock_seconds": round(time.time() - t0, 2),
@@ -278,6 +337,7 @@ def _run_stage2(
             "stage_completed": (epoch == cfg["stage2_epochs"]),
             "global_step": sched.last_epoch,
             "model": model.state_dict(),
+            "ema": ema.state_dict() if ema is not None else None,
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
             "rng": capture_rng(),
@@ -304,11 +364,13 @@ def _run_stage2(
         )
 
     if cfg["save_stage_completion"]:
+        primary_state = ema.shadow if ema is not None else model.state_dict()
         ckpt = {
             "stage": 2, "epoch": cfg["stage2_epochs"], "fold": None,
             "stage_completed": True,
             "global_step": sched.last_epoch,
-            "model": model.state_dict(),
+            "model": primary_state,
+            "ema": ema.state_dict() if ema is not None else None,
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
             "rng": capture_rng(),
@@ -365,6 +427,9 @@ def _run_stage3(
 
     opt = build_optimizer_for_stage(3, model, cfg)
     sched = build_scheduler(opt, total_steps=total_steps, warmup_frac=cfg["warmup_frac"])
+
+    ema, scaler, use_amp = _make_ema_and_scaler(model, cfg, device)
+    anneal_epochs = int(cfg.get("source_weight_anneal_epochs_s3", cfg["stage3_epochs"]))
 
     if start["stage"] == 3 and loaded_opt is not None and not rebuild:
         try:
@@ -423,16 +488,15 @@ def _run_stage3(
             )
             val_ds.set_fold(val_ids=val_ids)
 
+            progress = _epoch_progress_for_anneal(epoch, cfg["stage3_epochs"], anneal_epochs)
             train_metrics = train_one_pass(
                 model=model, optimizer=opt, scheduler=sched, loader=train_loader,
                 device=device, cfg=cfg, multi_scale=cfg["multi_scale_s3"],
                 multi_scale_sizes=tuple(cfg["multi_scale_sizes"]),
+                ema=ema, scaler=scaler, use_amp=use_amp,
+                epoch_progress=progress,
             )
-            val_metrics = evaluate(
-                model, val_loader, device,
-                use_tta=cfg["val_use_tta"], tta_sizes=tuple(cfg["val_tta_sizes"]),
-                img_size=cfg["img_size"],
-            )
+            val_metrics = _evaluate_with_ema(model, ema, val_loader, device, cfg)
             fold_payload = {
                 "stage": 3, "epoch": epoch, "fold": fold_idx,
                 "wall_clock_seconds": round(time.time() - t0, 2),
@@ -451,6 +515,7 @@ def _run_stage3(
                 "stage_completed": False,
                 "global_step": sched.last_epoch,
                 "model": model.state_dict(),
+                "ema": ema.state_dict() if ema is not None else None,
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict(),
                 "rng": capture_rng(),
@@ -494,11 +559,13 @@ def _run_stage3(
         del train_ds
 
     if cfg["save_stage_completion"]:
+        primary_state = ema.shadow if ema is not None else model.state_dict()
         ckpt = {
             "stage": 3, "epoch": cfg["stage3_epochs"], "fold": K - 1,
             "stage_completed": True,
             "global_step": sched.last_epoch,
-            "model": model.state_dict(),
+            "model": primary_state,
+            "ema": ema.state_dict() if ema is not None else None,
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
             "rng": capture_rng(),
@@ -530,16 +597,16 @@ def train(
     out_dir: str = "model",
     analysis_dir: str = "analysis",
     # stage durations
-    stage1_epochs: int = 5,
-    stage2_epochs: int = 8,
-    stage3_epochs: int = 35,
+    stage1_epochs: int = 3,
+    stage2_epochs: int = 12,
+    stage3_epochs: int = 20,
     # CV
     folds: int = 3,
     fold_seed: int = 42,
     # episodes / batches
     episodes_per_epoch_s1: int = 1500,
-    episodes_per_epoch_s2: int = 1500,
-    episodes_per_epoch_s3: int = 2000,
+    episodes_per_epoch_s2: int = 2000,
+    episodes_per_epoch_s3: int = 3000,
     val_episodes_s1: int = 400,
     val_episodes_s2: int = 400,
     val_episodes_s3: int = 240,
@@ -549,7 +616,7 @@ def train(
     # LR
     lr_heads_s1: float = 3e-4,
     lr_heads_s2: float = 2e-4,
-    lr_backbone_upper_s2: float = 5e-5,
+    lr_backbone_upper_s2: float = 7e-5,
     lr_heads_s3: float = 1e-4,
     lr_backbone_upper_s3: float = 5e-6,
     lr_backbone_lower_s3: float = 5e-6,
@@ -559,10 +626,10 @@ def train(
     # losses
     presence_weight: float = 1.0,
     attn_loss_weight: float = 0.5,
-    aux_weight: float = 0.5,
+    aux_weight: float = 0.1,
     entropy_reg_weight: float = 0.01,
-    reg_l2_prior_weight: float = 1e-3,
-    proto_norm_weight: float = 1e-3,
+    reg_l2_prior_weight: float = 0.0,
+    proto_norm_weight: float = 0.0,
     contrastive: bool = True,
     contrastive_weight: float = 0.1,
     contrastive_temp: float = 0.1,
@@ -572,21 +639,37 @@ def train(
     barlow_weight: float = 0.005,
     triplet: bool = False,
     triplet_weight: float = 0.1,
+    # Phase-0 last-resort discrimination + anti-collapse losses.
+    contrastive_presence_weight: float = 0.5,
+    feature_spread_weight: float = 0.1,
+    use_hardness_weighted_presence: bool = True,
     # curriculum
     neg_prob_s1: float = 0.40,
     neg_prob_s2: float = 0.45,
     neg_prob_s3: float = 0.50,
     hard_neg_ratio_s1: float = 0.0,
     hard_neg_ratio_s2: float = 0.30,
-    hard_neg_ratio_s3: float = 0.50,
+    hard_neg_ratio_s3: float = 0.60,
     # sampler
     source_mix: dict[str, int] | None = None,
+    source_loss_weights: dict[str, float] | None = None,
+    source_loss_weights_warmup: dict[str, float] | None = None,
+    source_weight_anneal_epochs_s1: int | None = None,
+    source_weight_anneal_epochs_s2: int | None = None,
+    source_weight_anneal_epochs_s3: int | None = None,
+    # backbone unfreeze indices
+    stage2_unfreeze_idx: int = 6,
+    stage3_split_idx: int = 6,
     # augmentation
     augment: bool = True,
     augment_strength: float = 1.0,
     multi_scale_s2: bool = True,
     multi_scale_s3: bool = True,
     multi_scale_sizes: tuple[int, ...] = (192, 224, 256),
+    # AMP + EMA
+    use_amp: bool = True,
+    use_ema: bool = True,
+    ema_decay: float = 0.999,
     # checkpoints
     save_stage_completion: bool = True,
     keep_last_n: int = 6,
@@ -687,7 +770,7 @@ def train(
 
 def train_stage1(**kwargs) -> dict:
     """Run only Stage 1 (head warmup, no CV)."""
-    kwargs.setdefault("stage1_epochs", 5)
+    kwargs.setdefault("stage1_epochs", 3)
     kwargs["stage2_epochs"] = 0
     kwargs["stage3_epochs"] = 0
     return train(**kwargs)
@@ -699,7 +782,7 @@ def train_stage2(**kwargs) -> dict:
     Defaults ``resume='stage1_complete.pt'`` so the cell is self-sufficient.
     """
     kwargs["stage1_epochs"] = 0
-    kwargs.setdefault("stage2_epochs", 8)
+    kwargs.setdefault("stage2_epochs", 12)
     kwargs["stage3_epochs"] = 0
     kwargs.setdefault("resume", "stage1_complete.pt")
     return train(**kwargs)
@@ -712,7 +795,7 @@ def train_stage3(**kwargs) -> dict:
     """
     kwargs["stage1_epochs"] = 0
     kwargs["stage2_epochs"] = 0
-    kwargs.setdefault("stage3_epochs", 35)
+    kwargs.setdefault("stage3_epochs", 20)
     kwargs.setdefault("folds", 3)
     kwargs.setdefault("resume", "stage2_complete.pt")
     return train(**kwargs)

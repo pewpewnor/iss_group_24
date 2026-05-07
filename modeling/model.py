@@ -1,46 +1,49 @@
-"""Siamese few-shot localiser with transformer cross-attention bridge.
+"""Siamese few-shot localiser (Phase 0 architecture overhaul).
 
 Architecture (Siamese — backbone weights shared between support and query):
 
-  shared MobileNetV3-Large backbone
+  shared MobileNetV3-Large backbone (+ optional 2-block ViT head over P5)
    ├── support_imgs (B,K,3,H,W) → P5 feat ────► SupportTokenizer (slot-attn, M=6, 2 iters)
    │                                          ─► (B*K, M, DIM) tokens
    │                                          ─► reshape (B, K*M, DIM)
    │                                          ─► SupportFusion (3-layer pre-LN Transformer
    │                                                            encoder, 8 heads, MLP×4)
    │                                          ─► (B, K*M, DIM) fused
-   │                                          ─► AttentionPool (CaiT class-attention)
-   │                                                          ─► support_summary (B, DIM)
+   │                                          ─► PerShotPool (K independent CaiT [CLS]
+   │                                                          queries → (B, K, DIM))
    │
    └── query_img (B,3,H,W) → P3,P4,P5 ──► FPN(P4,P5) + gated P3 residual
-                                       ─► query_pe (learnable + sinusoidal)
-                                       ─► CrossAttentionHead (2-layer DETR decoder,
-                                                             learnable softmax τ,
-                                                             DropPath p=0.15)
+                                       ─► query_pe (learnable bilinear-resizable
+                                                    + sinusoidal floor)
+                                       ─► CrossAttentionHead (3-layer DETR decoder,
+                                                              learnable softmax τ,
+                                                              DropPath p=0.20)
                                        ─► enriched query feat (B,DIM,H/16,W/16)
-                                       ─► P_lat (1×1 conv) lateral for stride-8 path
+                                       ─► gated P3 lateral for stride-8 detection path
 
-Detection heads (weight-shared across two FPN scales):
-  stride 16 (14×14 at 224 input):  reg(DFL 17 bins × 4 coords) + conf + centerness
-  stride  8 (28×28 at 224 input):  same head, weight-shared
+Detection heads — DECOUPLED across stride-8 / stride-16 / aux scales (each is a
+separate ``DetectionHead`` instance). Each emits:
+    reg     : 4 * DFL_BINS=32 channels (DFL distribution per l/t/r/b)
+    conf    : 1 channel
+    ctr     : 1 channel  (FCOS centerness)
+    pred_iou: 1 channel  (IoU-Aware FCOS / VarifocalNet ranking head)
 
-Aux head: a second DetectionHead applied to the layer-0 decoder output (DETR-style aux loss).
+Inference score = σ(conf) · σ(centerness) · σ(pred_iou) · σ(presence_logit).
 
 Presence head:
-  [support_summary ⊕ GAP(enriched_query)] → 320 → 160 → 64 → 1, GELU + LN-pre + dropout 0.2.
-
-decode_topk (inference-time):
-  Per image, take top-K cells across both scales above τ_conf, NMS at IoU=0.5,
-  score = σ(conf) · σ(centerness) · σ(presence_logit).
+  Input is per-shot prototypes (B, K, DIM) flattened ⊕ GAP(enriched_query) →
+  K·DIM + DIM → 256 → 64 → 1, GELU + LN-pre + dropout 0.2.
+  Per-shot input lets the head consult shot-disagreement directly (the prior
+  bag-summary version aggregated this away → presence_acc_neg ~ 0.5).
 
 Outputs (forward):
-  reg_p4, conf_p4, ctr_p4   — stride-16 grids (B, *, 14, 14)
-  reg_p3, conf_p3, ctr_p3   — stride-8 grids (B, *, 28, 28)
-  reg_aux, conf_aux, ctr_aux— stride-16 decoder layer-0 aux (same shape)
-  presence_logit            — (B,)
-  prototype                 — (B, DIM) bag-level summary
-  per_shot_prototype        — (B, K, DIM)
-  support_attn              — (B, K, M, 7, 7)
+  reg_p4_logits, conf_p4, ctr_p4, pred_iou_p4   (stride-16 grid)
+  reg_p3_logits, conf_p3, ctr_p3, pred_iou_p3   (stride-8 grid)
+  reg_aux_logits, conf_aux, ctr_aux, pred_iou_aux  (aux head on decoder layer 0)
+  presence_logit  (B,)
+  prototype       (B, DIM)  — bag-level summary (avg of per-shot prototypes)
+  per_shot_prototype (B, K, DIM)
+  support_attn    (B, K, M, 7, 7)
 """
 
 from __future__ import annotations
@@ -60,8 +63,8 @@ from torchvision.ops import FeaturePyramidNetwork, batched_nms
 # ---------------------------------------------------------------------------
 
 IMG_SIZE = 224
-GRID_P4 = 14                         # stride 16 grid at IMG_SIZE=224
-GRID_P3 = 28                         # stride  8 grid at IMG_SIZE=224
+GRID_P4 = 14
+GRID_P3 = 28
 STRIDE_P4 = 16
 STRIDE_P3 = 8
 
@@ -70,13 +73,13 @@ M_TOKENS = 6
 N_HEADS = 8
 K_SUPPORT_MAX = 8
 FUSION_LAYERS = 3
-DECODER_LAYERS = 2
+DECODER_LAYERS = 3                                # was 2 — Phase 0 deeper decoder
 SLOT_ATTN_ITERS = 2
-DROP_PATH = 0.15
+DROP_PATH = 0.20                                  # was 0.15 — compensate for added capacity
 
-# Distribution Focal Loss bins per coordinate (l, t, r, b in stride units).
-# 17 bins covers offsets up to ~stride*16 (256 px) — sufficient at 224 input.
-DFL_BINS = 17
+# Distribution Focal Loss bins per coordinate. Bumped from 17 to 32 so the
+# regressor can express larger objects without bin-clamp truncation.
+DFL_BINS = 32
 
 P3_IDX = 6
 P3_CHANNELS = 40
@@ -87,7 +90,7 @@ P5_CHANNELS = 160
 
 
 # ---------------------------------------------------------------------------
-# Backbone (shared between support and query streams — Siamese)
+# Backbone (shared between support and query — Siamese)
 # ---------------------------------------------------------------------------
 
 
@@ -139,14 +142,12 @@ class MobileNetBackbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 2D sinusoidal positional encoding (DETR-style)
+# 2D sinusoidal positional encoding
 # ---------------------------------------------------------------------------
 
 
 def _sinusoidal_2d_pe(dim: int, h: int, w: int, device, dtype=torch.float32) -> torch.Tensor:
-    """Return (1, dim, h, w) DETR-style 2D sinusoidal PE."""
     if dim % 4 != 0:
-        # Pad to nearest multiple of 4; we'll slice back to `dim` at the end.
         pad_dim = ((dim + 3) // 4) * 4
     else:
         pad_dim = dim
@@ -167,76 +168,7 @@ def _sinusoidal_2d_pe(dim: int, h: int, w: int, device, dtype=torch.float32) -> 
 
 
 # ---------------------------------------------------------------------------
-# Slot-attention support tokenizer (2-iter, M=6, learnable temperature)
-# ---------------------------------------------------------------------------
-
-
-class SupportTokenizer(nn.Module):
-    """2-iteration slot-attention with M competing slots per support image.
-
-    Iterating slot-attention >1 (Locatello et al. 2020) gives slots time to
-    refine their assignments — empirically much cleaner region tokens than 1
-    iteration. Slots compete via softmax over the M dimension, forcing them
-    to cover disjoint regions of the support feature map.
-    """
-
-    def __init__(
-        self,
-        in_c: int = P5_CHANNELS,
-        dim: int = DIM,
-        m_tokens: int = M_TOKENS,
-        n_iters: int = SLOT_ATTN_ITERS,
-    ) -> None:
-        super().__init__()
-        self.dim = dim
-        self.m = m_tokens
-        self.n_iters = n_iters
-        self.scale = dim ** -0.5
-        self.slots_init = nn.Parameter(torch.randn(m_tokens, dim) * 0.02)
-        # Learnable softmax temperature (clamped to a stable range).
-        self._log_tau = nn.Parameter(torch.zeros(1))
-        self.kv_norm = nn.LayerNorm(in_c)
-        self.k_proj = nn.Linear(in_c, dim, bias=False)
-        self.v_proj = nn.Linear(in_c, dim, bias=False)
-        self.q_norm = nn.LayerNorm(dim)
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.norm_out = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Linear(dim * 2, dim),
-        )
-
-    def _tau(self) -> torch.Tensor:
-        # Clamp τ to [0.5, 2.0] via softplus, keeps gradients smooth.
-        return F.softplus(self._log_tau) + 0.5
-
-    def forward(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        n, _, h, w = feat.shape
-        kv_in = self.kv_norm(feat.flatten(2).transpose(1, 2))           # (N, HW, C)
-        k = self.k_proj(kv_in)                                          # (N, HW, dim)
-        v = self.v_proj(kv_in)                                          # (N, HW, dim)
-        slots = self.slots_init.unsqueeze(0).expand(n, -1, -1)          # (N, M, dim)
-        tau = self._tau()
-        attn = None
-        for _ in range(self.n_iters):
-            q = self.q_proj(self.q_norm(slots))                          # (N, M, dim)
-            logits = torch.einsum("nmd,nld->nml", q, k) * (self.scale / tau)
-            attn = logits.softmax(dim=1)                                  # softmax over M
-            attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)     # (N, M, 1)
-            weights = attn / attn_sum                                     # (N, M, HW)
-            updates = torch.einsum("nml,nld->nmd", weights, v)            # (N, M, dim)
-            slots = self.norm_out(slots + updates)
-            slots = slots + self.ffn(slots)
-        assert attn is not None
-        attn_map = (attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)).view(
-            n, self.m, h, w
-        )
-        return slots, attn_map
-
-
-# ---------------------------------------------------------------------------
-# Pre-LN Transformer encoder block (used by SupportFusion)
+# DropPath + pre-LN transformer block
 # ---------------------------------------------------------------------------
 
 
@@ -255,7 +187,7 @@ class _DropPath(nn.Module):
 
 
 class _TransformerEncoderBlock(nn.Module):
-    """Pre-LN self-attention + GELU FFN with MLP ratio = 4."""
+    """Pre-LN self-attention + GELU FFN."""
 
     def __init__(
         self,
@@ -285,15 +217,114 @@ class _TransformerEncoderBlock(nn.Module):
         return x
 
 
-class SupportFusion(nn.Module):
-    """3-layer pre-LN Transformer encoder over the K*M token bag.
+# ---------------------------------------------------------------------------
+# ViT head over P5 — adds global context to the backbone (Phase 0 last-resort)
+# ---------------------------------------------------------------------------
 
-    Adds learnable shot+slot positional embeddings so self-attention can
-    consult "which support did this token come from" and "which region in
-    that support". Critical for cross-shot voting; without this the K shots
-    are independent tokens.
+
+class ViTHeadP5(nn.Module):
+    """2-block ViT applied to the P5 feature map (7×7×160 → 7×7×160).
+
+    Adds global self-attention so the support tokenizer + cross-attention
+    bridge get spatially-mixed P5 features instead of the raw MobileNet
+    P5 output. ~0.4M params; cheap because it only sees 49 tokens.
     """
 
+    def __init__(
+        self,
+        dim: int = P5_CHANNELS,
+        n_heads: int = N_HEADS,
+        n_layers: int = 2,
+        drop_path: float = DROP_PATH,
+    ) -> None:
+        super().__init__()
+        # 7×7 grid PE
+        self.pe = nn.Parameter(torch.zeros(1, dim, 7, 7))
+        nn.init.trunc_normal_(self.pe, std=0.02)
+        self.layers = nn.ModuleList(
+            [_TransformerEncoderBlock(dim, n_heads, mlp_ratio=4, drop_path=drop_path)
+             for _ in range(n_layers)]
+        )
+        self.out_norm = nn.LayerNorm(dim)
+
+    def forward(self, p5: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = p5.shape
+        # Resize PE if input grid size != 7×7 (multi-scale TTA)
+        pe = self.pe
+        if pe.shape[-2:] != (h, w):
+            pe = F.interpolate(pe, size=(h, w), mode="bilinear", align_corners=False)
+        x = (p5 + pe).flatten(2).transpose(1, 2)                                # (B, HW, C)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.out_norm(x)
+        return x.transpose(1, 2).view(b, c, h, w) + p5                          # residual
+
+
+# ---------------------------------------------------------------------------
+# Slot-attention support tokenizer
+# ---------------------------------------------------------------------------
+
+
+class SupportTokenizer(nn.Module):
+    def __init__(
+        self,
+        in_c: int = P5_CHANNELS,
+        dim: int = DIM,
+        m_tokens: int = M_TOKENS,
+        n_iters: int = SLOT_ATTN_ITERS,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.m = m_tokens
+        self.n_iters = n_iters
+        self.scale = dim ** -0.5
+        self.slots_init = nn.Parameter(torch.randn(m_tokens, dim) * 0.02)
+        self._log_tau = nn.Parameter(torch.zeros(1))
+        self.kv_norm = nn.LayerNorm(in_c)
+        self.k_proj = nn.Linear(in_c, dim, bias=False)
+        self.v_proj = nn.Linear(in_c, dim, bias=False)
+        self.q_norm = nn.LayerNorm(dim)
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.norm_out = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
+
+    def _tau(self) -> torch.Tensor:
+        return F.softplus(self._log_tau) + 0.5
+
+    def forward(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        n, _, h, w = feat.shape
+        kv_in = self.kv_norm(feat.flatten(2).transpose(1, 2))
+        k = self.k_proj(kv_in)
+        v = self.v_proj(kv_in)
+        slots = self.slots_init.unsqueeze(0).expand(n, -1, -1)
+        tau = self._tau()
+        attn = None
+        for _ in range(self.n_iters):
+            q = self.q_proj(self.q_norm(slots))
+            logits = torch.einsum("nmd,nld->nml", q, k) * (self.scale / tau)
+            attn = logits.softmax(dim=1)
+            attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            weights = attn / attn_sum
+            updates = torch.einsum("nml,nld->nmd", weights, v)
+            slots = self.norm_out(slots + updates)
+            slots = slots + self.ffn(slots)
+        assert attn is not None
+        attn_map = (attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)).view(
+            n, self.m, h, w
+        )
+        return slots, attn_map
+
+
+# ---------------------------------------------------------------------------
+# Inter-shot fusion — 3-layer pre-LN transformer encoder
+# ---------------------------------------------------------------------------
+
+
+class SupportFusion(nn.Module):
     def __init__(
         self,
         dim: int = DIM,
@@ -301,7 +332,7 @@ class SupportFusion(nn.Module):
         n_layers: int = FUSION_LAYERS,
         k_max: int = K_SUPPORT_MAX,
         m_tokens: int = M_TOKENS,
-        drop_path: float = 0.0,
+        drop_path: float = DROP_PATH,
     ) -> None:
         super().__init__()
         self.shot_pe = nn.Parameter(torch.randn(k_max, dim) * 0.02)
@@ -309,10 +340,8 @@ class SupportFusion(nn.Module):
         self.k_max = k_max
         self.m = m_tokens
         self.layers = nn.ModuleList(
-            [
-                _TransformerEncoderBlock(dim, n_heads, mlp_ratio=4, drop_path=drop_path)
-                for _ in range(n_layers)
-            ]
+            [_TransformerEncoderBlock(dim, n_heads, mlp_ratio=4, drop_path=drop_path)
+             for _ in range(n_layers)]
         )
         self.out_norm = nn.LayerNorm(dim)
 
@@ -333,21 +362,28 @@ class SupportFusion(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Class-attention pool (CaiT-style)
+# Per-shot CaiT-style attention pool — K independent [CLS] queries
 # ---------------------------------------------------------------------------
 
 
-class ClassAttentionPool(nn.Module):
-    """Single learnable [CLS] token attends over the support token bag.
+class PerShotAttentionPool(nn.Module):
+    """Per-shot pool: ``K`` independent CaiT [CLS] queries each attend over
+    the full ``K*M`` token bag. Returns ``(B, K, DIM)`` per-shot prototypes.
 
-    A fresh CLS query (rather than mean-pool) lets the pool weight informative
-    tokens (object-relevant slots) over redundant ones (background, repeated
-    shots). 1 layer, pre-LN, 8 heads, residual + FFN.
+    The ``forward_bag`` method preserves the previous bag-level interface
+    (single CLS over all tokens) for the cross-attention bridge.
     """
 
-    def __init__(self, dim: int = DIM, n_heads: int = N_HEADS) -> None:
+    def __init__(
+        self,
+        dim: int = DIM,
+        n_heads: int = N_HEADS,
+        k_max: int = K_SUPPORT_MAX,
+    ) -> None:
         super().__init__()
-        self.cls = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.k_max = k_max
+        self.cls = nn.Parameter(torch.randn(k_max, 1, dim) * 0.02)
+        self.bag_cls = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
@@ -358,27 +394,40 @@ class ClassAttentionPool(nn.Module):
             nn.Linear(dim * 4, dim),
         )
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def _pool(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        # q: (B, Q, D); kv: (B, N, D)
+        q_n = self.norm_q(q)
+        kv_n = self.norm_kv(kv)
+        out, _ = self.attn(q_n, kv_n, kv_n, need_weights=False)
+        x = q + out
+        x = x + self.ffn(self.norm_ffn(x))
+        return x
+
+    def forward_per_shot(self, tokens: torch.Tensor, k: int) -> torch.Tensor:
+        """Returns per-shot prototypes (B, K, DIM)."""
         b = tokens.shape[0]
-        cls = self.cls.expand(b, -1, -1)
-        q = self.norm_q(cls)
-        kv = self.norm_kv(tokens)
-        out, _ = self.attn(q, kv, kv, need_weights=False)
-        cls = cls + out
-        cls = cls + self.ffn(self.norm_ffn(cls))
-        return cls.squeeze(1)
+        if k > self.k_max:
+            raise ValueError(f"k={k} exceeds k_max={self.k_max}")
+        q = self.cls[:k].unsqueeze(0).expand(b, k, 1, tokens.shape[-1])
+        # We need K independent queries each attending over the bag.
+        # Stack into (B, K, D) by treating Q=K and reshaping:
+        q = q.reshape(b, k, tokens.shape[-1])                                  # (B, K, D)
+        return self._pool(q, tokens)
+
+    def forward_bag(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Returns bag-level summary (B, DIM) via a single shared [CLS] query."""
+        b = tokens.shape[0]
+        q = self.bag_cls.expand(b, -1, -1)                                     # (B, 1, D)
+        out = self._pool(q, tokens)
+        return out.squeeze(1)
 
 
 # ---------------------------------------------------------------------------
-# Cross-attention bridge — DETR-style 2-layer decoder, learnable softmax τ
+# Cross-attention bridge — DETR-style 3-layer decoder
 # ---------------------------------------------------------------------------
 
 
 class _LearnableTempMHA(nn.Module):
-    """MultiheadAttention with a learnable softmax temperature applied to
-    the attention logits. τ is parameterised via softplus to stay positive
-    and clamped to [0.5, 2.0] for stability."""
-
     def __init__(self, dim: int, n_heads: int) -> None:
         super().__init__()
         if dim % n_heads != 0:
@@ -401,20 +450,18 @@ class _LearnableTempMHA(nn.Module):
         B, Lq, _ = q.shape
         Lk = k.shape[1]
         nh, hd = self.n_heads, self.head_dim
-        qh = self.q_proj(q).reshape(B, Lq, nh, hd).transpose(1, 2)        # (B,nh,Lq,hd)
+        qh = self.q_proj(q).reshape(B, Lq, nh, hd).transpose(1, 2)
         kh = self.k_proj(k).reshape(B, Lk, nh, hd).transpose(1, 2)
         vh = self.v_proj(v).reshape(B, Lk, nh, hd).transpose(1, 2)
         scale = (hd ** -0.5) / self._tau()
-        attn = (qh @ kh.transpose(-2, -1)) * scale                         # (B,nh,Lq,Lk)
+        attn = (qh @ kh.transpose(-2, -1)) * scale
         attn = attn.softmax(dim=-1)
-        out = attn @ vh                                                    # (B,nh,Lq,hd)
+        out = attn @ vh
         out = out.transpose(1, 2).reshape(B, Lq, self.dim)
         return self.out_proj(out)
 
 
 class _DecoderLayer(nn.Module):
-    """SelfAttn(query) → CrossAttn(query → support) → FFN, all pre-LN with DropPath."""
-
     def __init__(
         self,
         dim: int = DIM,
@@ -454,7 +501,7 @@ class _DecoderLayer(nn.Module):
 
 
 class CrossAttentionHead(nn.Module):
-    """2-layer DETR-style decoder. Returns (out, layer0_out)."""
+    """3-layer DETR-style decoder. Returns (final, layer0)."""
 
     def __init__(
         self,
@@ -472,7 +519,7 @@ class CrossAttentionHead(nn.Module):
         self, q_feat: torch.Tensor, support_kv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         b, c, h, w = q_feat.shape
-        q = q_feat.flatten(2).transpose(1, 2)                              # (B, H*W, dim)
+        q = q_feat.flatten(2).transpose(1, 2)
         layer0 = None
         for i, layer in enumerate(self.layers):
             q = layer(q, support_kv)
@@ -485,13 +532,11 @@ class CrossAttentionHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Detection head — DFL-bins reg + conf + centerness, weight-shared across scales
+# Detection head — DFL reg + conf + centerness + pred_iou
 # ---------------------------------------------------------------------------
 
 
 class _DWSepGN(nn.Module):
-    """Depthwise-separable conv with GroupNorm + GELU."""
-
     def __init__(self, in_c: int, out_c: int, gn_groups: int = 16) -> None:
         super().__init__()
         self.dw = nn.Conv2d(in_c, in_c, 3, padding=1, groups=in_c, bias=False)
@@ -504,11 +549,12 @@ class _DWSepGN(nn.Module):
 
 
 class DetectionHead(nn.Module):
-    """4× DWSep-GN tower, then three 1×1 heads:
+    """4× DWSep-GN tower → reg / conf / ctr / pred_iou.
 
-      reg : (B, 4*DFL_BINS, H, W) — discrete distribution per (l, t, r, b)
-      conf: (B, 1, H, W)
-      ctr : (B, 1, H, W) — centerness logit
+      reg     : (B, 4*DFL_BINS, H, W)
+      conf    : (B, 1, H, W)
+      ctr     : (B, 1, H, W)
+      pred_iou: (B, 1, H, W)
     """
 
     PRIOR_PI: float = 0.01
@@ -525,46 +571,64 @@ class DetectionHead(nn.Module):
         self.reg = nn.Conv2d(dim, 4 * dfl_bins, 1)
         self.conf = nn.Conv2d(dim, 1, 1)
         self.ctr = nn.Conv2d(dim, 1, 1)
+        self.pred_iou = nn.Conv2d(dim, 1, 1)
 
-        # RetinaNet bias-init for conf: π=0.01 → bias = -log((1-π)/π).
         nn.init.constant_(
             self.conf.bias, -math.log((1.0 - self.PRIOR_PI) / self.PRIOR_PI)
         )
         nn.init.zeros_(self.ctr.bias)
+        nn.init.zeros_(self.pred_iou.bias)
 
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         f = self.tower(x)
-        return self.reg(f), self.conf(f), self.ctr(f)
+        return self.reg(f), self.conf(f), self.ctr(f), self.pred_iou(f)
 
 
 # ---------------------------------------------------------------------------
-# Presence head — deeper bottleneck MLP, harder to short-circuit
+# Presence head — consumes per-shot prototypes
 # ---------------------------------------------------------------------------
 
 
 class PresenceHead(nn.Module):
-    """[support_summary ⊕ GAP(enriched)] → 320 → 160 → 64 → 1, GELU + LN-pre."""
+    """[per_shot_prototypes ⊕ GAP(enriched)] → 256 → 64 → 1.
 
-    def __init__(self, dim: int = DIM, dropout: float = 0.2) -> None:
+    Per-shot input preserves shot-disagreement, which the prior bag-summary
+    head aggregated away. This directly attacks the ``presence_acc_neg ≈ 0.5``
+    bias.
+    """
+
+    def __init__(
+        self, dim: int = DIM, k_max: int = K_SUPPORT_MAX, dropout: float = 0.2
+    ) -> None:
         super().__init__()
-        in_dim = dim * 2
+        in_dim = dim * k_max + dim                                              # K*D + D
         self.norm = nn.LayerNorm(in_dim)
+        hidden1 = 256
+        hidden2 = 64
         self.fc = nn.Sequential(
-            nn.Linear(in_dim, dim),
+            nn.Linear(in_dim, hidden1),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim, dim // 2 + dim // 4),                           # 64
+            nn.Linear(hidden1, hidden2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim // 2 + dim // 4, 1),
+            nn.Linear(hidden2, 1),
         )
+        self.k_max = k_max
+        self.dim = dim
 
     def forward(
-        self, support_summary: torch.Tensor, q_gap: torch.Tensor
+        self, per_shot_prototype: torch.Tensor, q_gap: torch.Tensor
     ) -> torch.Tensor:
-        x = torch.cat([support_summary, q_gap], dim=1)
+        b, k, d = per_shot_prototype.shape
+        # Pad up to k_max with zeros so input dim is constant.
+        if k < self.k_max:
+            pad = per_shot_prototype.new_zeros(b, self.k_max - k, d)
+            per_shot_prototype = torch.cat([per_shot_prototype, pad], dim=1)
+        flat = per_shot_prototype.reshape(b, -1)
+        x = torch.cat([flat, q_gap], dim=1)
         x = self.norm(x)
         return self.fc(x).squeeze(1)
 
@@ -577,23 +641,15 @@ class PresenceHead(nn.Module):
 def dfl_expectation(
     reg_logits: torch.Tensor, dfl_bins: int = DFL_BINS
 ) -> torch.Tensor:
-    """(B, 4*K, H, W) discrete logits → (B, 4, H, W) expected scalar offsets.
-
-    Bins represent integer offsets in stride units: 0, 1, ..., DFL_BINS-1.
-    The expected value is sum_i softmax(logits)_i · i.
-    """
     b, c, h, w = reg_logits.shape
     assert c == 4 * dfl_bins, f"expected channels={4 * dfl_bins}, got {c}"
     logits = reg_logits.view(b, 4, dfl_bins, h, w)
     p = logits.softmax(dim=2)
     bins = torch.arange(dfl_bins, device=reg_logits.device, dtype=p.dtype)
-    return (p * bins.view(1, 1, dfl_bins, 1, 1)).sum(dim=2)                 # (B, 4, H, W)
+    return (p * bins.view(1, 1, dfl_bins, 1, 1)).sum(dim=2)
 
 
-def decode_ltrb_to_xyxy(
-    ltrb: torch.Tensor, stride: int
-) -> torch.Tensor:
-    """(B, 4, H, W) (l, t, r, b) in stride units → (B, 4, H, W) xyxy boxes in image coords."""
+def decode_ltrb_to_xyxy(ltrb: torch.Tensor, stride: float | int) -> torch.Tensor:
     b, _, h, w = ltrb.shape
     device = ltrb.device
     j = torch.arange(w, device=device, dtype=ltrb.dtype).view(1, 1, w).expand(b, h, w)
@@ -613,19 +669,22 @@ def decode_ltrb_to_xyxy(
 
 
 class FewShotLocalizer(nn.Module):
-    """Siamese few-shot localiser. Backbone weights are shared between the
-    support and query streams (one ``MobileNetBackbone`` instance, called
-    once for supports and once for the query)."""
+    """Siamese few-shot localiser. Backbone weights are shared between
+    support and query streams (one ``MobileNetBackbone`` instance)."""
 
     def __init__(self, pretrained: bool = True) -> None:
         super().__init__()
         # Shared backbone — Siamese contract.
         self.backbone = MobileNetBackbone(pretrained=pretrained)
 
+        # ViT head over P5 — adds global self-attention to the backbone
+        # output before slot-attention / FPN consume it.
+        self.vit_head = ViTHeadP5()
+
         # Support branch.
         self.support_tokenizer = SupportTokenizer()
         self.support_fusion = SupportFusion(drop_path=DROP_PATH)
-        self.support_pool = ClassAttentionPool()
+        self.support_pool = PerShotAttentionPool()
 
         # Query branch.
         self.fpn = FeaturePyramidNetwork(
@@ -635,34 +694,34 @@ class FewShotLocalizer(nn.Module):
         self.p3_lat = nn.Conv2d(P3_CHANNELS, DIM, kernel_size=1, bias=False)
         self.p3_gate = nn.Parameter(torch.zeros(1, DIM, 1, 1))
 
-        # Stride-8 detection feature map: upsample enriched query feat (14×14)
-        # to 28×28 and add a 1×1-projected P3 lateral.
+        # Stride-8 detection lateral with its own per-channel gate
+        # (mirrors the FPN-side P3 gate so the model can dial the stride-8
+        # detection path up or down independently).
         self.p3_det_lat = nn.Conv2d(P3_CHANNELS, DIM, kernel_size=1, bias=False)
+        self.p3_det_gate = nn.Parameter(torch.zeros(1, DIM, 1, 1))
 
-        # Learnable 2D PE for the query feature map (14×14). Sinusoidal floor
-        # is added in forward.
+        # Learnable + sinusoidal PE for the query feature map at stride 16.
         self.query_pe_p4 = nn.Parameter(torch.zeros(1, DIM, GRID_P4, GRID_P4))
         nn.init.trunc_normal_(self.query_pe_p4, std=0.02)
 
-        # [ABSENT] sink token for cross-attention; token-dropout p=0.1 during training.
-        self.absent_token = nn.Parameter(torch.zeros(1, 1, DIM))
-        nn.init.trunc_normal_(self.absent_token, std=0.02)
-        self.absent_dropout_p = 0.1
+        # Per-slot [ABSENT] token bank (one per support slot). Token-dropout
+        # p=0.2 applied during training.
+        self.absent_tokens = nn.Parameter(torch.zeros(1, M_TOKENS, DIM))
+        nn.init.trunc_normal_(self.absent_tokens, std=0.02)
+        self.absent_dropout_p = 0.2
 
         # Cross-attention bridge.
         self.cross_attn = CrossAttentionHead()
 
-        # Detection heads — weight-shared across stride-8 and stride-16 outputs.
-        self.det_head = DetectionHead()
-        # Aux head on decoder-layer-0 output, stride-16 only (cheap aux loss).
-        self.aux_head = DetectionHead()
+        # DECOUPLED detection heads: one per scale.
+        self.det_head_p4 = DetectionHead()
+        self.det_head_p3 = DetectionHead()
+        self.det_head_aux = DetectionHead()
 
-        # Presence head.
+        # Presence head consumes per-shot prototypes ⊕ GAP(enriched_p4).
         self.presence_head = PresenceHead()
 
-        # Score-calibration scalar (init=1.0). Multiplies conf logits at train
-        # time — lets the conf distribution expand without rebalancing other
-        # losses.
+        # Score-calibration scalar.
         self.conf_scale = nn.Parameter(torch.ones(1))
 
     # ---- support branch ----------------------------------------------------
@@ -671,29 +730,22 @@ class FewShotLocalizer(nn.Module):
         self,
         support_imgs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """support_imgs: (B, K, 3, H, W).
-
-        Returns:
-            tokens             — (B, K*M, DIM) fused token bag.
-            per_shot_prototype — (B, K, DIM) per-shot pooled summary.
-            attn               — (B, K, M, 7, 7) slot attention maps.
-        """
         b, k = support_imgs.shape[:2]
         flat = support_imgs.reshape(b * k, 3, support_imgs.shape[3], support_imgs.shape[4])
         feat = self.backbone.forward_p5_only(flat)
+        feat = self.vit_head(feat)
         tokens, attn = self.support_tokenizer(feat)
         m, dim = tokens.shape[1], tokens.shape[2]
 
-        # Per-shot pooled summary (BEFORE fusion) for contrastive losses.
-        per_shot = self.support_pool(tokens)
-        per_shot = per_shot.view(b, k, dim)
-
         # Fuse the K*M token bag.
-        tokens = tokens.view(b, k * m, dim)
-        tokens = self.support_fusion(tokens, k=k)
+        bag = tokens.view(b, k * m, dim)
+        bag_fused = self.support_fusion(bag, k=k)
+
+        # Per-shot prototypes — independent CaiT [CLS] queries.
+        per_shot = self.support_pool.forward_per_shot(bag_fused, k=k)            # (B, K, DIM)
 
         attn = attn.view(b, k, m, attn.shape[-2], attn.shape[-1])
-        return tokens, per_shot, attn
+        return bag_fused, per_shot, attn
 
     @torch.no_grad()
     def compute_prototype(self, support_imgs: torch.Tensor) -> torch.Tensor:
@@ -705,22 +757,18 @@ class FewShotLocalizer(nn.Module):
     def encode_query(
         self, query_img: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (q_p4 stride-16, p3_for_det stride-8 lateral).
-
-        q_p4 : (B, DIM, H/16, W/16)
-        p3_l : (B, DIM, H/8,  W/8 )
-        """
         p3, p4, p5 = self.backbone(query_img)
+        p5 = self.vit_head(p5)
         fpn_out = self.fpn(OrderedDict([("p4", p4), ("p5", p5)]))
-        feat = fpn_out["p4"]                                              # (B, DIM, H/16, W/16)
-        # Stride-8 residual added to P4 (downsampled)
+        feat = fpn_out["p4"]
         p3_down = F.avg_pool2d(self.p3_lat(p3), kernel_size=2)
         gate = torch.sigmoid(self.p3_gate)
         feat = feat + gate * p3_down
 
-        # Stride-8 detection lateral (kept at 28×28).
+        # Stride-8 detection lateral, gated independently.
         p3_det = self.p3_det_lat(p3)
-        return feat, p3_det
+        p3_det_gate = torch.sigmoid(self.p3_det_gate)
+        return feat, p3_det, p3_det_gate
 
     # ---- core head ---------------------------------------------------------
 
@@ -728,16 +776,15 @@ class FewShotLocalizer(nn.Module):
         self,
         q_feat_p4: torch.Tensor,
         q_feat_p3: torch.Tensor,
+        p3_det_gate: torch.Tensor,
         support_tokens: torch.Tensor,
+        per_shot_prototype: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         b = q_feat_p4.shape[0]
         if support_tokens.shape[0] != b:
             support_tokens = support_tokens.expand(b, -1, -1)
 
-        # Add learnable + sinusoidal PE to query at stride 16. The learnable
-        # PE is stored at the canonical 14×14 grid; it's bilinearly resized
-        # to whatever grid the current input produced (multi-scale training,
-        # 2-scale TTA, etc.).
+        # Add learnable + sinusoidal PE.
         h, w = q_feat_p4.shape[-2:]
         learn_pe = self.query_pe_p4
         if learn_pe.shape[-2:] != (h, w):
@@ -750,62 +797,71 @@ class FewShotLocalizer(nn.Module):
         )
         q = q_feat_p4 + learn_pe + sin_pe
 
-        # [ABSENT] sink token; token-dropout during training.
-        absent = self.absent_token.expand(b, -1, -1)
+        # Per-slot absent token bank with token-dropout.
+        absent = self.absent_tokens.expand(b, -1, -1)
         if self.training and self.absent_dropout_p > 0.0:
             keep = (
-                torch.rand(b, 1, 1, device=q.device) >= self.absent_dropout_p
+                torch.rand(b, absent.shape[1], 1, device=q.device)
+                >= self.absent_dropout_p
             ).to(q.dtype)
             absent = absent * keep
         cross_kv = torch.cat([support_tokens, absent], dim=1)
 
         enriched_p4, enriched_aux = self.cross_attn(q, cross_kv)
 
-        # Stride-8 enriched feature: upsample stride-16 + add P3 lateral.
+        # Stride-8 enriched feature: upsample stride-16 + gated P3 lateral.
         enriched_up = F.interpolate(
             enriched_p4, size=q_feat_p3.shape[-2:], mode="bilinear", align_corners=False
         )
-        enriched_p3 = enriched_up + q_feat_p3
+        enriched_p3 = enriched_up + p3_det_gate * q_feat_p3
 
-        # Detection heads.
-        reg_p4_logits, conf_p4, ctr_p4 = self.det_head(enriched_p4)
-        reg_p3_logits, conf_p3, ctr_p3 = self.det_head(enriched_p3)
-        # Aux head on stride-16 layer-0 decoder output.
-        reg_aux_logits, conf_aux, ctr_aux = self.aux_head(enriched_aux)
+        # Decoupled detection heads.
+        reg_p4_logits, conf_p4, ctr_p4, iou_p4 = self.det_head_p4(enriched_p4)
+        reg_p3_logits, conf_p3, ctr_p3, iou_p3 = self.det_head_p3(enriched_p3)
+        reg_aux_logits, conf_aux, ctr_aux, iou_aux = self.det_head_aux(enriched_aux)
 
-        # Score-calibration scalar on conf logits (kept ≥0 via softplus shift).
+        # Score-calibration scalar.
         scale = F.softplus(self.conf_scale) + 1e-3
         conf_p4 = conf_p4 * scale
         conf_p3 = conf_p3 * scale
         conf_aux = conf_aux * scale
 
-        # Presence head on bag-level summary + GAP(enriched_p4).
+        # Presence head: per-shot prototypes ⊕ GAP(enriched_p4).
         q_gap = enriched_p4.mean(dim=(2, 3))
-        support_summary = self.support_pool(support_tokens)
-        presence_logit = self.presence_head(support_summary, q_gap)
+        presence_logit = self.presence_head(per_shot_prototype, q_gap)
+
+        # Bag-level summary for prototype regularisers / hard-neg cache.
+        prototype = per_shot_prototype.mean(dim=1)
 
         return {
             "reg_p4_logits": reg_p4_logits,
             "conf_p4": conf_p4,
             "ctr_p4": ctr_p4,
+            "pred_iou_p4": iou_p4,
             "reg_p3_logits": reg_p3_logits,
             "conf_p3": conf_p3,
             "ctr_p3": ctr_p3,
+            "pred_iou_p3": iou_p3,
             "reg_aux_logits": reg_aux_logits,
             "conf_aux": conf_aux,
             "ctr_aux": ctr_aux,
+            "pred_iou_aux": iou_aux,
             "presence_logit": presence_logit,
             "support_tokens": support_tokens,
-            "prototype": support_summary,
+            "prototype": prototype,
+            # Enriched-query features at stride 16 — exposed for the
+            # presence-aware contrastive + feature-spread losses.
+            "enriched_p4": enriched_p4,
         }
 
     # ---- inference path ---------------------------------------------------
 
     def detect(
-        self, prototype: torch.Tensor, query_img: torch.Tensor
+        self, support_tokens: torch.Tensor, per_shot_prototype: torch.Tensor,
+        query_img: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        q_p4, q_p3 = self.encode_query(query_img)
-        return self._heads_forward(q_p4, q_p3, prototype)
+        q_p4, q_p3, p3g = self.encode_query(query_img)
+        return self._heads_forward(q_p4, q_p3, p3g, support_tokens, per_shot_prototype)
 
     # ---- training forward -------------------------------------------------
 
@@ -822,15 +878,19 @@ class FewShotLocalizer(nn.Module):
             tokens, per_shot, attn = self.encode_support(support_imgs)
         else:
             tokens, per_shot, attn = prototype, None, None
-        q_p4, q_p3 = self.encode_query(query_img)
-        out = self._heads_forward(q_p4, q_p3, tokens)
-        out["per_shot_prototype"] = per_shot                                # type: ignore[assignment]
-        out["support_attn"] = attn                                          # type: ignore[assignment]
+        if per_shot is None:
+            # Inference path through ``detect`` provides prototype directly;
+            # for ``forward`` we always re-encode.
+            tokens, per_shot, attn = self.encode_support(support_imgs)
+        q_p4, q_p3, p3g = self.encode_query(query_img)
+        out = self._heads_forward(q_p4, q_p3, p3g, tokens, per_shot)
+        out["per_shot_prototype"] = per_shot
+        out["support_attn"] = attn
         return out
 
 
 # ---------------------------------------------------------------------------
-# Decoding — top-K + NMS, presence-gated, multi-scale union
+# Decoding — top-K + NMS, multi-signal score
 # ---------------------------------------------------------------------------
 
 
@@ -838,18 +898,18 @@ def _decode_one_scale(
     reg_logits: torch.Tensor,
     conf_logits: torch.Tensor,
     ctr_logits: torch.Tensor,
-    stride: int,
+    pred_iou_logits: torch.Tensor,
+    stride: float,
     dfl_bins: int = DFL_BINS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns:
-      boxes : (B, H*W, 4) xyxy in image coords
-      score : (B, H*W) — σ(conf) · σ(centerness) (presence applied later).
-    """
+    """Returns (boxes, score) where score = σ(conf)·σ(centerness)·σ(pred_iou)."""
     ltrb = dfl_expectation(reg_logits, dfl_bins=dfl_bins)
-    boxes = decode_ltrb_to_xyxy(ltrb, stride=stride)                        # (B, 4, H, W)
+    boxes = decode_ltrb_to_xyxy(ltrb, stride=stride)
     b = boxes.shape[0]
     score = (
-        torch.sigmoid(conf_logits) * torch.sigmoid(ctr_logits)
+        torch.sigmoid(conf_logits)
+        * torch.sigmoid(ctr_logits)
+        * torch.sigmoid(pred_iou_logits)
     ).view(b, -1)
     boxes = boxes.permute(0, 2, 3, 1).reshape(b, -1, 4)
     return boxes, score
@@ -859,42 +919,44 @@ def decode_topk(
     out: dict[str, torch.Tensor],
     img_size: int = IMG_SIZE,
     top_k: int = 100,
-    conf_thr: float = 0.05,
+    conf_thr: float = 0.03,
     nms_iou: float = 0.5,
     use_aux: bool = False,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Per-image top-K with NMS across the union of stride-8 and stride-16 grids.
+    """Per-image top-K with NMS across the union of stride-8 / stride-16 grids.
 
-    Returns:
-      boxes_per_image : list of length B, each (N_i, 4) xyxy boxes (clipped to img_size).
-      scores_per_image: list of length B, each (N_i,) float scores in [0, 1].
-
-    Score = σ(conf) · σ(centerness) · σ(presence_logit), conf gated by τ.
-    Presence is broadcast as a per-image multiplicative gate.
+    Final score = σ(conf) · σ(centerness) · σ(pred_iou) · σ(presence_logit).
+    ``conf_thr`` defaulted to 0.03 (was 0.05) — extra ranking signals tighten
+    score distribution so a lower threshold is safe.
     """
+    p4_h = out["conf_p4"].shape[-2]
+    p3_h = out["conf_p3"].shape[-2]
+    stride_p4 = img_size / float(p4_h)
+    stride_p3 = img_size / float(p3_h)
+
     boxes_p4, score_p4 = _decode_one_scale(
-        out["reg_p4_logits"], out["conf_p4"], out["ctr_p4"], stride=STRIDE_P4
+        out["reg_p4_logits"], out["conf_p4"], out["ctr_p4"], out["pred_iou_p4"],
+        stride=stride_p4,
     )
     boxes_p3, score_p3 = _decode_one_scale(
-        out["reg_p3_logits"], out["conf_p3"], out["ctr_p3"], stride=STRIDE_P3
+        out["reg_p3_logits"], out["conf_p3"], out["ctr_p3"], out["pred_iou_p3"],
+        stride=stride_p3,
     )
-    boxes = torch.cat([boxes_p4, boxes_p3], dim=1)                          # (B, N, 4)
-    score = torch.cat([score_p4, score_p3], dim=1)                          # (B, N)
+    boxes = torch.cat([boxes_p4, boxes_p3], dim=1)
+    score = torch.cat([score_p4, score_p3], dim=1)
 
     if use_aux and "reg_aux_logits" in out:
+        aux_h = out["conf_aux"].shape[-2]
         boxes_aux, score_aux = _decode_one_scale(
-            out["reg_aux_logits"],
-            out["conf_aux"],
-            out["ctr_aux"],
-            stride=STRIDE_P4,
+            out["reg_aux_logits"], out["conf_aux"], out["ctr_aux"], out["pred_iou_aux"],
+            stride=img_size / float(aux_h),
         )
         boxes = torch.cat([boxes, boxes_aux], dim=1)
         score = torch.cat([score, score_aux], dim=1)
 
-    presence = torch.sigmoid(out["presence_logit"]).view(-1, 1)             # (B, 1)
+    presence = torch.sigmoid(out["presence_logit"]).view(-1, 1)
     score = score * presence
 
-    # Clip to image boundaries.
     boxes = boxes.clamp(min=0.0, max=float(img_size))
 
     boxes_out: list[torch.Tensor] = []
@@ -909,12 +971,10 @@ def decode_topk(
             continue
         b_i = boxes[i, keep]
         s_i = s[keep]
-        # Top-K before NMS for efficiency.
         if s_i.numel() > top_k * 4:
             tk = torch.topk(s_i, k=top_k * 4, largest=True)
             b_i = b_i[tk.indices]
             s_i = tk.values
-        # Class-agnostic NMS via single class id 0.
         idx_classes = torch.zeros_like(s_i, dtype=torch.long)
         keep_idx = batched_nms(b_i, s_i, idx_classes, iou_threshold=nms_iou)
         b_i = b_i[keep_idx][:top_k]
@@ -927,10 +987,8 @@ def decode_topk(
 def decode_top1(
     out: dict[str, torch.Tensor],
     img_size: int = IMG_SIZE,
-    conf_thr: float = 0.05,
+    conf_thr: float = 0.03,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convenience: top-1 per image after `decode_topk`. Used by IoU-style metrics
-    (val_iou, contain). Returns (B, 4) and (B,)."""
     boxes_pi, scores_pi = decode_topk(out, img_size=img_size, conf_thr=conf_thr)
     B = len(boxes_pi)
     box_t = out["conf_p4"].new_zeros((B, 4))
@@ -940,3 +998,56 @@ def decode_top1(
             box_t[i] = bxs[0]
             score_t[i] = scs[0]
     return box_t, score_t
+
+
+# ---------------------------------------------------------------------------
+# EMA wrapper
+# ---------------------------------------------------------------------------
+
+
+class ModelEMA:
+    """Exponential moving average of model parameters.
+
+    Standard +0.5–1.5 mAP from reduced gradient noise. Update at every
+    optimiser step; evaluate / save with EMA weights.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        # Lazy-init device on first update so the EMA copy lands on the
+        # same device as the live model.
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        self.num_updates += 1
+        # Warmup: linearly ramp decay so early steps have stronger pull.
+        d = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        msd = model.state_dict()
+        for k, v in self.shadow.items():
+            mv = msd[k]
+            if v.dtype.is_floating_point:
+                v.mul_(d).add_(mv.detach(), alpha=1 - d)
+            else:
+                v.copy_(mv)
+
+    def state_dict(self) -> dict:
+        return {"shadow": self.shadow, "decay": self.decay,
+                "num_updates": self.num_updates}
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.shadow = sd["shadow"]
+        self.decay = sd.get("decay", self.decay)
+        self.num_updates = sd.get("num_updates", 0)
+
+    def apply_to(self, model: nn.Module) -> dict:
+        """Swap model weights to the EMA shadow. Returns the original
+        state_dict so the caller can restore later."""
+        backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=False)
+        return backup
+
+    @staticmethod
+    def restore(model: nn.Module, backup: dict) -> None:
+        model.load_state_dict(backup, strict=False)
