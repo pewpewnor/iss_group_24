@@ -1468,8 +1468,14 @@ def train(
                         return
                 if saved_stage == stage_name:
                     if saved_cv_epoch >= stage_epochs:
-                        # This stage was fully completed in the prior run.
-                        print(f"\n=== {stage_name} CV: skipped (already completed) ===")
+                        # The saved checkpoint already covers (or exceeds) the
+                        # requested epoch budget — nothing more to do.
+                        print(
+                            f"\n=== {stage_name} CV: skipped "
+                            f"(already completed: saved cv_epoch={saved_cv_epoch} "
+                            f">= requested stage_epochs={stage_epochs}; "
+                            "raise stage_epochs to extend) ==="
+                        )
                         for fs, saved in zip(
                             fold_structs, cv_resume_state.get("folds", [])
                         ):
@@ -1481,7 +1487,8 @@ def train(
                                 full_history.extend(saved["history"])
                         cv_resume_state = None
                         return
-                    # Partial: resume from cv_epoch + 1.
+                    # Partial (or extending an already-finished stage with a
+                    # larger stage_epochs budget): resume from cv_epoch + 1.
                     saved_per_fold = cv_resume_state.get("folds")
                     start_cv_epoch = saved_cv_epoch + 1
                     if saved_per_fold:
