@@ -34,17 +34,15 @@ import numpy as np
 _STAGE_COLORS = {
     "stage1_1": "#4C72B0",
     "stage1_2": "#6495ED",
-    "stage2_1": "#DD8452",
-    "stage2_2": "#C44E52",
-    "stage2_3": "#55A868",
+    "stage2_1": "#C44E52",
+    "stage2_2": "#55A868",
 }
 
 _STAGE_LABELS = {
     "stage1_1": "Stage 1.1 (VizWiz base, frozen)",
     "stage1_2": "Stage 1.2 (VizWiz base, partial)",
-    "stage2_1": "Stage 2.1 (target domain, frozen)",
-    "stage2_2": "Stage 2.2 (target domain, partial)",
-    "stage2_3": "Stage 2.3 (full unfreeze)",
+    "stage2_1": "Stage 2.1 (target domain, partial)",
+    "stage2_2": "Stage 2.2 (full unfreeze)",
 }
 
 

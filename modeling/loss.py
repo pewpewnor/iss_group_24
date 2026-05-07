@@ -496,14 +496,24 @@ def total_loss(
     stride: int = 16,
     support_bboxes: torch.Tensor | None = None,
     attn_loss_weight: float = 0.5,
+    presence_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Weighted sum of QFL (cls) + CIoU (box) + focal-BCE (presence) + attn.
 
     Loss weights:
       qfl:      1.0  (Quality Focal Loss; sum normalised by num_pos)
       box:      1.0  (area-weighted CIoU on positive cells only)
-      presence: 1.0  (focal BCE on (B,) presence_logit)
+      presence: presence_weight  (focal BCE on (B,) presence_logit; default 1.0)
       attn:     attn_loss_weight (caller; default 0.5 for Phase 1, 1.0 for Phase 2)
+
+    The presence_weight knob exists because the presence head's raw focal-BCE
+    typically lands around 0.03–0.10 when training is going well — an order
+    of magnitude smaller than qfl + box. Without up-weighting, the presence
+    head receives almost no gradient pressure relative to the localizer,
+    which on hard target-domain transfers (HOTS scenes, InsDet products)
+    manifests as the head defaulting to "always present" (mean_score_neg
+    drifting up to 0.7+). Set presence_weight=2-3x in Phase 2 stages to
+    rebalance.
 
     Returned dict still uses the key "focal" for the cls term so existing
     plotting/logging continues to work — but the value is now the QFL.
@@ -551,7 +561,7 @@ def total_loss(
     if support_attn is not None and support_bboxes is not None:
         attn_loss = attention_bbox_loss(support_attn, support_bboxes)
 
-    loss = qfl + box_loss + presence_loss + attn_loss_weight * attn_loss
+    loss = qfl + box_loss + presence_weight * presence_loss + attn_loss_weight * attn_loss
     return {
         "loss": loss,
         "focal": qfl.detach(),     # legacy key — value is now QFL

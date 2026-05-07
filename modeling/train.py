@@ -1,19 +1,22 @@
-"""Five-stage episodic training entrypoint.
+"""Four-stage episodic training entrypoint.
 
 Phase 1 — VizWiz base pretraining (100 categories, rotation-synthesis episodes):
   Stage 1.1:  backbone fully frozen, heads LR 1e-3.          Val: VizWiz base val split.
   Stage 1.2:  features[7:] @ 1e-5, heads LR 5e-4.            Val: VizWiz base val split.
 
 Phase 2 — target-domain fine-tuning (VizWiz novel + HOTS + InsDet):
-  Stage 2.1:  backbone fully re-frozen, heads LR 5e-4.       Val: HOTS+InsDet val split.
-  Stage 2.2:  features[7:] @ 1e-5, heads LR 5e-4.            Val: HOTS+InsDet val split.
-  Stage 2.3:  full unfreeze, all @ 5e-6, heads LR 1e-4.       Val: HOTS+InsDet val split.
+  Stage 2.1:  features[7:] @ 3e-5, heads LR 4e-4.            Val: HOTS+InsDet val split.
+  Stage 2.2:  full unfreeze, all @ 3e-6, heads LR 5e-5.      Val: HOTS+InsDet val split.
 
-Backbone is frozen for two full warmup stages (1.1, 2.1) before any gradient flows
-through MobileNetV3. This prevents catastrophic forgetting at the Phase 1→2 boundary.
+Phase 2 used to have a third "frozen-backbone re-warmup" sub-stage at the start;
+it was removed because empirically the heads warmed up via Phase 1 already
+adapt fine when the backbone joins them in 2.1, and the extra warm-up stage
+produced ~zero target-domain mAP while burning epochs. The backbone now
+joins gradient flow on the very first Phase 2 step (with features[0:7]
+still frozen as a forgetting-safety net).
 
 Common workflows:
-    # All five stages from scratch
+    # All four stages from scratch
     python -m modeling.train --no-resume
 
     # Skip Phase 1 (already pretrained), run Phase 2 from a checkpoint
@@ -22,8 +25,8 @@ Common workflows:
     # Quick smoke test (1 epoch each, 32 episodes)
     python -m modeling.train --no-resume \\
         --phase1-frozen-epochs 1 --phase1-partial-epochs 1 \\
-        --phase2-frozen-epochs 1 --phase2-partial-epochs 1 \\
-        --phase2-full-epochs 1 --episodes-per-epoch 32
+        --phase2-partial-epochs 1 --phase2-full-epochs 1 \\
+        --episodes-per-epoch 32
 """
 
 from __future__ import annotations
@@ -126,19 +129,22 @@ def _heads(model: FewShotLocalizer) -> list:
     )
 
 
-# LR notes (2026-05 architecture, post query-decoder + Phase-2 K-fold CV):
+# LR notes (2026-05 architecture, post query-decoder + Phase-2 simplified):
 #   The heads now contain SIX attention modules: SupportTokenizer slot attn,
 #   2× SupportFusion encoder attn, AttentionPool query, and the QueryDecoder's
 #   self-attn + cross-attn. Plus DropPath p=0.1 on three decoder branches
 #   adds gradient noise. We drop stage1_1 head LR another step (5e-4 → 3e-4)
 #   to avoid attention collapse on the new self-attn, and stage1_2 → 2e-4
-#   once the backbone joins. Stage 2.1 heads stay at 2.5e-4 (frozen-backbone
-#   re-warmup is short, 10 epochs). Stage 2.2 heads dropped 2.5e-4 → 2e-4:
-#   K-fold CV trains each fold on ~10-11 HOTS+InsDet instances (+ 16 vizwiz
-#   novel), so the smaller per-fold dataset wants slightly cooler heads to
-#   avoid overfitting noise. Stage 2.3 backbone dropped 5e-6 → 3e-6: epoch
-#   budget went 10 → 15 (+50%), so we offset the longer cosine schedule to
-#   keep cumulative low-level ImageNet-feature drift bounded.
+#   once the backbone joins.
+#
+#   Phase 2 was simplified from three stages to two: the old frozen-backbone
+#   re-warmup (former 2.1) was removed because target-domain mAP barely
+#   moved during it — the heads already had Phase-1 momentum; what they
+#   actually needed was backbone adaptation (former 2.2) running first.
+#   New 2.1 = old 2.2 (features[7:] @ 3e-5, heads at 4e-4). New 2.2 = old
+#   2.3 (full unfreeze, all @ 3e-6 lower / 3e-6 upper / 5e-5 heads;
+#   that's the polish stage with the goal of bounding low-level ImageNet-
+#   feature drift, not aggressive adaptation).
 
 
 def phase1_frozen_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
@@ -166,21 +172,18 @@ def phase1_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
     )
 
 
-def phase2_frozen_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.1: re-freeze backbone, heads at 2.5e-4 (warmed heads)."""
-    model.backbone.freeze_all()
-    return torch.optim.AdamW(
-        [{"params": _heads(model), "lr": 2.5e-4, "weight_decay": 1e-4}]
-    )
-
-
 def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.2: features[7:] @ 1e-5, heads at 2e-4.
+    """Stage 2.1 (Phase 2 entry): features[7:] @ 3e-5, heads at 4e-4.
 
-    Heads dropped 2.5e-4 → 2e-4: with K-fold CV active, each fold trains on
-    only ~10-11 HOTS+InsDet instances (plus 16 vizwiz_novel). At that scale
-    2.5e-4 over 30 epochs risks overfitting noise on the small fold; 2e-4
-    gives cleaner gradients while staying productive.
+    Real domain-shift fine-tuning. The frozen-backbone re-warmup that used
+    to precede this stage was removed — the heads already adapted to the
+    new (small) target domain from Phase 1 just fine, what they actually
+    needed was backbone adaptation in parallel. So this is now Phase 2's
+    entry stage. Backbone upper at 3e-5 (the upper MobileNetV3 blocks need
+    to actually move to the target distribution; HOTS scenes / InsDet
+    product crops differ from ImageNet object-centric photos). Heads at
+    4e-4 (2× the prior K-fold-CV value, which was overly cool for the full
+    ~123-instance pool).
     """
     model.backbone.freeze_lower(freeze_idx_exclusive=7)
     upper = [
@@ -191,21 +194,21 @@ def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
     ]
     return torch.optim.AdamW(
         [
-            {"params": upper, "lr": 1e-5, "weight_decay": 1e-4},
-            {"params": _heads(model), "lr": 2e-4, "weight_decay": 1e-4},
+            {"params": upper, "lr": 3e-5, "weight_decay": 1e-4},
+            {"params": _heads(model), "lr": 4e-4, "weight_decay": 1e-4},
         ]
     )
 
 
 def phase2_full_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.3: full unfreeze. Backbone at 3e-6 to preserve ImageNet features.
+    """Stage 2.2 (Phase 2 polish): full unfreeze, backbone at 3e-6.
 
-    Backbone dropped 5e-6 → 3e-6: epoch budget went 10 → 15 (+50%), so the
-    cumulative gradient flow through `features[0:7]` (low-level ImageNet
-    filters) grows proportionally. Lowering the backbone LR offsets the
-    longer schedule and keeps low-level feature drift bounded. Heads stay
-    at 5e-5 — heads are not the catastrophic-forgetting risk and need the
-    polish budget.
+    Polish stage. Lower MobileNetV3 blocks (features[0:7]) join gradient flow
+    for the first time at a very low 3e-6 to preserve low-level ImageNet
+    features. Upper backbone also at 3e-6 to keep the LR ratio between
+    layers consistent with the partial stage that just ran. Heads at 5e-5 —
+    heads are not the catastrophic-forgetting risk and need the polish
+    budget.
     """
     model.backbone.unfreeze_all()
     lower = [
@@ -292,7 +295,7 @@ def build_proto_cache(
 # ---------------------------------------------------------------------------
 
 
-STAGE_ORDER: tuple[str, ...] = ("stage1_1", "stage1_2", "stage2_1", "stage2_2", "stage2_3")
+STAGE_ORDER: tuple[str, ...] = ("stage1_1", "stage1_2", "stage2_1", "stage2_2")
 
 
 def _make_full_ckpt(
@@ -478,6 +481,7 @@ def train_stage(
     hard_neg_mining: bool = True,
     neg_prob_schedule: dict[int, float] | None = None,
     attn_loss_weight: float = 0.5,
+    presence_weight: float = 1.0,
     start_epoch: int = 1,
     scheduler_state: dict | None = None,
     prior_history: list[dict] | None = None,
@@ -543,6 +547,7 @@ def train_stage(
                 out, gt_bbox, is_present,
                 support_bboxes=support_bboxes,
                 attn_loss_weight=attn_loss_weight,
+                presence_weight=presence_weight,
             )
             loss = losses["loss"]
 
@@ -606,9 +611,13 @@ def train_stage(
             f"{prefix} "
             f"loss={avg['loss']:.4f} (focal={avg['focal']:.4f} box={avg['box']:.4f} "
             f"presence={avg['presence']:.4f} attn={avg['attn']:.4f}{reg_str}) "
+            f"val_loss={metrics['val_loss']:.4f} "
             f"val_iou={metrics['val_iou']:.4f} "
+            f"val_contain={metrics['val_contain']:.4f} "
             f"val_map50={metrics['val_map_50']:.4f} "
+            f"val_map5095={metrics['val_map_5095']:.4f} "
             f"val_f1_50={metrics['val_f1_50']:.4f} "
+            f"val_presence={metrics['val_presence_acc']:.4f} "
             f"time={elapsed:.1f}s"
         )
 
@@ -836,7 +845,6 @@ def _save_cv_results(
         "aggregate": {
             "stage2_1": {"epoch_1": {"val_iou_mean": ..., ...}, ...},
             "stage2_2": {...},
-            "stage2_3": {...},
         }
       }
     """
@@ -887,7 +895,7 @@ def _save_cv_results(
 
     # Pretty summary printed to console: final-epoch val_iou mean per stage.
     print("CV summary (mean across folds, final epoch of each stage):")
-    for stage in ("stage2_1", "stage2_2", "stage2_3"):
+    for stage in ("stage2_1", "stage2_2"):
         stage_agg = aggregate.get(stage)
         if not stage_agg:
             continue
@@ -926,10 +934,10 @@ def train(
     # Phase 2: target-domain fine-tuning. Defaults are 0 so each notebook
     # cell must explicitly turn on exactly one stage — this prevents
     # accidental multi-stage runs when users call train() with only one
-    # phase2_*_epochs argument set. The notebook cells override one stage
-    # at a time using CV-scaled budgets (5/15/8 for 3-fold CV); single-run
-    # users should pass 10/30/15 explicitly to match the historical baseline.
-    phase2_frozen_epochs: int = 0,
+    # phase2_*_epochs argument set.
+    #   phase2_partial_epochs → stage 2.1 (features[7:] @ 3e-5, heads 4e-4)
+    #   phase2_full_epochs    → stage 2.2 (full unfreeze, 3e-6 / 5e-5)
+    # The frozen-backbone re-warmup that used to be stage 2.1 was removed.
     phase2_partial_epochs: int = 0,
     phase2_full_epochs: int = 0,
     # K-fold cross-validation for Phase 2. With ~14 HOTS+InsDet instances the
@@ -983,7 +991,6 @@ def train(
         "num_workers": num_workers,
         "phase1_frozen_epochs": phase1_frozen_epochs,
         "phase1_partial_epochs": phase1_partial_epochs,
-        "phase2_frozen_epochs": phase2_frozen_epochs,
         "phase2_partial_epochs": phase2_partial_epochs,
         "phase2_full_epochs": phase2_full_epochs,
         "phase2_cv_folds": phase2_cv_folds,
@@ -1306,26 +1313,19 @@ def train(
     # -----------------------------------------------------------------------
 
     # Stage configs registered once regardless of CV (used by the LR plot).
-    if phase2_frozen_epochs > 0:
-        stage_configs_for_lr.append({
-            "name": "stage2_1",
-            "epochs": phase2_frozen_epochs,
-            "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
-            "param_groups": [{"label": "heads", "lr": 2.5e-4}],
-        })
     if phase2_partial_epochs > 0:
         stage_configs_for_lr.append({
-            "name": "stage2_2",
+            "name": "stage2_1",
             "epochs": phase2_partial_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [
-                {"label": "backbone upper", "lr": 1e-5},
-                {"label": "heads", "lr": 2e-4},
+                {"label": "backbone upper", "lr": 3e-5},
+                {"label": "heads", "lr": 4e-4},
             ],
         })
     if phase2_full_epochs > 0:
         stage_configs_for_lr.append({
-            "name": "stage2_3",
+            "name": "stage2_2",
             "epochs": phase2_full_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [
@@ -1341,22 +1341,22 @@ def train(
         best_local: float,
         history_local: list[dict],
     ) -> tuple[float, list[dict]]:
-        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_1", phase2_frozen_epochs)
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_1", phase2_partial_epochs)
         if skip:
             print("=== Stage 2.1: skipped ===")
             return best_local, []
         resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-        print(f"=== Stage 2.1: HOTS+InsDet+VizWiz novel, backbone re-frozen{resume_str} ===")
-        train_loader_local.dataset.set_hard_neg_ratio(0.25)  # type: ignore[attr-defined]
-        opt = phase2_frozen_optimizer(model)
+        print(f"=== Stage 2.1: HOTS+InsDet+VizWiz novel, features[7:] @ 3e-5{resume_str} ===")
+        train_loader_local.dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
+        opt = phase2_partial_optimizer(model)
         _log_trainable("stage2_1")
         if opt_state is not None:
             opt.load_state_dict(opt_state)
         return train_stage(
             model, opt, train_loader_local, val_loader_local, device_t,
-            phase2_frozen_epochs, "stage2_1", out_dir, best_local,
+            phase2_partial_epochs, "stage2_1", out_dir, best_local,
             contrastive=contrastive,
-            contrastive_weight=contrastive_weight_p1,
+            contrastive_weight=contrastive_weight_p2,
             contrastive_temp=contrastive_temp,
             vicreg=vicreg,
             vicreg_weight=vicreg_weight,
@@ -1365,8 +1365,15 @@ def train(
             triplet=triplet,
             triplet_weight=triplet_weight,
             hard_neg_mining=hard_neg_mining,
-            neg_prob_schedule={1: 0.0, 4: 0.15},
+            # Negatives from epoch 1 at 0.3 — the heads already saw Phase-1
+            # negatives, no warmup ramp needed and the presence head was
+            # collapsing toward "always present" without earlier exposure.
+            neg_prob_schedule={1: 0.3, 6: 0.4},
             attn_loss_weight=1.0,
+            # Up-weight presence loss because target-domain test eval showed
+            # mean_score_neg drifting to 0.7+ (head bias). Doubling the
+            # presence term gives it gradient parity with focal+box.
+            presence_weight=2.0,
             start_epoch=start_epoch,
             scheduler_state=sched_state,
             prior_history=history_local,
@@ -1378,20 +1385,20 @@ def train(
         best_local: float,
         history_local: list[dict],
     ) -> tuple[float, list[dict]]:
-        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_2", phase2_partial_epochs)
+        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_2", phase2_full_epochs)
         if skip:
             print("=== Stage 2.2: skipped ===")
             return best_local, []
         resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-        print(f"=== Stage 2.2: HOTS+InsDet+VizWiz novel, features[7:] @ 1e-5{resume_str} ===")
+        print(f"=== Stage 2.2: full unfreeze (all @ 3e-6){resume_str} ===")
         train_loader_local.dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
-        opt = phase2_partial_optimizer(model)
+        opt = phase2_full_optimizer(model)
         _log_trainable("stage2_2")
         if opt_state is not None:
             opt.load_state_dict(opt_state)
         return train_stage(
             model, opt, train_loader_local, val_loader_local, device_t,
-            phase2_partial_epochs, "stage2_2", out_dir, best_local,
+            phase2_full_epochs, "stage2_2", out_dir, best_local,
             contrastive=contrastive,
             contrastive_weight=contrastive_weight_p2,
             contrastive_temp=contrastive_temp,
@@ -1402,61 +1409,23 @@ def train(
             triplet=triplet,
             triplet_weight=triplet_weight,
             hard_neg_mining=hard_neg_mining,
-            neg_prob_schedule={1: 0.1, 8: 0.3},
+            neg_prob_schedule={1: 0.4},
             attn_loss_weight=1.0,
-            start_epoch=start_epoch,
-            scheduler_state=sched_state,
-            prior_history=history_local,
-        )
-
-    def _run_phase2_stage_2_3(
-        train_loader_local: DataLoader,
-        val_loader_local: DataLoader,
-        best_local: float,
-        history_local: list[dict],
-    ) -> tuple[float, list[dict]]:
-        skip, start_epoch, opt_state, sched_state = _resume_for("stage2_3", phase2_full_epochs)
-        if skip:
-            print("=== Stage 2.3: skipped ===")
-            return best_local, []
-        resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-        print(f"=== Stage 2.3: full unfreeze (all @ 5e-6){resume_str} ===")
-        train_loader_local.dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
-        opt = phase2_full_optimizer(model)
-        _log_trainable("stage2_3")
-        if opt_state is not None:
-            opt.load_state_dict(opt_state)
-        return train_stage(
-            model, opt, train_loader_local, val_loader_local, device_t,
-            phase2_full_epochs, "stage2_3", out_dir, best_local,
-            contrastive=contrastive,
-            contrastive_weight=contrastive_weight_p2,
-            contrastive_temp=contrastive_temp,
-            vicreg=vicreg,
-            vicreg_weight=vicreg_weight,
-            barlow=barlow,
-            barlow_weight=barlow_weight,
-            triplet=triplet,
-            triplet_weight=triplet_weight,
-            hard_neg_mining=hard_neg_mining,
-            neg_prob_schedule={1: 0.3},
-            attn_loss_weight=1.0,
+            presence_weight=2.0,
             start_epoch=start_epoch,
             scheduler_state=sched_state,
             prior_history=history_local,
         )
 
     if phase2_cv_folds > 0 and (
-        phase2_frozen_epochs > 0
-        or phase2_partial_epochs > 0
+        phase2_partial_epochs > 0
         or phase2_full_epochs > 0
     ):
         # CV resume policy: when resume_state["cv_state"] is present AND its
-        # stage matches one we're about to run, _run_cv_stage will pick it up
-        # and restore per-fold model/optimizer/scheduler state. Otherwise the
-        # resume_state is ignored for CV (its model_state is a single fold's
-        # weights, not a clean post-Phase-1 snapshot — using it as the seed
-        # for all folds biases the comparison).
+        # stage matches one we're about to run, _run_cv_stage picks it up and
+        # restores per-fold model/optimizer/scheduler state. Otherwise (e.g.
+        # resuming from stage1_2.pt to start Phase 2 fresh) every fold is
+        # seeded from the post-Phase-1 weights snapshotted below.
         cv_resume_state: dict | None = None
         if resume_state is not None and isinstance(resume_state.get("cv_state"), dict):
             cv_resume_state = resume_state["cv_state"]
@@ -1464,16 +1433,6 @@ def train(
                 f"  CV mode: found cv_state for stage={cv_resume_state.get('stage')} "
                 f"cv_epoch={cv_resume_state.get('cv_epoch')} — will resume "
                 f"from cv_epoch {int(cv_resume_state.get('cv_epoch', 0)) + 1}"
-            )
-        elif resume_state is not None and resume_state.get("stage") in (
-            "stage2_1",
-            "stage2_2",
-            "stage2_3",
-        ):
-            print(
-                "  CV mode: ignoring legacy mid-Phase-2 resume state "
-                f"(stage={resume_state.get('stage')}, epoch={resume_state.get('epoch')}) "
-                "— no per-fold cv_state present"
             )
         # Snapshot the post-Phase-1 weights so each fold starts identically
         # when there is no cv_state to resume from.
@@ -1600,7 +1559,7 @@ def train(
             logged_trainable = False
             for fi, fs in enumerate(fold_structs):
                 model.load_state_dict(fs["model_state"])
-                opt, neg_sched, attn_w, cont_w = setup_fold_fn(fs)
+                opt, neg_sched, attn_w, cont_w, pres_w = setup_fold_fn(fs)
                 if not logged_trainable:
                     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
                     print(f"  trainable params: {n_train / 1e6:.2f}M")
@@ -1634,6 +1593,7 @@ def train(
                     "neg_sched": neg_sched,
                     "attn_w": attn_w,
                     "cont_w": cont_w,
+                    "pres_w": pres_w,
                 })
 
             cv_resume_state = None  # consumed — does not apply to subsequent stages
@@ -1669,6 +1629,7 @@ def train(
                         hard_neg_mining=hard_neg_mining,
                         neg_prob_schedule=fo["neg_sched"],
                         attn_loss_weight=fo["attn_w"],
+                        presence_weight=fo["pres_w"],
                         start_epoch=cv_epoch,
                         scheduler_state=None,
                         prior_history=fs["history"],
@@ -1756,29 +1717,21 @@ def train(
 
             best = max(best, best_fold_iou)
 
-        if phase2_frozen_epochs > 0:
-            def _setup_2_1(fs: dict) -> tuple:
-                model.load_state_dict(fs["model_state"])
-                fs["train_loader"].dataset.set_hard_neg_ratio(0.25)  # type: ignore[attr-defined]
-                opt = phase2_frozen_optimizer(model)
-                return opt, {1: 0.0, 4: 0.15}, 1.0, contrastive_weight_p1
-            _run_cv_stage("stage2_1", phase2_frozen_epochs, _setup_2_1)
-
         if phase2_partial_epochs > 0:
-            def _setup_2_2(fs: dict) -> tuple:
+            def _setup_2_1(fs: dict) -> tuple:
                 model.load_state_dict(fs["model_state"])
                 fs["train_loader"].dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
                 opt = phase2_partial_optimizer(model)
-                return opt, {1: 0.1, 8: 0.3}, 1.0, contrastive_weight_p2
-            _run_cv_stage("stage2_2", phase2_partial_epochs, _setup_2_2)
+                return opt, {1: 0.3, 6: 0.4}, 1.0, contrastive_weight_p2, 2.0
+            _run_cv_stage("stage2_1", phase2_partial_epochs, _setup_2_1)
 
         if phase2_full_epochs > 0:
-            def _setup_2_3(fs: dict) -> tuple:
+            def _setup_2_2(fs: dict) -> tuple:
                 model.load_state_dict(fs["model_state"])
                 fs["train_loader"].dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
                 opt = phase2_full_optimizer(model)
-                return opt, {1: 0.3}, 1.0, contrastive_weight_p2
-            _run_cv_stage("stage2_3", phase2_full_epochs, _setup_2_3)
+                return opt, {1: 0.4}, 1.0, contrastive_weight_p2, 2.0
+            _run_cv_stage("stage2_2", phase2_full_epochs, _setup_2_2)
 
         print(
             f"\n=== Phase 2 CV done. best fold = {best_fold_idx + 1}/{phase2_cv_folds} "
@@ -1789,10 +1742,10 @@ def train(
         # similarity plot covers the entire instance pool, not the last fold.
         train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
     else:
-        # Single-run (non-CV) Phase 2 — original behaviour. Uses the manifest's
-        # fixed val split and writes test-set evaluation per stage.
-        if phase2_frozen_epochs > 0:
-            if not _try_skip_complete_stage("stage2_1", phase2_frozen_epochs):
+        # Single-run (non-CV) Phase 2 — uses the manifest's fixed val split
+        # and writes test-set evaluation per stage.
+        if phase2_partial_epochs > 0:
+            if not _try_skip_complete_stage("stage2_1", phase2_partial_epochs):
                 train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
                 best_new, hist = _run_phase2_stage_2_1(
                     train_loader, val_loader_p2, best, full_history
@@ -1801,8 +1754,8 @@ def train(
                 full_history.extend(hist)
             _eval_stage("stage2_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
-        if phase2_partial_epochs > 0:
-            if not _try_skip_complete_stage("stage2_2", phase2_partial_epochs):
+        if phase2_full_epochs > 0:
+            if not _try_skip_complete_stage("stage2_2", phase2_full_epochs):
                 train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
                 best_new, hist = _run_phase2_stage_2_2(
                     train_loader, val_loader_p2, best, full_history
@@ -1810,16 +1763,6 @@ def train(
                 best = best_new
                 full_history.extend(hist)
             _eval_stage("stage2_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
-
-        if phase2_full_epochs > 0:
-            if not _try_skip_complete_stage("stage2_3", phase2_full_epochs):
-                train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
-                best_new, hist = _run_phase2_stage_2_3(
-                    train_loader, val_loader_p2, best, full_history
-                )
-                best = best_new
-                full_history.extend(hist)
-            _eval_stage("stage2_3", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")
 
@@ -1891,8 +1834,7 @@ def main() -> None:
     # Phase 1 epoch counts (set to 0 to skip a stage)
     p.add_argument("--phase1-frozen-epochs", type=int, default=15)
     p.add_argument("--phase1-partial-epochs", type=int, default=40)
-    # Phase 2 epoch counts
-    p.add_argument("--phase2-frozen-epochs", type=int, default=10)
+    # Phase 2 epoch counts (the former --phase2-frozen-epochs stage was removed)
     p.add_argument("--phase2-partial-epochs", type=int, default=30)
     p.add_argument("--phase2-full-epochs", type=int, default=15)
     p.add_argument(
@@ -1939,7 +1881,6 @@ def main() -> None:
         num_workers=args.num_workers,
         phase1_frozen_epochs=args.phase1_frozen_epochs,
         phase1_partial_epochs=args.phase1_partial_epochs,
-        phase2_frozen_epochs=args.phase2_frozen_epochs,
         phase2_partial_epochs=args.phase2_partial_epochs,
         phase2_full_epochs=args.phase2_full_epochs,
         phase2_cv_folds=args.phase2_cv_folds,
