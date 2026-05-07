@@ -1,22 +1,21 @@
 """Aggregate raw datasets into a clean staging directory + manifest.
 
-Two phases of training data:
-  Phase 1 (VizWiz base): 100 categories, 4229 images, episodic crop+rotation synthesis.
-      source="vizwiz_base"; split 75/10/15 so Phase 1 can be validated on its own domain.
+Single 80/20 train/test split (no val). The trainer derives K=3 stratified CV
+folds from the train pool at Stage 3; Stages 1 and 2 sample a probe from the
+test split. The manifest's "splits" index therefore only contains "train"
+and "test".
 
-  Phase 2 (mixed):
-      VizWiz novel: 16 categories, 1 support image per category (rotation synthesis).
-          source="vizwiz_novel"; all in train (too few to split).
-      HOTS: instance-level multi-shot supports + scene queries.
-          source="hots"; split 75/10/15.
-      InsDet: instance-level multi-shot supports + scene queries.
-          source="insdet"; split 75/10/15.
+Sources:
+  vizwiz_base   — 100 categories, episodic crop+rotation synthesis. 80/20.
+  vizwiz_novel  — 16 categories, 1 support image each. All to train.
+  hots          — instance-level multi-shot supports + scene queries. 80/20.
+  insdet        — instance-level multi-shot supports + scene queries. 80/20.
 
 Negatives:
-  vizwiz_base pool: ~500 VizWiz base images not used as positives.
-      Used by Phase 1 (same domain, prevents style-gap trivial negatives).
-  hope pool: HOPE scene RGBs + InsDet Background + VizWiz query images.
-      Used by Phase 2 (mixed product / real-world scenes).
+  vizwiz_base pool — VizWiz base images not used as positives. Pool routed to
+                     vizwiz_base instances during episode sampling.
+  hope pool        — HOPE scene RGBs + InsDet Background + VizWiz query images.
+                     Pool routed to vizwiz_novel / hots / insdet instances.
 
 Run:
     uv run python -m aggregator
@@ -33,8 +32,7 @@ from PIL import Image
 from scipy import ndimage
 
 SEED = 42
-TRAIN_RATIO = 0.75
-VAL_RATIO = 0.10
+TRAIN_RATIO = 0.80
 N_SUPPORT = 4
 BBOX_PAD_FRAC = 0.05
 BBOX_MIN_SIDE = 20
@@ -543,19 +541,19 @@ def filter_empty_instances(instances: list[dict]) -> list[dict]:
     return out
 
 
-def split_instances(instances: list[dict]) -> tuple[list, list, list]:
-    """Split instances by source:
+def split_instances(instances: list[dict]) -> tuple[list, list]:
+    """Split instances per source into train (80%) / test (20%).
 
-    vizwiz_base: 75/10/15 — needs a val split for Phase 1 validation.
-    vizwiz_novel: 100% train (only 16 instances).
-    hots, insdet: 75/10/15 — val/test are the deployment domain.
+    vizwiz_novel is exempt — only 16 instances, all kept in train.
+    The trainer derives K-fold CV from the train pool at Stage 3.
     """
     rng = random.Random(SEED)
     by_source: dict[str, list[dict]] = {}
     for inst in instances:
         by_source.setdefault(inst["source"], []).append(inst)
 
-    train, val, test = [], [], []
+    train: list[dict] = []
+    test: list[dict] = []
     for source in sorted(by_source):
         group = by_source[source][:]
         rng.shuffle(group)
@@ -563,18 +561,17 @@ def split_instances(instances: list[dict]) -> tuple[list, list, list]:
         if source == "vizwiz_novel":
             train.extend(group)
             print(
-                f"  split[vizwiz_novel]: train={n} val=0 test=0  (train-only, only {n} instances)"
+                f"  split[vizwiz_novel]: train={n} test=0  (train-only, only {n} instances)"
             )
             continue
-        n_train = int(n * TRAIN_RATIO)
-        n_val = int(n * VAL_RATIO)
+        n_train = int(round(n * TRAIN_RATIO))
+        n_train = max(1, min(n - 1, n_train)) if n > 1 else n
         train.extend(group[:n_train])
-        val.extend(group[n_train : n_train + n_val])
-        test.extend(group[n_train + n_val :])
+        test.extend(group[n_train:])
         print(
-            f"  split[{source}]: train={n_train} val={n_val} test={n - n_train - n_val}"
+            f"  split[{source}]: train={n_train} test={n - n_train}"
         )
-    return train, val, test
+    return train, test
 
 
 def stage_images(splits: dict[str, list[dict]], negatives: list[dict]) -> list[dict]:
@@ -700,10 +697,10 @@ def main():
     negatives = collect_negative_backgrounds(vizwiz_base_used_paths=vizwiz_base_used)
     print(f"negatives: {len(negatives)} background images")
 
-    train, val, test = split_instances(instances)
-    splits = {"train": train, "val": val, "test": test}
+    train, test = split_instances(instances)
+    splits = {"train": train, "test": test}
 
-    print("staging images into train / val / test directories")
+    print("staging images into train / test directories")
     negatives = stage_images(splits, negatives)
 
     write_manifest(splits, negatives)
