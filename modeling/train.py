@@ -305,8 +305,19 @@ def _make_full_ckpt(
     best_val_iou: float,
     full_history: list[dict],
 ) -> dict:
+    # model.state_dict() serialises ALL parameters and buffers regardless of
+    # requires_grad — so a stage that runs with the MobileNetV3 backbone
+    # frozen still writes its full backbone weights to disk. This is what
+    # lets stage 2.1 (frozen-backbone re-warmup) hand off the inherited
+    # stage1_2 backbone weights to stage 2.2 (which thaws features[7:]).
+    model_state = model.state_dict()
+    if not any(k.startswith("backbone.") for k in model_state):
+        raise RuntimeError(
+            f"checkpoint for {stage_name}@epoch{epoch} is missing backbone.* keys "
+            f"in state_dict — refusing to save partial weights"
+        )
     return {
-        "model": model.state_dict(),
+        "model": model_state,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "stage": stage_name,
@@ -324,6 +335,27 @@ def _make_full_ckpt(
             "python": _random.getstate(),
         },
     }
+
+
+def _load_stage_ckpt(
+    out_dir: Path,
+    stage_name: str,
+    device: torch.device,
+) -> dict | None:
+    """Load <stage>.pt if it exists. Returns the payload dict or None.
+
+    Used by the per-stage skip-and-resave logic: if the file exists and
+    represents a completed run (epoch >= stage_epochs and no cv_state),
+    we can skip training that stage and just propagate its weights forward.
+    """
+    path = out_dir / f"{stage_name}.pt"
+    if not path.exists():
+        return None
+    try:
+        return torch.load(str(path), map_location=device, weights_only=False)
+    except Exception as exc:
+        print(f"  warn: failed to load {path}: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1116,53 +1148,108 @@ def train(
                 return True, 1, None, None
         return False, 1, None, None
 
+    def _try_skip_complete_stage(stage_name: str, configured_epochs: int) -> bool:
+        """If <stage>.pt exists and shows the stage was fully completed in a
+        prior run (non-CV semantics: epoch >= configured_epochs and no
+        cv_state), load its weights, update global best/full_history, re-save
+        the checkpoint in the current format to both <stage>.pt and last.pt,
+        and return True so the caller skips training.
+
+        Returns False if the file is missing, incomplete, or for a CV run
+        (cv_state present) — those cases fall through to the normal resume
+        path so the existing CV-aware logic handles them.
+        """
+        nonlocal best, full_history
+        ckpt = _load_stage_ckpt(out_dir, stage_name, device_t)
+        if ckpt is None:
+            return False
+        if isinstance(ckpt.get("cv_state"), dict):
+            return False  # CV checkpoint — let the CV path decide
+        saved_stage = ckpt.get("stage")
+        saved_epoch = int(ckpt.get("epoch", 0))
+        if saved_stage != stage_name or saved_epoch < configured_epochs:
+            return False
+
+        print(
+            f"=== {stage_name}: skipped — found completed {stage_name}.pt "
+            f"(epoch={saved_epoch}/{configured_epochs}); reusing its weights "
+            "and re-saving in current format ==="
+        )
+        # Load model weights so subsequent stages start from this stage's end.
+        try:
+            model.load_state_dict(ckpt["model"])
+        except Exception as exc:
+            print(f"  warn: failed to load model weights from {stage_name}.pt: {exc}")
+            return False
+
+        # Reconcile global tracking with what the saved stage already produced.
+        ckpt_best = float(ckpt.get("best_val_iou", best))
+        if ckpt_best > best:
+            best = ckpt_best
+        # full_history: the saved ckpt's history is the most authoritative
+        # accumulation up through this stage. If our current full_history is
+        # shorter (e.g. because last.pt came from an earlier stage), adopt
+        # the saved one. Otherwise keep ours (it has equal or more info).
+        saved_history = ckpt.get("full_history") or []
+        if len(saved_history) > len(full_history):
+            full_history = list(saved_history)
+
+        # Re-save in current format. We don't have a live optimizer/scheduler
+        # for a skipped stage, so we write the loaded ckpt back essentially
+        # as-is, with refreshed best_val_iou and full_history fields.
+        ckpt["best_val_iou"] = best
+        ckpt["full_history"] = list(full_history)
+        _save_checkpoint_async(ckpt, out_dir / f"{stage_name}.pt")
+        _save_checkpoint_async(ckpt, out_dir / "last.pt")
+        return True
+
     # -----------------------------------------------------------------------
     # Phase 1: VizWiz base pretraining
     # -----------------------------------------------------------------------
 
     if phase1_frozen_epochs > 0:
-        skip, start_epoch, opt_state, sched_state = _resume_for("stage1_1", phase1_frozen_epochs)
         stage_configs_for_lr.append({
             "name": "stage1_1",
             "epochs": phase1_frozen_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [{"label": "heads", "lr": 3e-4}],
         })
-        if skip:
-            print("=== Stage 1.1: skipped ===")
-        else:
-            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-            print(f"=== Stage 1.1: VizWiz base, backbone frozen{resume_str} ===")
-            train_ds, train_loader = _build_train_loader(VIZWIZ_BASE_SOURCES)
-            train_ds.set_hard_neg_ratio(0.0)
-            opt = phase1_frozen_optimizer(model)
-            _log_trainable("stage1_1")
-            if opt_state is not None:
-                opt.load_state_dict(opt_state)
-            best, hist = train_stage(
-                model, opt, train_loader, val_loader_p1, device_t,
-                phase1_frozen_epochs, "stage1_1", out_dir, best,
-                contrastive=contrastive,
-                contrastive_weight=contrastive_weight_p1,
-                contrastive_temp=contrastive_temp,
-                vicreg=vicreg,
-                vicreg_weight=vicreg_weight,
-                barlow=barlow,
-                barlow_weight=barlow_weight,
-                triplet=triplet,
-                triplet_weight=triplet_weight,
-                hard_neg_mining=False,
-                neg_prob_schedule={1: 0.1},
-                attn_loss_weight=0.5,
-                start_epoch=start_epoch,
-                scheduler_state=sched_state,
-                prior_history=full_history,
-            )
-            full_history.extend(hist)
-            _eval_stage("stage1_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
+        if not _try_skip_complete_stage("stage1_1", phase1_frozen_epochs):
+            skip, start_epoch, opt_state, sched_state = _resume_for("stage1_1", phase1_frozen_epochs)
+            if skip:
+                print("=== Stage 1.1: skipped ===")
+            else:
+                resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+                print(f"=== Stage 1.1: VizWiz base, backbone frozen{resume_str} ===")
+                train_ds, train_loader = _build_train_loader(VIZWIZ_BASE_SOURCES)
+                train_ds.set_hard_neg_ratio(0.0)
+                opt = phase1_frozen_optimizer(model)
+                _log_trainable("stage1_1")
+                if opt_state is not None:
+                    opt.load_state_dict(opt_state)
+                best, hist = train_stage(
+                    model, opt, train_loader, val_loader_p1, device_t,
+                    phase1_frozen_epochs, "stage1_1", out_dir, best,
+                    contrastive=contrastive,
+                    contrastive_weight=contrastive_weight_p1,
+                    contrastive_temp=contrastive_temp,
+                    vicreg=vicreg,
+                    vicreg_weight=vicreg_weight,
+                    barlow=barlow,
+                    barlow_weight=barlow_weight,
+                    triplet=triplet,
+                    triplet_weight=triplet_weight,
+                    hard_neg_mining=False,
+                    neg_prob_schedule={1: 0.1},
+                    attn_loss_weight=0.5,
+                    start_epoch=start_epoch,
+                    scheduler_state=sched_state,
+                    prior_history=full_history,
+                )
+                full_history.extend(hist)
+                _eval_stage("stage1_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     if phase1_partial_epochs > 0:
-        skip, start_epoch, opt_state, sched_state = _resume_for("stage1_2", phase1_partial_epochs)
         stage_configs_for_lr.append({
             "name": "stage1_2",
             "epochs": phase1_partial_epochs,
@@ -1172,38 +1259,40 @@ def train(
                 {"label": "heads", "lr": 2e-4},
             ],
         })
-        if skip:
-            print("=== Stage 1.2: skipped ===")
-        else:
-            resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-            print(f"=== Stage 1.2: VizWiz base, features[7:] @ 1e-5{resume_str} ===")
-            train_ds, train_loader = _build_train_loader(VIZWIZ_BASE_SOURCES)
-            train_ds.set_hard_neg_ratio(0.0)
-            opt = phase1_partial_optimizer(model)
-            _log_trainable("stage1_2")
-            if opt_state is not None:
-                opt.load_state_dict(opt_state)
-            best, hist = train_stage(
-                model, opt, train_loader, val_loader_p1, device_t,
-                phase1_partial_epochs, "stage1_2", out_dir, best,
-                contrastive=contrastive,
-                contrastive_weight=contrastive_weight_p1,
-                contrastive_temp=contrastive_temp,
-                vicreg=vicreg,
-                vicreg_weight=vicreg_weight,
-                barlow=barlow,
-                barlow_weight=barlow_weight,
-                triplet=triplet,
-                triplet_weight=triplet_weight,
-                hard_neg_mining=False,
-                neg_prob_schedule={1: 0.2},
-                attn_loss_weight=0.5,
-                start_epoch=start_epoch,
-                scheduler_state=sched_state,
-                prior_history=full_history,
-            )
-            full_history.extend(hist)
-            _eval_stage("stage1_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
+        if not _try_skip_complete_stage("stage1_2", phase1_partial_epochs):
+            skip, start_epoch, opt_state, sched_state = _resume_for("stage1_2", phase1_partial_epochs)
+            if skip:
+                print("=== Stage 1.2: skipped ===")
+            else:
+                resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
+                print(f"=== Stage 1.2: VizWiz base, features[7:] @ 1e-5{resume_str} ===")
+                train_ds, train_loader = _build_train_loader(VIZWIZ_BASE_SOURCES)
+                train_ds.set_hard_neg_ratio(0.0)
+                opt = phase1_partial_optimizer(model)
+                _log_trainable("stage1_2")
+                if opt_state is not None:
+                    opt.load_state_dict(opt_state)
+                best, hist = train_stage(
+                    model, opt, train_loader, val_loader_p1, device_t,
+                    phase1_partial_epochs, "stage1_2", out_dir, best,
+                    contrastive=contrastive,
+                    contrastive_weight=contrastive_weight_p1,
+                    contrastive_temp=contrastive_temp,
+                    vicreg=vicreg,
+                    vicreg_weight=vicreg_weight,
+                    barlow=barlow,
+                    barlow_weight=barlow_weight,
+                    triplet=triplet,
+                    triplet_weight=triplet_weight,
+                    hard_neg_mining=False,
+                    neg_prob_schedule={1: 0.2},
+                    attn_loss_weight=0.5,
+                    start_epoch=start_epoch,
+                    scheduler_state=sched_state,
+                    prior_history=full_history,
+                )
+                full_history.extend(hist)
+                _eval_stage("stage1_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     # -----------------------------------------------------------------------
     # Phase 2: target-domain fine-tuning
@@ -1703,30 +1792,33 @@ def train(
         # Single-run (non-CV) Phase 2 — original behaviour. Uses the manifest's
         # fixed val split and writes test-set evaluation per stage.
         if phase2_frozen_epochs > 0:
-            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
-            best_new, hist = _run_phase2_stage_2_1(
-                train_loader, val_loader_p2, best, full_history
-            )
-            best = best_new
-            full_history.extend(hist)
+            if not _try_skip_complete_stage("stage2_1", phase2_frozen_epochs):
+                train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
+                best_new, hist = _run_phase2_stage_2_1(
+                    train_loader, val_loader_p2, best, full_history
+                )
+                best = best_new
+                full_history.extend(hist)
             _eval_stage("stage2_1", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
         if phase2_partial_epochs > 0:
-            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
-            best_new, hist = _run_phase2_stage_2_2(
-                train_loader, val_loader_p2, best, full_history
-            )
-            best = best_new
-            full_history.extend(hist)
+            if not _try_skip_complete_stage("stage2_2", phase2_partial_epochs):
+                train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
+                best_new, hist = _run_phase2_stage_2_2(
+                    train_loader, val_loader_p2, best, full_history
+                )
+                best = best_new
+                full_history.extend(hist)
             _eval_stage("stage2_2", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
         if phase2_full_epochs > 0:
-            train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
-            best_new, hist = _run_phase2_stage_2_3(
-                train_loader, val_loader_p2, best, full_history
-            )
-            best = best_new
-            full_history.extend(hist)
+            if not _try_skip_complete_stage("stage2_3", phase2_full_epochs):
+                train_ds, train_loader = _build_train_loader(PHASE2_SOURCES)
+                best_new, hist = _run_phase2_stage_2_3(
+                    train_loader, val_loader_p2, best, full_history
+                )
+                best = best_new
+                full_history.extend(hist)
             _eval_stage("stage2_3", out_dir, analysis_dir, manifest, data_root, val_episodes, batch_size, num_workers, seed, device, full_history=full_history)
 
     print(f"done. best val_iou={best:.4f} (saved to {out_dir / 'best.pt'})")
