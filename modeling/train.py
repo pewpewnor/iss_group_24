@@ -1362,21 +1362,32 @@ def train(
         or phase2_partial_epochs > 0
         or phase2_full_epochs > 0
     ):
-        # CV runs always start each fold from the post-Phase-1 weights —
-        # mid-Phase-2 resume across folds is ill-defined (whose fold's
-        # optimizer state? whose val IDs?). Disable per-stage resume so
-        # _resume_for() returns "fresh" for stages 2.x in every fold.
-        if resume_state is not None and resume_state.get("stage") in (
+        # CV resume policy: when resume_state["cv_state"] is present AND its
+        # stage matches one we're about to run, _run_cv_stage will pick it up
+        # and restore per-fold model/optimizer/scheduler state. Otherwise the
+        # resume_state is ignored for CV (its model_state is a single fold's
+        # weights, not a clean post-Phase-1 snapshot — using it as the seed
+        # for all folds biases the comparison).
+        cv_resume_state: dict | None = None
+        if resume_state is not None and isinstance(resume_state.get("cv_state"), dict):
+            cv_resume_state = resume_state["cv_state"]
+            print(
+                f"  CV mode: found cv_state for stage={cv_resume_state.get('stage')} "
+                f"cv_epoch={cv_resume_state.get('cv_epoch')} — will resume "
+                f"from cv_epoch {int(cv_resume_state.get('cv_epoch', 0)) + 1}"
+            )
+        elif resume_state is not None and resume_state.get("stage") in (
             "stage2_1",
             "stage2_2",
             "stage2_3",
         ):
             print(
-                "  CV mode: discarding mid-Phase-2 resume state "
-                f"(was stage={resume_state.get('stage')}, epoch={resume_state.get('epoch')})"
+                "  CV mode: ignoring legacy mid-Phase-2 resume state "
+                f"(stage={resume_state.get('stage')}, epoch={resume_state.get('epoch')}) "
+                "— no per-fold cv_state present"
             )
-            resume_state = None
-        # Snapshot the post-Phase-1 weights so each fold starts identically.
+        # Snapshot the post-Phase-1 weights so each fold starts identically
+        # when there is no cv_state to resume from.
         phase1_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         folds = _build_phase2_cv_folds(
             manifest_path=manifest, k=phase2_cv_folds, seed=seed
@@ -1431,14 +1442,67 @@ def train(
             It must return (optimizer, neg_prob_schedule, attn_loss_weight,
             contrastive_weight_local).
             """
-            nonlocal best, best_fold_iou, best_fold_idx
+            nonlocal best, best_fold_iou, best_fold_idx, cv_resume_state
 
-            print(f"\n=== {stage_name} CV: {stage_epochs} epochs × {phase2_cv_folds} folds ===")
+            # Resume policy: if cv_resume_state is set, it applies to the FIRST
+            # CV stage we encounter that matches its stage_name (or a stage
+            # ordered before it). Once consumed (or skipped), it's cleared.
+            start_cv_epoch = 1
+            saved_per_fold: list[dict] | None = None
+            if cv_resume_state is not None:
+                saved_stage = cv_resume_state.get("stage")
+                saved_cv_epoch = int(cv_resume_state.get("cv_epoch", 0))
+                if saved_stage in STAGE_ORDER and stage_name in STAGE_ORDER:
+                    if STAGE_ORDER.index(saved_stage) > STAGE_ORDER.index(stage_name):
+                        # The saved progress is in a LATER stage — this stage
+                        # already finished in the prior run. Use the saved
+                        # per-fold model_state to seed fold_structs, then skip.
+                        print(f"\n=== {stage_name} CV: skipped (resumed past this stage) ===")
+                        for fs, saved in zip(
+                            fold_structs, cv_resume_state.get("folds", [])
+                        ):
+                            if "model_state" in saved:
+                                fs["model_state"] = saved["model_state"]
+                            if "best" in saved:
+                                fs["best"] = saved["best"]
+                        return
+                if saved_stage == stage_name:
+                    if saved_cv_epoch >= stage_epochs:
+                        # This stage was fully completed in the prior run.
+                        print(f"\n=== {stage_name} CV: skipped (already completed) ===")
+                        for fs, saved in zip(
+                            fold_structs, cv_resume_state.get("folds", [])
+                        ):
+                            if "model_state" in saved:
+                                fs["model_state"] = saved["model_state"]
+                            if "best" in saved:
+                                fs["best"] = saved["best"]
+                            if saved.get("history"):
+                                full_history.extend(saved["history"])
+                        cv_resume_state = None
+                        return
+                    # Partial: resume from cv_epoch + 1.
+                    saved_per_fold = cv_resume_state.get("folds")
+                    start_cv_epoch = saved_cv_epoch + 1
+                    if saved_per_fold:
+                        for fs, saved in zip(fold_structs, saved_per_fold):
+                            if "model_state" in saved:
+                                fs["model_state"] = saved["model_state"]
+                            if "best" in saved:
+                                fs["best"] = saved["best"]
+                            if "history" in saved:
+                                fs["history"] = list(saved["history"])
+
+            print(
+                f"\n=== {stage_name} CV: {stage_epochs} epochs × {phase2_cv_folds} folds"
+                + (f" (resuming from cv_epoch {start_cv_epoch})" if start_cv_epoch > 1 else "")
+                + " ==="
+            )
 
             # Per-fold optimizer + scheduler, built once and reused across epochs.
             fold_opts: list[dict] = []
             logged_trainable = False
-            for fs in fold_structs:
+            for fi, fs in enumerate(fold_structs):
                 model.load_state_dict(fs["model_state"])
                 opt, neg_sched, attn_w, cont_w = setup_fold_fn(fs)
                 if not logged_trainable:
@@ -1456,6 +1520,18 @@ def train(
                 scheduler = torch.optim.lr_scheduler.SequentialLR(
                     opt, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps]
                 )
+                if saved_per_fold is not None and fi < len(saved_per_fold):
+                    saved_fold = saved_per_fold[fi]
+                    if "optimizer" in saved_fold:
+                        try:
+                            opt.load_state_dict(saved_fold["optimizer"])
+                        except Exception as e:
+                            print(f"  warn: fold {fi+1} optimizer restore failed: {e}")
+                    if "scheduler" in saved_fold:
+                        try:
+                            scheduler.load_state_dict(saved_fold["scheduler"])
+                        except Exception as e:
+                            print(f"  warn: fold {fi+1} scheduler restore failed: {e}")
                 fold_opts.append({
                     "opt": opt,
                     "scheduler": scheduler,
@@ -1464,7 +1540,9 @@ def train(
                     "cont_w": cont_w,
                 })
 
-            for cv_epoch in range(1, stage_epochs + 1):
+            cv_resume_state = None  # consumed — does not apply to subsequent stages
+
+            for cv_epoch in range(start_cv_epoch, stage_epochs + 1):
                 print(f"\n  CV epoch {cv_epoch}/{stage_epochs}")
                 epoch_val_ious: list[float] = []
                 epoch_val_map50s: list[float] = []
@@ -1519,14 +1597,39 @@ def train(
                     f"  ({fold_ious_str})"
                 )
 
-                # After each CV epoch, save rolling checkpoints (last fold's model state).
+                # After each CV epoch, save rolling checkpoints. The payload
+                # carries (a) the last fold's model_state at the model_state
+                # top-level (for non-CV resume compatibility / probing) and
+                # (b) a cv_state dict with per-fold model/opt/scheduler state
+                # plus history, so the run can resume mid-stage from the next
+                # cv_epoch with all folds restored exactly.
                 model.load_state_dict(fold_structs[-1]["model_state"])
+                cv_state = {
+                    "stage": stage_name,
+                    "cv_epoch": cv_epoch,
+                    "stage_epochs": stage_epochs,
+                    "phase2_cv_folds": phase2_cv_folds,
+                    "folds": [
+                        {
+                            "fold_idx": fs["fold_idx"],
+                            "train_ids": fs["train_ids"],
+                            "val_ids": fs["val_ids"],
+                            "model_state": fs["model_state"],
+                            "best": fs["best"],
+                            "history": list(fs["history"]),
+                            "optimizer": fo["opt"].state_dict(),
+                            "scheduler": fo["scheduler"].state_dict(),
+                        }
+                        for fs, fo in zip(fold_structs, fold_opts)
+                    ],
+                }
                 full_ckpt = _make_full_ckpt(
                     model, fold_opts[-1]["opt"], fold_opts[-1]["scheduler"],
                     stage_name, cv_epoch, stage_epochs,
                     max(fs["best"] for fs in fold_structs),
                     full_history,
                 )
+                full_ckpt["cv_state"] = cv_state
                 _save_checkpoint_async(full_ckpt, out_dir / "last.pt")
                 _save_checkpoint_async(full_ckpt, out_dir / f"{stage_name}.pt")
                 print(

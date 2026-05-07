@@ -618,7 +618,9 @@ class EpisodeDataset(Dataset):
                         sim = F.cosine_similarity(anchor.unsqueeze(0), p.unsqueeze(0)).item()
                         sims.append((sim, inst))
                 if sims:
-                    sims.sort(reverse=True)
+                    # Sort by similarity only — tie-breaking on the dict
+                    # would raise TypeError ('<' not supported between dicts).
+                    sims.sort(key=lambda x: x[0], reverse=True)
                     hard_inst = rng.choice(sims[: min(5, len(sims))])[1]
                     pool = hard_inst["query_images"] + hard_inst["support_images"]
                     q = rng.choice(pool)
