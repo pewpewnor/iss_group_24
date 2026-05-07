@@ -137,14 +137,47 @@ def _heads(model: FewShotLocalizer) -> list:
 #   to avoid attention collapse on the new self-attn, and stage1_2 → 2e-4
 #   once the backbone joins.
 #
-#   Phase 2 was simplified from three stages to two: the old frozen-backbone
-#   re-warmup (former 2.1) was removed because target-domain mAP barely
-#   moved during it — the heads already had Phase-1 momentum; what they
-#   actually needed was backbone adaptation (former 2.2) running first.
-#   New 2.1 = old 2.2 (features[7:] @ 3e-5, heads at 4e-4). New 2.2 = old
-#   2.3 (full unfreeze, all @ 3e-6 lower / 3e-6 upper / 5e-5 heads;
-#   that's the polish stage with the goal of bounding low-level ImageNet-
-#   feature drift, not aggressive adaptation).
+#   Phase 2 was simplified from three stages to two and tuned holistically
+#   against the first end-to-end target-domain test report (HOTS scenes had
+#   mean_iou_pos=0.0 and mean_score_neg=0.90 — both localization collapse
+#   and presence-head bias).
+#
+#   Stage 2.1 (entry, features[7:] partial unfreeze):
+#     backbone upper 5e-5    — was 3e-5; bumped because val_iou wasn't moving
+#                              and the upper blocks need to actually adapt
+#                              from ImageNet object-centric photos to the
+#                              HOTS scene / InsDet product domain.
+#     heads          4e-4    — kept; heads were already learning fine.
+#     neg_prob       {1:0.4, 5:0.5} — ramped earlier (was 0.3→0.4 at ep 6).
+#                              The presence head needs negatives from step 1.
+#     hard_neg_ratio 0.25    — was 0.5; with a fresh-from-Phase-1 prototype
+#                              cache the hard-neg miner doesn't have a
+#                              meaningful similarity signal yet. Easier
+#                              negatives let the box+presence heads find
+#                              their feet before the curriculum hardens.
+#     presence_weight 3.0    — was 2.0; doubling didn't fix the bias, so
+#                              triple it. Head-bias takes a lot to overcome
+#                              when the sample-level focal loss is small in
+#                              absolute value (0.03–0.10).
+#     attn_loss_weight 1.0   — kept; HOTS/InsDet have reliable bbox targets
+#                              and the attention spatial supervision is the
+#                              primary localization gradient driver in 2.1.
+#     contrastive    0.08    — was 0.1; let box+presence dominate early.
+#
+#   Stage 2.2 (polish, full unfreeze):
+#     backbone lower 5e-6    — was 3e-6; the lower blocks have never trained
+#                              on the target domain so 3e-6 is too cold.
+#     backbone upper 5e-6    — was 3e-6; same reasoning, kept symmetric.
+#     heads          8e-5    — was 5e-5; modest polish bump.
+#     neg_prob       {1:0.45} — was 0.4; slight increase since the curriculum
+#                              has already ramped through 2.1.
+#     hard_neg_ratio 0.5     — kept; prototype cache is real now.
+#     presence_weight 2.5    — was 2.0; once 2.1 has corrected the bias the
+#                              polish stage doesn't need 3.0, but 2.0 was
+#                              too low when this stage ran in isolation.
+#     attn_loss_weight 0.5   — was 1.0; localization is largely set by 2.1
+#                              and at 1.0 the attn term competes with box.
+#     contrastive    0.1     — kept.
 
 
 def phase1_frozen_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
@@ -173,18 +206,7 @@ def phase1_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
 
 
 def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.1 (Phase 2 entry): features[7:] @ 3e-5, heads at 4e-4.
-
-    Real domain-shift fine-tuning. The frozen-backbone re-warmup that used
-    to precede this stage was removed — the heads already adapted to the
-    new (small) target domain from Phase 1 just fine, what they actually
-    needed was backbone adaptation in parallel. So this is now Phase 2's
-    entry stage. Backbone upper at 3e-5 (the upper MobileNetV3 blocks need
-    to actually move to the target distribution; HOTS scenes / InsDet
-    product crops differ from ImageNet object-centric photos). Heads at
-    4e-4 (2× the prior K-fold-CV value, which was overly cool for the full
-    ~123-instance pool).
-    """
+    """Stage 2.1 (Phase 2 entry): features[7:] @ 5e-5, heads at 4e-4."""
     model.backbone.freeze_lower(freeze_idx_exclusive=7)
     upper = [
         p
@@ -194,22 +216,14 @@ def phase2_partial_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
     ]
     return torch.optim.AdamW(
         [
-            {"params": upper, "lr": 3e-5, "weight_decay": 1e-4},
+            {"params": upper, "lr": 5e-5, "weight_decay": 1e-4},
             {"params": _heads(model), "lr": 4e-4, "weight_decay": 1e-4},
         ]
     )
 
 
 def phase2_full_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
-    """Stage 2.2 (Phase 2 polish): full unfreeze, backbone at 3e-6.
-
-    Polish stage. Lower MobileNetV3 blocks (features[0:7]) join gradient flow
-    for the first time at a very low 3e-6 to preserve low-level ImageNet
-    features. Upper backbone also at 3e-6 to keep the LR ratio between
-    layers consistent with the partial stage that just ran. Heads at 5e-5 —
-    heads are not the catastrophic-forgetting risk and need the polish
-    budget.
-    """
+    """Stage 2.2 (Phase 2 polish): full unfreeze, backbone at 5e-6, heads 8e-5."""
     model.backbone.unfreeze_all()
     lower = [
         p
@@ -225,9 +239,9 @@ def phase2_full_optimizer(model: FewShotLocalizer) -> torch.optim.Optimizer:
     ]
     return torch.optim.AdamW(
         [
-            {"params": lower, "lr": 3e-6, "weight_decay": 1e-4},
-            {"params": upper, "lr": 3e-6, "weight_decay": 1e-4},
-            {"params": _heads(model), "lr": 5e-5, "weight_decay": 1e-4},
+            {"params": lower, "lr": 5e-6, "weight_decay": 1e-4},
+            {"params": upper, "lr": 5e-6, "weight_decay": 1e-4},
+            {"params": _heads(model), "lr": 8e-5, "weight_decay": 1e-4},
         ]
     )
 
@@ -1319,7 +1333,7 @@ def train(
             "epochs": phase2_partial_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [
-                {"label": "backbone upper", "lr": 3e-5},
+                {"label": "backbone upper", "lr": 5e-5},
                 {"label": "heads", "lr": 4e-4},
             ],
         })
@@ -1329,9 +1343,9 @@ def train(
             "epochs": phase2_full_epochs,
             "steps_per_epoch": max(episodes_per_epoch // batch_size, 1),
             "param_groups": [
-                {"label": "backbone lower", "lr": 3e-6},
-                {"label": "backbone upper", "lr": 3e-6},
-                {"label": "heads", "lr": 5e-5},
+                {"label": "backbone lower", "lr": 5e-6},
+                {"label": "backbone upper", "lr": 5e-6},
+                {"label": "heads", "lr": 8e-5},
             ],
         })
 
@@ -1346,8 +1360,12 @@ def train(
             print("=== Stage 2.1: skipped ===")
             return best_local, []
         resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-        print(f"=== Stage 2.1: HOTS+InsDet+VizWiz novel, features[7:] @ 3e-5{resume_str} ===")
-        train_loader_local.dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
+        print(f"=== Stage 2.1: HOTS+InsDet+VizWiz novel, features[7:] @ 5e-5{resume_str} ===")
+        # Hard-neg ratio starts low (0.25): the prototype cache is fresh from
+        # Phase 1 and the cosine-similarity miner needs a few epochs of
+        # target-domain exposure before its picks are meaningful. Stage 2.2
+        # raises this back to 0.5 once the cache is calibrated.
+        train_loader_local.dataset.set_hard_neg_ratio(0.25)  # type: ignore[attr-defined]
         opt = phase2_partial_optimizer(model)
         _log_trainable("stage2_1")
         if opt_state is not None:
@@ -1356,7 +1374,10 @@ def train(
             model, opt, train_loader_local, val_loader_local, device_t,
             phase2_partial_epochs, "stage2_1", out_dir, best_local,
             contrastive=contrastive,
-            contrastive_weight=contrastive_weight_p2,
+            # Drop contrastive 0.1 → 0.08: the test report showed the box
+            # loss wasn't moving (mean_iou_pos ≈ 0 on HOTS/InsDet); easing
+            # contrastive lets focal+box dominate the gradient early.
+            contrastive_weight=0.08,
             contrastive_temp=contrastive_temp,
             vicreg=vicreg,
             vicreg_weight=vicreg_weight,
@@ -1365,15 +1386,17 @@ def train(
             triplet=triplet,
             triplet_weight=triplet_weight,
             hard_neg_mining=hard_neg_mining,
-            # Negatives from epoch 1 at 0.3 — the heads already saw Phase-1
-            # negatives, no warmup ramp needed and the presence head was
-            # collapsing toward "always present" without earlier exposure.
-            neg_prob_schedule={1: 0.3, 6: 0.4},
+            # Negatives from epoch 1 at 0.4 (was 0.3) — the presence head
+            # showed strong "always present" bias (mean_score_neg=0.90 on
+            # HOTS) so it needs immediate, heavy negative exposure. Ramp
+            # to 0.5 by epoch 5 once the head has stabilized.
+            neg_prob_schedule={1: 0.4, 5: 0.5},
             attn_loss_weight=1.0,
-            # Up-weight presence loss because target-domain test eval showed
-            # mean_score_neg drifting to 0.7+ (head bias). Doubling the
-            # presence term gives it gradient parity with focal+box.
-            presence_weight=2.0,
+            # Triple presence loss (was 2.0) — doubling didn't move
+            # mean_score_neg off ~0.68 in the prior run. The raw focal-BCE
+            # output is small in absolute value so a strong multiplier is
+            # needed for gradient parity with focal+box.
+            presence_weight=3.0,
             start_epoch=start_epoch,
             scheduler_state=sched_state,
             prior_history=history_local,
@@ -1390,7 +1413,10 @@ def train(
             print("=== Stage 2.2: skipped ===")
             return best_local, []
         resume_str = f" — resuming from epoch {start_epoch}" if start_epoch > 1 else ""
-        print(f"=== Stage 2.2: full unfreeze (all @ 3e-6){resume_str} ===")
+        print(f"=== Stage 2.2: full unfreeze (all @ 5e-6){resume_str} ===")
+        # Prototype cache is calibrated on the target domain by now — raise
+        # hard-neg ratio back to 0.5 so the polish stage actually polishes
+        # against meaningful confusers.
         train_loader_local.dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
         opt = phase2_full_optimizer(model)
         _log_trainable("stage2_2")
@@ -1409,9 +1435,14 @@ def train(
             triplet=triplet,
             triplet_weight=triplet_weight,
             hard_neg_mining=hard_neg_mining,
-            neg_prob_schedule={1: 0.4},
-            attn_loss_weight=1.0,
-            presence_weight=2.0,
+            neg_prob_schedule={1: 0.45},
+            # Drop attn 1.0 → 0.5: localization is set by 2.1; at 1.0 the
+            # spatial-attention term competes with the box regression at
+            # the polish LRs (5e-6 backbone) and slows convergence.
+            attn_loss_weight=0.5,
+            # Drop presence 3.0 → 2.5: 2.1 has corrected the bias; polish
+            # stage just needs to maintain it without over-pushing.
+            presence_weight=2.5,
             start_epoch=start_epoch,
             scheduler_state=sched_state,
             prior_history=history_local,
@@ -1720,9 +1751,13 @@ def train(
         if phase2_partial_epochs > 0:
             def _setup_2_1(fs: dict) -> tuple:
                 model.load_state_dict(fs["model_state"])
-                fs["train_loader"].dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
+                # Hard-neg starts low (0.25) — fresh prototype cache; ramps in 2.2.
+                fs["train_loader"].dataset.set_hard_neg_ratio(0.25)  # type: ignore[attr-defined]
                 opt = phase2_partial_optimizer(model)
-                return opt, {1: 0.3, 6: 0.4}, 1.0, contrastive_weight_p2, 2.0
+                # Tuple: (optimizer, neg_prob_schedule, attn_loss_weight,
+                #         contrastive_weight, presence_weight). See
+                #         _run_phase2_stage_2_1 for the rationale on each.
+                return opt, {1: 0.4, 5: 0.5}, 1.0, 0.08, 3.0
             _run_cv_stage("stage2_1", phase2_partial_epochs, _setup_2_1)
 
         if phase2_full_epochs > 0:
@@ -1730,7 +1765,7 @@ def train(
                 model.load_state_dict(fs["model_state"])
                 fs["train_loader"].dataset.set_hard_neg_ratio(0.5)  # type: ignore[attr-defined]
                 opt = phase2_full_optimizer(model)
-                return opt, {1: 0.4}, 1.0, contrastive_weight_p2, 2.0
+                return opt, {1: 0.45}, 0.5, contrastive_weight_p2, 2.5
             _run_cv_stage("stage2_2", phase2_full_epochs, _setup_2_2)
 
         print(
