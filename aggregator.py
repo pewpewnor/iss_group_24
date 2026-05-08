@@ -1,25 +1,26 @@
 """Aggregate raw datasets into a clean staging directory + manifest.
 
-Single 80/20 train/test split (no val). The trainer derives K=3 stratified CV
-folds from the train pool at Stage 3; Stages 1 and 2 sample a probe from the
-test split. The manifest's "splits" index therefore only contains "train"
-and "test".
+Output layout:
+    dataset/aggregated/
+    ├── manifest.json
+    ├── stats.json
+    ├── train/{support,query}/<inst_id>/<NNN>.{png,jpg}
+    ├── test/{support,query}/<inst_id>/<NNN>.{png,jpg}
+    └── phase0/{support,query}/<inst_id>/<NNN>.{png,jpg}
 
 Sources:
-  vizwiz_base   — 100 categories, episodic crop+rotation synthesis. 80/20.
-  vizwiz_novel  — 16 categories, 1 support image each. All to train.
-  hots          — instance-level multi-shot supports + scene queries. 80/20.
-  insdet        — instance-level multi-shot supports + scene queries. 80/20.
+    HOTS          → train + test (80/20 instance split)
+    InsDet        → train + test (80/20 instance split)
+    vizwiz_novel  → phase0 only (16 instances, untouched)
 
-Negatives:
-  vizwiz_base pool — VizWiz base images not used as positives. Pool routed to
-                     vizwiz_base instances during episode sampling.
-  hope pool        — HOPE scene RGBs + InsDet Background + VizWiz query images.
-                     Pool routed to vizwiz_novel / hots / insdet instances.
+VizWiz base / FSOD / HOPE are NOT used. Negative episodes during training
+are constructed from same-source other-instance queries.
 
 Run:
     uv run python -m aggregator
 """
+
+from __future__ import annotations
 
 import json
 import random
@@ -39,23 +40,16 @@ BBOX_MIN_SIDE = 20
 BBOX_MIN_AREA_FRAC = 0.005
 
 BASE_DIR = Path("dataset/original")
-OUT_DIR = Path("dataset/cleaned")
+OUT_DIR = Path("dataset/aggregated")
 
 HOTS_OBJECT_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "object"
 HOTS_SCENE_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "scene"
 INSDET_DIR = BASE_DIR / "InsDet"
-HOPE_DIR = BASE_DIR / "HOPE"
 VIZWIZ_DIR = BASE_DIR / "VizWiz"
-
-# VizWiz base scope controls. Each (scene, bbox) entry = one complete episode source;
-# the rotation trick generates 4 support views + the original scene as query at runtime.
-# Capping per-category limits staging time and disk while keeping diverse pretraining.
-VIZWIZ_BASE_MAX_IMAGES_PER_CAT = 0  # 0 = no cap, use all available images per category
-VIZWIZ_NEG_SAMPLES = 500  # Phase 1 negative backgrounds from VizWiz base unused images
 
 
 # ---------------------------------------------------------------------------
-# Bbox utilities (shared across all collectors)
+# Bbox utilities
 # ---------------------------------------------------------------------------
 
 
@@ -94,7 +88,7 @@ def _bbox_valid(bbox: list[int], img_size: tuple[int, int]) -> bool:
     return (bw * bh) / (w * h) >= BBOX_MIN_AREA_FRAC
 
 
-def bbox_from_mask(mask_path: Path) -> list[int] | None:
+def _bbox_from_mask(mask_path: Path) -> list[int] | None:
     mask_arr = np.array(Image.open(mask_path).convert("L")) > 127
     bbox = _largest_component_bbox(mask_arr)
     if bbox is None:
@@ -104,7 +98,7 @@ def bbox_from_mask(mask_path: Path) -> list[int] | None:
     return bbox if _bbox_valid(bbox, (w, h)) else None
 
 
-def bbox_from_image(img_path: Path, bg_thresh: int = 240) -> list[int] | None:
+def _bbox_from_image(img_path: Path, bg_thresh: int = 240) -> list[int] | None:
     img = np.array(Image.open(img_path).convert("RGB"))
     fg = ~np.all(img > bg_thresh, axis=2)
     bbox = _largest_component_bbox(fg)
@@ -125,9 +119,9 @@ def _int_child(el: ET.Element, tag: str) -> int | None:
         return None
 
 
-def parse_voc_xml(xml_path: Path) -> list[dict]:
+def _parse_voc_xml(xml_path: Path) -> list[dict]:
     root = ET.parse(xml_path).getroot()
-    out = []
+    out: list[dict] = []
     for obj in root.findall("object"):
         name_el = obj.find("name")
         bb = obj.find("bndbox")
@@ -150,127 +144,166 @@ def _normalize_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# VizWiz base collector (Phase 1 pretraining)
+# HOTS collectors
 # ---------------------------------------------------------------------------
 
 
-def collect_vizwiz_base_instances() -> list[dict]:
-    """One instance per VizWiz base category holding (scene, bbox) entries.
+def collect_hots_instances() -> list[dict]:
+    """Pool object/{train,test}/<cls>/*.png as supports per class.
 
-    Phase 1 episodes are synthesised at sample time: pick one entry, crop
-    the bbox + rotate four ways → 4 supports; the same scene image becomes
-    the query (with the same bbox as ground truth). This turns a category-
-    level annotation into instance-level supervision — the model is asked to
-    find the specific object whose own crops it just saw.
-
-    Dedup: one entry per (image, category) pair, keeping the largest bbox if
-    a scene contains multiple instances of the same category.
+    The HOTS object split is photographer-round, not generalisation, so
+    we pool both rounds for each class.
     """
-    annot_path = VIZWIZ_DIR / "base_annotations.json"
-    if not annot_path.exists():
-        print(f"  [skip] vizwiz_base: {annot_path} not found")
-        return []
-
-    with open(annot_path) as f:
-        coco = json.load(f)
-
-    cat_name = {c["id"]: c["name"] for c in coco["categories"]}
-    image_meta = {im["id"]: im for im in coco["images"]}
-
-    by_cat: dict[int, dict[int, dict]] = {}
-    for ann in coco["annotations"]:
-        if ann.get("ignore") or ann.get("iscrowd"):
-            continue
-        cat_id = ann["category_id"]
-        img_id = ann["image_id"]
-        x, y, w_b, h_b = ann["bbox"]
-        if w_b <= 0 or h_b <= 0:
-            continue
-        area = w_b * h_b
-        cat = by_cat.setdefault(cat_id, {})
-        prev = cat.get(img_id)
-        if prev is None or area > prev["area"]:
-            cat[img_id] = {"area": area, "x": x, "y": y, "w": w_b, "h": h_b}
-
-    rng = random.Random(SEED)
+    train_dir = HOTS_OBJECT_DIR / "train"
+    test_dir = HOTS_OBJECT_DIR / "test"
     instances: list[dict] = []
-    skipped = 0
-    for cat_id in sorted(by_cat):
-        per_image = by_cat[cat_id]
-        entries: list[dict] = []
-        for img_id, ann in per_image.items():
-            meta = image_meta.get(img_id)
-            if meta is None:
-                continue
-            img_path = VIZWIZ_DIR / "images" / meta["file_name"]
-            if not img_path.exists():
-                continue
-            iw, ih = int(meta["width"]), int(meta["height"])
-            x1 = int(ann["x"])
-            y1 = int(ann["y"])
-            x2 = int(ann["x"] + ann["w"])
-            y2 = int(ann["y"] + ann["h"])
-            bbox = _pad_bbox([x1, y1, x2, y2], (iw, ih))
-            if not _bbox_valid(bbox, (iw, ih)):
-                continue
-            entries.append({"path": str(img_path), "bbox": bbox})
-
-        # Minimum entries to provide episodic variety within the category.
-        if len(entries) < 5:
-            skipped += 1
+    if not train_dir.exists():
+        print(f"  [skip] hots: {train_dir} missing")
+        return instances
+    for cls_dir in sorted(d for d in train_dir.iterdir() if d.is_dir()):
+        cls = cls_dir.name
+        support: list[dict] = []
+        for p in sorted(cls_dir.glob("*.png")):
+            bbox = _bbox_from_image(p)
+            if bbox is not None:
+                support.append({"path": str(p), "bbox": bbox})
+        test_cls = test_dir / cls
+        if test_cls.exists():
+            for p in sorted(test_cls.glob("*.png")):
+                bbox = _bbox_from_image(p)
+                if bbox is not None:
+                    support.append({"path": str(p), "bbox": bbox})
+        if len(support) < N_SUPPORT:
+            print(f"  [skip] hots/{cls}: only {len(support)} valid supports")
             continue
-
-        rng.shuffle(entries)
-        if (
-            VIZWIZ_BASE_MAX_IMAGES_PER_CAT > 0
-            and len(entries) > VIZWIZ_BASE_MAX_IMAGES_PER_CAT
-        ):
-            entries = entries[:VIZWIZ_BASE_MAX_IMAGES_PER_CAT]
-
-        name = cat_name[cat_id]
-        # Deep copy entries for support/query so stage_images path mutations
-        # on one list don't corrupt the other.
         instances.append(
             {
-                "instance_id": f"vizwiz_base_{_normalize_name(name)}",
-                "source": "vizwiz_base",
-                "class_name": name,
-                "support_images": [
-                    {"path": e["path"], "bbox": e["bbox"]} for e in entries
-                ],
-                "query_images": [
-                    {"path": e["path"], "bbox": e["bbox"]} for e in entries
-                ],
+                "instance_id": f"hots_{_normalize_name(cls)}",
+                "source": "hots",
+                "class_name": cls,
+                "support_images": support,
+                "query_images": [],
             }
         )
-
-    print(f"vizwiz_base: {len(instances)} categories ({skipped} skipped, < 5 entries)")
+    print(f"hots: {len(instances)} instances")
     return instances
 
 
+def collect_hots_scene_queries() -> list[dict]:
+    annot_dir = HOTS_SCENE_DIR / "ObjectDetection" / "Annotations"
+    rgb_dir = HOTS_SCENE_DIR / "RGB"
+    out: list[dict] = []
+    if not annot_dir.exists():
+        return out
+    for xml_p in sorted(annot_dir.glob("*.xml")):
+        img_p = rgb_dir / f"{xml_p.stem}.png"
+        if not img_p.exists():
+            continue
+        for o in _parse_voc_xml(xml_p):
+            out.append(
+                {
+                    "instance_id": f"hots_{_normalize_name(o['name'])}",
+                    "path": str(img_p),
+                    "bbox": o["bbox"],
+                    "scene_type": "hots_scene",
+                }
+            )
+    print(f"hots scene annotations: {len(out)}")
+    return out
+
+
 # ---------------------------------------------------------------------------
-# VizWiz novel collector (Phase 2, additional 16 instances)
+# InsDet collectors
+# ---------------------------------------------------------------------------
+
+
+def collect_insdet_instances() -> list[dict]:
+    """Pool Objects/<cls>/images/*.jpg as supports per class.
+
+    Bbox is computed from the matching mask under masks/<stem>.png.
+    """
+    objects_dir = INSDET_DIR / "Objects"
+    instances: list[dict] = []
+    if not objects_dir.exists():
+        print(f"  [skip] insdet: {objects_dir} missing")
+        return instances
+    for obj_dir in sorted(d for d in objects_dir.iterdir() if d.is_dir()):
+        images_dir = obj_dir / "images"
+        masks_dir = obj_dir / "masks"
+        img_files = sorted(images_dir.glob("*.jpg"))
+        if len(img_files) < N_SUPPORT:
+            print(f"  [skip] insdet/{obj_dir.name}: {len(img_files)} images")
+            continue
+        support: list[dict] = []
+        for p in img_files:
+            mask = masks_dir / f"{p.stem}.png"
+            bbox = _bbox_from_mask(mask) if mask.exists() else _bbox_from_image(p)
+            if bbox is None:
+                continue
+            support.append({"path": str(p), "bbox": bbox})
+        if len(support) < N_SUPPORT:
+            print(f"  [skip] insdet/{obj_dir.name}: post-bbox {len(support)} supports")
+            continue
+        instances.append(
+            {
+                "instance_id": f"insdet_{_normalize_name(obj_dir.name)}",
+                "source": "insdet",
+                "class_name": obj_dir.name,
+                "support_images": support,
+                "query_images": [],
+            }
+        )
+    print(f"insdet: {len(instances)} instances")
+    return instances
+
+
+def collect_insdet_scene_queries() -> list[dict]:
+    scenes_root = INSDET_DIR / "Scenes"
+    out: list[dict] = []
+    if not scenes_root.exists():
+        return out
+    for difficulty in ("easy", "hard"):
+        diff_dir = scenes_root / difficulty
+        if not diff_dir.exists():
+            continue
+        for scene_dir in sorted(d for d in diff_dir.iterdir() if d.is_dir()):
+            for xml_p in sorted(scene_dir.glob("*.xml")):
+                img_p = scene_dir / f"{xml_p.stem}.jpg"
+                if not img_p.exists():
+                    continue
+                for o in _parse_voc_xml(xml_p):
+                    out.append(
+                        {
+                            "instance_id": f"insdet_{_normalize_name(o['name'])}",
+                            "path": str(img_p),
+                            "bbox": o["bbox"],
+                            "scene_type": f"insdet_{difficulty}",
+                        }
+                    )
+    print(f"insdet scene annotations: {len(out)}")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# VizWiz novel collector (phase0 only)
 # ---------------------------------------------------------------------------
 
 
 def collect_vizwiz_novel_instances() -> list[dict]:
-    """One instance per VizWiz novel category. 16 categories, 1 image each.
+    """16 categories, 1 image each. Used for Phase 0 zero-shot baseline.
 
-    The same rotation trick (crop + 4-way rotate) is used at sample time to
-    generate 4 support views from the single labeled image. All 16 go to
-    train since the set is too small to meaningfully split.
+    The single image acts as both support source and query. The 4 supports
+    are produced by rotation synthesis (0/90/180/270) at episode time —
+    the manifest just stores the single (image, bbox) entry.
     """
     annot_path = VIZWIZ_DIR / "support_set.json"
     if not annot_path.exists():
         print(f"  [skip] vizwiz_novel: {annot_path} not found")
         return []
-
     with open(annot_path) as f:
         coco = json.load(f)
-
     cat_name = {c["id"]: c["name"] for c in coco["categories"]}
     image_meta = {im["id"]: im for im in coco["images"]}
-
     instances: list[dict] = []
     skipped = 0
     for ann in coco["annotations"]:
@@ -294,143 +327,23 @@ def collect_vizwiz_novel_instances() -> list[dict]:
             skipped += 1
             continue
         name = cat_name[cat_id]
-        entry = {"path": str(img_path), "bbox": bbox}
         instances.append(
             {
                 "instance_id": f"vizwiz_novel_{_normalize_name(name)}",
                 "source": "vizwiz_novel",
                 "class_name": name,
-                # Single entry; rotation synthesis generates 4 supports at runtime.
-                "support_images": [{"path": entry["path"], "bbox": entry["bbox"]}],
-                "query_images": [{"path": entry["path"], "bbox": entry["bbox"]}],
+                "support_images": [{"path": str(img_path), "bbox": bbox}],
+                "query_images": [{"path": str(img_path), "bbox": bbox,
+                                  "scene_type": "vizwiz_novel"}],
             }
         )
-
     print(f"vizwiz_novel: {len(instances)} instances ({skipped} skipped)")
     return instances
 
 
 # ---------------------------------------------------------------------------
-# HOTS + InsDet collectors (unchanged from cleaner.py)
+# Attach scene queries
 # ---------------------------------------------------------------------------
-
-
-def collect_hots_instances() -> list[dict]:
-    train_dir = HOTS_OBJECT_DIR / "train"
-    test_dir = HOTS_OBJECT_DIR / "test"
-    instances = []
-    for cls_dir in sorted(d for d in train_dir.iterdir() if d.is_dir()):
-        cls = cls_dir.name
-        support = []
-        for p in sorted(cls_dir.glob("*.png")):
-            bbox = bbox_from_image(p)
-            if bbox is not None:
-                support.append({"path": str(p), "bbox": bbox})
-        test_cls = test_dir / cls
-        if test_cls.exists():
-            for p in sorted(test_cls.glob("*.png")):
-                bbox = bbox_from_image(p)
-                if bbox is not None:
-                    support.append({"path": str(p), "bbox": bbox})
-        if len(support) < N_SUPPORT:
-            print(f"  [skip] hots/{cls}: {len(support)} valid support images")
-            continue
-        instances.append(
-            {
-                "instance_id": f"hots_{_normalize_name(cls)}",
-                "source": "hots",
-                "class_name": cls,
-                "support_images": support,
-                "query_images": [],
-            }
-        )
-    print(f"hots: {len(instances)} instances")
-    return instances
-
-
-def collect_insdet_instances() -> list[dict]:
-    objects_dir = INSDET_DIR / "Objects"
-    instances = []
-    for obj_dir in sorted(d for d in objects_dir.iterdir() if d.is_dir()):
-        images_dir = obj_dir / "images"
-        masks_dir = obj_dir / "masks"
-        img_files = sorted(images_dir.glob("*.jpg"))
-        if len(img_files) < N_SUPPORT + 1:
-            print(f"  [skip] insdet/{obj_dir.name}: {len(img_files)} images")
-            continue
-        support = []
-        for p in img_files:
-            mask = masks_dir / f"{p.stem}.png"
-            bbox = bbox_from_mask(mask) if mask.exists() else bbox_from_image(p)
-            if bbox is None:
-                continue
-            support.append({"path": str(p), "bbox": bbox})
-        if len(support) < N_SUPPORT:
-            print(
-                f"  [skip] insdet/{obj_dir.name}: post-bbox {len(support)} support images"
-            )
-            continue
-        instances.append(
-            {
-                "instance_id": f"insdet_{_normalize_name(obj_dir.name)}",
-                "source": "insdet",
-                "class_name": obj_dir.name,
-                "support_images": support,
-                "query_images": [],
-            }
-        )
-    print(f"insdet: {len(instances)} instances")
-    return instances
-
-
-def collect_hots_scene_queries() -> list[dict]:
-    annot_dir = HOTS_SCENE_DIR / "ObjectDetection" / "Annotations"
-    rgb_dir = HOTS_SCENE_DIR / "RGB"
-    if not annot_dir.exists():
-        return []
-    out = []
-    for xml_p in sorted(annot_dir.glob("*.xml")):
-        img_p = rgb_dir / f"{xml_p.stem}.png"
-        if not img_p.exists():
-            continue
-        for o in parse_voc_xml(xml_p):
-            out.append(
-                {
-                    "instance_id": f"hots_{_normalize_name(o['name'])}",
-                    "path": str(img_p),
-                    "bbox": o["bbox"],
-                    "scene_type": "hots_scene",
-                }
-            )
-    print(f"hots scene: {len(out)} annotations")
-    return out
-
-
-def collect_insdet_scene_queries() -> list[dict]:
-    scenes_root = INSDET_DIR / "Scenes"
-    if not scenes_root.exists():
-        return []
-    out = []
-    for difficulty in ("easy", "hard"):
-        diff_dir = scenes_root / difficulty
-        if not diff_dir.exists():
-            continue
-        for scene_dir in sorted(d for d in diff_dir.iterdir() if d.is_dir()):
-            for xml_p in sorted(scene_dir.glob("*.xml")):
-                img_p = scene_dir / f"{xml_p.stem}.jpg"
-                if not img_p.exists():
-                    continue
-                for o in parse_voc_xml(xml_p):
-                    out.append(
-                        {
-                            "instance_id": f"insdet_{_normalize_name(o['name'])}",
-                            "path": str(img_p),
-                            "bbox": o["bbox"],
-                            "scene_type": f"insdet_{difficulty}",
-                        }
-                    )
-    print(f"insdet scene: {len(out)} annotations")
-    return out
 
 
 def attach_scene_queries(
@@ -441,119 +354,48 @@ def attach_scene_queries(
         by_id.setdefault(sq["instance_id"], []).append(
             {"path": sq["path"], "bbox": sq["bbox"], "scene_type": sq["scene_type"]}
         )
+    out: list[dict] = []
     matched_total = 0
     matched_instances = 0
-    out = []
     for inst in instances:
         sq = by_id.get(inst["instance_id"], [])
         if sq:
             matched_instances += 1
             matched_total += len(sq)
         out.append({**inst, "query_images": inst["query_images"] + sq})
-    unmatched_keys = set(by_id) - {i["instance_id"] for i in instances}
+    unmatched = set(by_id) - {i["instance_id"] for i in instances}
     print(
         f"scene attached: {matched_total} annotations across "
         f"{matched_instances}/{len(instances)} instances "
-        f"({len(unmatched_keys)} XML names matched no instance)"
+        f"({len(unmatched)} XML names matched no instance)"
     )
     return out
 
 
-# ---------------------------------------------------------------------------
-# Negative background collector
-# ---------------------------------------------------------------------------
-
-
-def collect_negative_backgrounds(
-    vizwiz_base_used_paths: set[str],
-) -> list[dict]:
-    """Negative (no-target) backgrounds, tagged by pool.
-
-    vizwiz_base pool — used by Phase 1 (VizWiz base episodes). Drawing from
-    the same visual domain (VizWiz phone shots) prevents the model from
-    rejecting negatives by global image style rather than object content.
-
-    hope pool — used by Phase 2 (HOTS + InsDet + VizWiz novel episodes).
-    Includes HOPE scene RGBs, InsDet Background images, and VizWiz query
-    images (unannotated). Mixed-domain is fine for Phase 2: the model is
-    already past the style-discrimination failure mode by this point.
-    """
-    out: list[dict] = []
-
-    # VizWiz base negatives (Phase 1): random images not used as positives.
-    n_vizwiz_base = 0
-    if VIZWIZ_DIR.exists():
-        rng = random.Random(SEED + 1)
-        images_dir = VIZWIZ_DIR / "images"
-        candidates = list(images_dir.glob("*.jpg"))
-        rng.shuffle(candidates)
-        for p in candidates:
-            if str(p) in vizwiz_base_used_paths:
-                continue
-            out.append({"path": str(p), "source": "vizwiz_base"})
-            n_vizwiz_base += 1
-            if n_vizwiz_base >= VIZWIZ_NEG_SAMPLES:
-                break
-
-    # HOPE scenes (Phase 2).
-    n_hope = 0
-    if HOPE_DIR.exists():
-        for p in sorted(HOPE_DIR.rglob("*_rgb.jpg")):
-            out.append({"path": str(p), "source": "hope"})
-            n_hope += 1
-
-    # InsDet Background images (Phase 2).
-    n_insdet_bg = 0
-    bg_dir = INSDET_DIR / "Background"
-    if bg_dir.exists():
-        for p in sorted(bg_dir.glob("*.jpg")):
-            out.append({"path": str(p), "source": "hope"})
-            n_insdet_bg += 1
-
-    # VizWiz query images (Phase 2, unannotated).
-    n_vizwiz_q = 0
-    query_dir = VIZWIZ_DIR / "query_images"
-    if query_dir.exists():
-        for p in sorted(query_dir.iterdir()):
-            if p.suffix.lower() in (".jpg", ".jpeg"):
-                out.append({"path": str(p), "source": "hope"})
-                n_vizwiz_q += 1
-
-    print(
-        f"  negatives: vizwiz_base={n_vizwiz_base}  "
-        f"hope(hope_scenes={n_hope} insdet_bg={n_insdet_bg} vizwiz_query={n_vizwiz_q})"
-    )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Split, stage, manifest
-# ---------------------------------------------------------------------------
-
-
-def filter_empty_instances(instances: list[dict]) -> list[dict]:
+def filter_empty_query_instances(instances: list[dict]) -> list[dict]:
     out = []
     for inst in instances:
-        if len(inst["query_images"]) == 0:
-            print(f"  [skip] {inst['instance_id']}: no query images after attach")
+        if not inst["query_images"]:
+            print(f"  [skip] {inst['instance_id']}: no queries after attach")
             continue
         out.append(inst)
     return out
 
 
-def split_instances(instances: list[dict]) -> tuple[list, list]:
-    """Split instances per source into train (80%) / test (20%).
+# ---------------------------------------------------------------------------
+# Split + stage + manifest
+# ---------------------------------------------------------------------------
 
-    Every source — including ``vizwiz_novel`` — gets at least a 1-instance
-    test slice so post-stage evaluation reports per-source metrics for all
-    four sources. With only 16 vizwiz_novel instances we cap its test slice
-    at the standard 20% (rounded up) so ~3 go to test and ~13 to train.
+
+def split_train_test(instances: list[dict]) -> tuple[list[dict], list[dict]]:
+    """80/20 instance-level split, stratified by source.
+
+    At least 1 train and 1 test per source when possible.
     """
     rng = random.Random(SEED)
     by_source: dict[str, list[dict]] = {}
     for inst in instances:
         by_source.setdefault(inst["source"], []).append(inst)
-
     train: list[dict] = []
     test: list[dict] = []
     for source in sorted(by_source):
@@ -561,20 +403,17 @@ def split_instances(instances: list[dict]) -> tuple[list, list]:
         rng.shuffle(group)
         n = len(group)
         n_train = int(round(n * TRAIN_RATIO))
-        # Guarantee at least 1 instance in each split when n > 1.
         if n > 1:
             n_train = max(1, min(n - 1, n_train))
         else:
             n_train = n
         train.extend(group[:n_train])
         test.extend(group[n_train:])
-        print(
-            f"  split[{source}]: train={n_train} test={n - n_train}"
-        )
+        print(f"  split[{source}]: train={n_train} test={n - n_train}")
     return train, test
 
 
-def stage_images(splits: dict[str, list[dict]], negatives: list[dict]) -> list[dict]:
+def stage_images(splits: dict[str, list[dict]]) -> None:
     n_copied = 0
 
     def copy(src: Path, dst: Path) -> None:
@@ -598,40 +437,16 @@ def stage_images(splits: dict[str, list[dict]], negatives: list[dict]) -> list[d
                     img["path"] = (
                         Path(split_name) / role / inst_id / dst.name
                     ).as_posix()
-
-    new_negatives: list[dict] = []
-    for neg in negatives:
-        src = Path(neg["path"])
-        source = neg["source"]
-        sub_dir = OUT_DIR / "negatives" / source
-        sub_dir.mkdir(parents=True, exist_ok=True)
-        dst = sub_dir / src.name
-        if dst.exists():
-            import hashlib
-
-            h = hashlib.md5(str(src).encode()).hexdigest()[:8]
-            dst = sub_dir / f"{src.stem}_{h}{src.suffix}"
-        shutil.copy2(src, dst)
-        n_copied += 1
-        new_negatives.append(
-            {
-                "path": (Path("negatives") / source / dst.name).as_posix(),
-                "source": source,
-            }
-        )
-
     print(f"staged images: {n_copied} files copied")
-    return new_negatives
 
 
-def write_manifest(splits: dict[str, list[dict]], negatives: list[dict]) -> None:
+def write_manifest(splits: dict[str, list[dict]]) -> None:
     instances_with_split: list[dict] = []
     split_index: dict[str, list[str]] = {k: [] for k in splits}
     for split_name, insts in splits.items():
         for inst in insts:
             instances_with_split.append({**inst, "split": split_name})
             split_index[split_name].append(inst["instance_id"])
-
     p = OUT_DIR / "manifest.json"
     with open(p, "w") as f:
         json.dump(
@@ -639,13 +454,12 @@ def write_manifest(splits: dict[str, list[dict]], negatives: list[dict]) -> None
                 "num_instances": len(instances_with_split),
                 "splits": split_index,
                 "instances": instances_with_split,
-                "negative_backgrounds": negatives,
             },
             f,
             indent=2,
         )
     counts = ", ".join(f"{k}={len(v)}" for k, v in split_index.items())
-    print(f"  manifest -> {p}: {len(instances_with_split)} instances ({counts})")
+    print(f"manifest -> {p}: {len(instances_with_split)} instances ({counts})")
 
 
 def write_stats(splits: dict[str, list[dict]]) -> None:
@@ -653,57 +467,45 @@ def write_stats(splits: dict[str, list[dict]]) -> None:
     for name, insts in splits.items():
         stats[name] = {
             "instances": len(insts),
-            "vizwiz_base": sum(1 for i in insts if i["source"] == "vizwiz_base"),
-            "vizwiz_novel": sum(1 for i in insts if i["source"] == "vizwiz_novel"),
             "hots": sum(1 for i in insts if i["source"] == "hots"),
             "insdet": sum(1 for i in insts if i["source"] == "insdet"),
+            "vizwiz_novel": sum(1 for i in insts if i["source"] == "vizwiz_novel"),
             "support_images": sum(len(i["support_images"]) for i in insts),
             "query_images": sum(len(i["query_images"]) for i in insts),
         }
-    p = OUT_DIR / "stats.json"
-    with open(p, "w") as f:
+    with open(OUT_DIR / "stats.json", "w") as f:
         json.dump(stats, f, indent=2)
     print(json.dumps(stats, indent=2))
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
     if OUT_DIR.exists():
         shutil.rmtree(OUT_DIR)
         print(f"cleared {OUT_DIR}")
     OUT_DIR.mkdir(parents=True)
 
-    print("collecting VizWiz base instances (Phase 1 pretraining pool)")
-    vizwiz_base_instances = collect_vizwiz_base_instances()
+    print("collecting HOTS + InsDet instances")
+    main_instances = collect_hots_instances() + collect_insdet_instances()
 
-    print("collecting VizWiz novel instances (Phase 2 additional training)")
-    vizwiz_novel_instances = collect_vizwiz_novel_instances()
+    print("collecting scene queries")
+    scene_queries = collect_hots_scene_queries() + collect_insdet_scene_queries()
+    main_instances = attach_scene_queries(main_instances, scene_queries)
+    main_instances = filter_empty_query_instances(main_instances)
 
-    print("collecting HOTS + InsDet instances (Phase 2 target domain)")
-    target_instances = collect_hots_instances() + collect_insdet_instances()
+    print("collecting vizwiz_novel instances (phase0)")
+    phase0_instances = collect_vizwiz_novel_instances()
 
-    print("collecting scene queries for HOTS + InsDet")
-    scene = collect_hots_scene_queries() + collect_insdet_scene_queries()
-    target_instances = attach_scene_queries(target_instances, scene)
-    target_instances = filter_empty_instances(target_instances)
+    train, test = split_train_test(main_instances)
+    splits = {"train": train, "test": test, "phase0": phase0_instances}
 
-    instances = vizwiz_base_instances + vizwiz_novel_instances + target_instances
-
-    # Track VizWiz base images used as positives so the negative pool is disjoint.
-    vizwiz_base_used: set[str] = set()
-    for inst in vizwiz_base_instances:
-        for img in inst["support_images"] + inst["query_images"]:
-            vizwiz_base_used.add(img["path"])
-
-    negatives = collect_negative_backgrounds(vizwiz_base_used_paths=vizwiz_base_used)
-    print(f"negatives: {len(negatives)} background images")
-
-    train, test = split_instances(instances)
-    splits = {"train": train, "test": test}
-
-    print("staging images into train / test directories")
-    negatives = stage_images(splits, negatives)
-
-    write_manifest(splits, negatives)
+    print("staging images")
+    stage_images(splits)
+    write_manifest(splits)
     write_stats(splits)
 
 

@@ -1,11 +1,8 @@
-"""Per-stage optimiser + LR scheduler factories.
+"""Per-stage optimiser + scheduler factories.
 
-Stage 1: heads only, backbone frozen.
-Stage 2: heads + backbone.features[7:].
-Stage 3: full unfreeze.
-
-The scheduler is one continuous ``LinearLR(warmup) → CosineAnnealingLR(rest)``
-across the entire stage's total step count.
+Stage 1.1: aggregator + existence_head.
+Stage 1.2: + box_head + class_head + layer_norm.
+Stage 2.3: + LoRA adapters on last 4 vision blocks.
 """
 
 from __future__ import annotations
@@ -13,79 +10,70 @@ from __future__ import annotations
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from modeling.model import FewShotLocalizer
-
-
-# ---------------------------------------------------------------------------
-# Param group helpers
-# ---------------------------------------------------------------------------
-
-
-def heads_params(model: FewShotLocalizer) -> list:
-    backbone_ids = {id(p) for p in model.backbone.parameters()}
-    return [p for p in model.parameters() if id(p) not in backbone_ids]
-
-
-def backbone_upper_params(
-    model: FewShotLocalizer, upper_idx: int = 6
-) -> list:
-    """``features[upper_idx:]`` parameters. Stage 2 default: idx=6 so two
-    extra MobileNet blocks join gradient (was idx=7)."""
-    return [
-        p
-        for i, blk in enumerate(model.backbone.features)
-        if i >= upper_idx
-        for p in blk.parameters()
-    ]
-
-
-def backbone_lower_params(
-    model: FewShotLocalizer, upper_idx: int = 6
-) -> list:
-    return [
-        p
-        for i, blk in enumerate(model.backbone.features)
-        if i < upper_idx
-        for p in blk.parameters()
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Optimiser factories
-# ---------------------------------------------------------------------------
+from modeling.model import OWLv2FewShotLocalizer
 
 
 def build_optimizer_for_stage(
-    stage: int, model: FewShotLocalizer, cfg: dict
-) -> torch.optim.Optimizer:
-    wd = cfg["weight_decay"]
-    # Stage 2 unfreeze depth (defaults to 6 so two MobileNet blocks join).
-    s2_idx = int(cfg.get("stage2_unfreeze_idx", 6))
-    s3_idx = int(cfg.get("stage3_split_idx", 6))
-    if stage == 1:
-        model.backbone.freeze_all()
-        groups = [
-            {"params": heads_params(model), "lr": cfg["lr_heads_s1"], "weight_decay": wd}
-        ]
-    elif stage == 2:
-        model.backbone.freeze_lower(freeze_idx_exclusive=s2_idx)
-        groups = [
-            {"params": backbone_upper_params(model, upper_idx=s2_idx),
-             "lr": cfg["lr_backbone_upper_s2"], "weight_decay": wd},
-            {"params": heads_params(model), "lr": cfg["lr_heads_s2"], "weight_decay": wd},
-        ]
-    elif stage == 3:
-        model.backbone.unfreeze_all()
-        groups = [
-            {"params": backbone_lower_params(model, upper_idx=s3_idx),
-             "lr": cfg["lr_backbone_lower_s3"], "weight_decay": wd},
-            {"params": backbone_upper_params(model, upper_idx=s3_idx),
-             "lr": cfg["lr_backbone_upper_s3"], "weight_decay": wd},
-            {"params": heads_params(model), "lr": cfg["lr_heads_s3"], "weight_decay": wd},
-        ]
-    else:
-        raise ValueError(f"unknown stage {stage}")
-    return torch.optim.AdamW(groups)
+    stage: str, model: OWLv2FewShotLocalizer, cfg: dict
+) -> tuple[torch.optim.Optimizer, list[torch.nn.Parameter] | None]:
+    """Returns (optimizer, lora_params).  ``lora_params`` is None unless
+    stage == "2_3", in which case it's the list of LoRA parameter tensors
+    (so the trainer can clip them separately if needed).
+    """
+    wd = float(cfg["weight_decay"])
+    lora_params: list[torch.nn.Parameter] | None = None
+
+    # Stage 2.3: attach LoRA first (this re-freezes everything except adapters).
+    if stage == "2_3":
+        lora_params = model.attach_lora(
+            r=int(cfg["lora_r"]),
+            alpha=int(cfg["lora_alpha"]),
+            dropout=float(cfg["lora_dropout"]),
+            last_n_layers=int(cfg["lora_layers"]),
+        )
+
+    # Always start from a clean freeze, then opt-in.
+    model.freeze_owlv2_all()
+    for p in model.aggregator.parameters():
+        p.requires_grad = True
+    for p in model.existence_head.parameters():
+        p.requires_grad = True
+
+    groups: list[dict] = [
+        {"params": list(model.aggregator.parameters()),
+         "lr": float(cfg["lr_aggregator"]),
+         "weight_decay": wd, "name": "aggregator"},
+        {"params": list(model.existence_head.parameters()),
+         "lr": float(cfg["lr_existence"]),
+         "weight_decay": wd, "name": "existence_head"},
+    ]
+
+    if stage in ("1_2", "2_3"):
+        model.unfreeze_owlv2_heads()
+        groups.append({
+            "params": model.class_head_params(),
+            "lr": float(cfg["lr_class"]),
+            "weight_decay": wd, "name": "class_head",
+        })
+        groups.append({
+            "params": model.box_head_params(),
+            "lr": float(cfg["lr_box"]),
+            "weight_decay": wd, "name": "box_head",
+        })
+
+    if stage == "2_3":
+        # Re-enable LoRA params (freeze_owlv2_all turned them off).
+        for p in lora_params:                                            # type: ignore[possibly-undefined]
+            p.requires_grad = True
+        if lora_params:
+            groups.append({
+                "params": lora_params,
+                "lr": float(cfg["lr_lora"]),
+                "weight_decay": wd, "name": "lora",
+            })
+
+    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999))
+    return optimizer, lora_params
 
 
 def build_scheduler(

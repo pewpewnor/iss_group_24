@@ -1,7 +1,5 @@
-"""Stratified K-fold construction for Stage 3 cross-validation.
-
-Each fold is built so every source's instances are partitioned in round-robin
-order — guaranteeing every fold has the same source mix as the training pool.
+"""K-fold construction.  Stratified by ``source`` so every fold's val set
+mirrors the source distribution of the full train pool.
 """
 
 from __future__ import annotations
@@ -13,7 +11,12 @@ from typing import Any
 def stratified_kfold(
     instances: list[dict[str, Any]], k: int, seed: int
 ) -> list[dict[str, list[str]]]:
-    """Return K folds; each is ``{"train_ids": [...], "val_ids": [...]}``."""
+    """Return K folds; each is ``{"train_ids": [...], "val_ids": [...]}``.
+
+    Round-robin stratification: instances of each source are sorted +
+    shuffled with the given seed, then assigned to folds modulo K.  This
+    guarantees every fold's val set has approximately the same source mix.
+    """
     by_source: dict[str, list[str]] = {}
     for inst in instances:
         by_source.setdefault(inst.get("source", "_"), []).append(inst["instance_id"])

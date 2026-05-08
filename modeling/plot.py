@@ -4,23 +4,24 @@ Reads:
   analysis/
     config.json
     folds.json
-    stage1/epoch_*.json (+ complete.json)
-    stage2/epoch_*.json (+ complete.json)
-    stage3/epoch_*/fold_*.json (+ aggregate.json) (+ complete.json)
     summary.json
-    test_report.json (optional, post-training)
+    phase0/results.json                            (zero-shot baseline)
+    {stage_1_1,stage_1_2,stage_2_3}/
+      epoch_NNN/fold_F.json                        (one per (epoch, fold))
+      epoch_NNN/aggregate.json                     (mean/min/max/std across folds)
+      complete.json                                (stage-completion marker)
 
 Writes:
   analysis/plots/
-    training_curves.png       — losses + val map_50/iou over the full timeline.
-    map_per_iou.png           — final-epoch ap_per_iou bar chart per stage.
-    collapse_diagnostics.png  — mean_score_neg / frac_corner / argmax entropy
-                                 / proto norm over the timeline.
-    per_source_map.png        — per-source map_50/map_5095 curves.
-    cv_envelope.png           — Stage 3: mean ± min/max envelope across folds.
-    eval_report.png           — final test_report.json summary.
+    training_curves.png       — losses + val map_50/iou_mean across all stages
+    map_per_iou.png           — best-epoch ap_per_iou per stage
+    collapse_diagnostics.png  — mean_pred_box_area, mean_existence_prob,
+                                  false_positive_rate over time
+    per_source_map.png        — per-source map_50 / map_5095 curves
+    cv_envelope.png           — mean ± [min, max] envelope across folds per stage
+    phase0_summary.png        — bar chart of zero-shot mAP / IoU per dataset
 
-Single entry point: ``plot_all_from_jsons(analysis_dir)``.
+Single public entry: ``plot_all_from_jsons(analysis_dir)``.
 """
 
 from __future__ import annotations
@@ -35,17 +36,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+STAGES = ("stage_1_1", "stage_1_2", "stage_2_3")
+STAGE_LABELS = {"stage_1_1": "Stage 1.1", "stage_1_2": "Stage 1.2", "stage_2_3": "Stage 2.3"}
+STAGE_COLORS = {"stage_1_1": "#3b82f6", "stage_1_2": "#22c55e", "stage_2_3": "#f97316"}
+
+
 # ---------------------------------------------------------------------------
-# Helpers
+# JSON traversal helpers
 # ---------------------------------------------------------------------------
 
 
-def _load_json(p: Path) -> dict:
-    with open(p) as f:
-        return json.load(f)
+def _load_json(p: Path) -> dict | None:
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return None
 
 
-def _safe_get(d: Any, *keys, default: float = 0.0) -> float:
+def _safe(d: Any, *keys: str, default: float = 0.0) -> float:
     cur = d
     for k in keys:
         if not isinstance(cur, dict) or k not in cur:
@@ -56,309 +67,264 @@ def _safe_get(d: Any, *keys, default: float = 0.0) -> float:
     return default
 
 
-def _stage_epoch_files(analysis_dir: Path, stage: str) -> list[tuple[int, dict]]:
+def _stage_epoch_dirs(analysis_dir: Path, stage: str) -> list[Path]:
     p = analysis_dir / stage
     if not p.exists():
         return []
-    out = []
-    for f in sorted(p.glob("epoch_*.json")):
-        try:
-            out.append((int(f.stem.split("_")[1]), _load_json(f)))
-        except (ValueError, json.JSONDecodeError):
-            continue
+    return sorted(d for d in p.glob("epoch_*") if d.is_dir())
+
+
+def _epoch_id(d: Path) -> int:
+    try:
+        return int(d.name.split("_")[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def _stage_aggregates(analysis_dir: Path, stage: str) -> list[tuple[int, dict]]:
+    out: list[tuple[int, dict]] = []
+    for d in _stage_epoch_dirs(analysis_dir, stage):
+        agg = _load_json(d / "aggregate.json")
+        if agg is not None:
+            out.append((_epoch_id(d), agg))
     return out
 
 
-def _stage3_fold_files(analysis_dir: Path) -> dict[int, list[dict]]:
-    p = analysis_dir / "stage3"
-    if not p.exists():
-        return {}
-    epochs: dict[int, list[dict]] = {}
-    for d in sorted(p.glob("epoch_*")):
-        if not d.is_dir():
-            continue
-        try:
-            ep = int(d.name.split("_")[1])
-        except ValueError:
-            continue
+def _stage_fold_jsons(analysis_dir: Path, stage: str) -> list[tuple[int, list[dict]]]:
+    out: list[tuple[int, list[dict]]] = []
+    for d in _stage_epoch_dirs(analysis_dir, stage):
+        folds: list[dict] = []
         for f in sorted(d.glob("fold_*.json")):
-            try:
-                epochs.setdefault(ep, []).append(_load_json(f))
-            except json.JSONDecodeError:
-                continue
-    return epochs
-
-
-def _stage3_aggregates(analysis_dir: Path) -> list[tuple[int, dict]]:
-    p = analysis_dir / "stage3"
-    if not p.exists():
-        return []
-    out = []
-    for d in sorted(p.glob("epoch_*")):
-        agg = d / "aggregate.json"
-        if agg.exists():
-            try:
-                ep = int(d.name.split("_")[1])
-                out.append((ep, _load_json(agg)))
-            except (ValueError, json.JSONDecodeError):
-                continue
+            j = _load_json(f)
+            if j is not None:
+                folds.append(j)
+        if folds:
+            out.append((_epoch_id(d), folds))
     return out
 
 
 # ---------------------------------------------------------------------------
-# Plots
+# Plotters
 # ---------------------------------------------------------------------------
 
 
-def plot_training_curves(analysis_dir: Path, out_dir: Path) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    timeline_x: list[int] = []
-    timeline_loss: list[float] = []
-    timeline_map: list[float] = []
-    timeline_iou: list[float] = []
-    boundaries: list[tuple[int, str]] = []
+def _plot_training_curves(analysis_dir: Path, plots_dir: Path) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    ax_loss, ax_map, ax_iou, ax_auroc = axes.flatten()
 
-    cum = 0
-    for stage_name in ("stage1", "stage2"):
-        files = _stage_epoch_files(analysis_dir, stage_name)
-        for ep, payload in files:
-            cum += 1
-            timeline_x.append(cum)
-            timeline_loss.append(_safe_get(payload, "train", "loss"))
-            timeline_map.append(_safe_get(payload, "val", "overall", "map_50"))
-            timeline_iou.append(_safe_get(payload, "val", "overall", "iou_mean"))
-        if files:
-            boundaries.append((cum, stage_name))
+    for stage in STAGES:
+        aggs = _stage_aggregates(analysis_dir, stage)
+        if not aggs:
+            continue
+        epochs = [e for e, _ in aggs]
+        loss = [_safe(a, "metrics", "train.loss", "mean") for _, a in aggs]
+        map50 = [_safe(a, "metrics", "val.overall.map_50", "mean") for _, a in aggs]
+        iou = [_safe(a, "metrics", "val.overall.iou_mean", "mean") for _, a in aggs]
+        auroc = [_safe(a, "metrics", "val.overall.existence_auroc", "mean") for _, a in aggs]
+        c = STAGE_COLORS[stage]
+        lbl = STAGE_LABELS[stage]
+        ax_loss.plot(epochs, loss, "-o", color=c, label=lbl)
+        ax_map.plot(epochs, map50, "-o", color=c, label=lbl)
+        ax_iou.plot(epochs, iou, "-o", color=c, label=lbl)
+        ax_auroc.plot(epochs, auroc, "-o", color=c, label=lbl)
 
-    s3_aggs = _stage3_aggregates(analysis_dir)
-    s3_fold_files = _stage3_fold_files(analysis_dir)
-    for ep, agg in s3_aggs:
-        cum += 1
-        timeline_x.append(cum)
-        # Average train.loss across the K fold files of this epoch.
-        folds = s3_fold_files.get(ep, [])
-        if folds:
-            timeline_loss.append(
-                sum(_safe_get(f, "train", "loss") for f in folds) / max(len(folds), 1)
-            )
-        else:
-            timeline_loss.append(0.0)
-        timeline_map.append(
-            _safe_get(agg, "metrics", "val.overall.map_50", "mean")
-        )
-        timeline_iou.append(
-            _safe_get(agg, "metrics", "val.overall.iou_mean", "mean")
-        )
-    if s3_aggs:
-        boundaries.append((cum, "stage3"))
+    for ax, title in zip(
+        (ax_loss, ax_map, ax_iou, ax_auroc),
+        ("Train loss", "Val mAP@50", "Val IoU mean (positives)", "Val existence AUROC"),
+    ):
+        ax.set_xlabel("epoch")
+        ax.set_title(title)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
 
-    axes[0].plot(timeline_x, timeline_loss, marker="o", label="train loss")
-    axes[0].set_ylabel("train loss")
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend(loc="upper right")
-    axes[1].plot(timeline_x, timeline_map, marker="o", color="tab:green", label="val mAP@0.5")
-    axes[1].plot(timeline_x, timeline_iou, marker="o", color="tab:orange", label="val IoU mean")
-    axes[1].set_ylabel("metric")
-    axes[1].set_xlabel("epoch (across all stages)")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend(loc="upper left")
-
-    for x, name in boundaries:
-        for ax in axes:
-            ax.axvline(x + 0.5, color="grey", alpha=0.3, linestyle="--")
-            ax.text(x, ax.get_ylim()[1], name, fontsize=8, alpha=0.6)
-
-    fig.suptitle("Training curves (concatenated across stages)")
     fig.tight_layout()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "training_curves.png", dpi=120)
+    fig.savefig(plots_dir / "training_curves.png", dpi=120)
     plt.close(fig)
 
 
-def plot_map_per_iou(analysis_dir: Path, out_dir: Path) -> None:
-    """ap_per_iou for the last epoch of each stage."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for stage in ("stage1", "stage2"):
-        files = _stage_epoch_files(analysis_dir, stage)
-        if not files:
+def _plot_map_per_iou(analysis_dir: Path, plots_dir: Path) -> None:
+    """Best-epoch (per stage) ap_per_iou bar chart."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    width = 0.25
+    iou_thresholds: list[str] = []
+    bars: dict[str, list[float]] = {}
+    for stage in STAGES:
+        aggs = _stage_aggregates(analysis_dir, stage)
+        if not aggs:
             continue
-        _, payload = files[-1]
-        ap = _safe_get_dict(payload, "val", "overall", "ap_per_iou")
-        if ap:
-            xs = [float(k) for k in sorted(ap)]
-            ys = [ap[f"{x:.2f}"] for x in xs]
-            ax.plot(xs, ys, marker="o", label=stage)
-    s3_aggs = _stage3_aggregates(analysis_dir)
-    if s3_aggs:
-        _, agg = s3_aggs[-1]
-        # Pull mean ap@0.5..0.95 from aggregate metrics.
-        keys = sorted(
-            k for k in agg.get("metrics", {})
-            if k.startswith("val.overall.ap_per_iou.")
+        # Pick the epoch with highest val.overall.map_50.mean.
+        best = max(aggs, key=lambda kv: _safe(kv[1], "metrics", "val.overall.map_50", "mean"))
+        metrics = best[1].get("metrics", {})
+        # Find ap_per_iou keys ─ they're flattened as val.overall.ap_per_iou.<thr>
+        thr_keys = sorted(
+            k for k in metrics if k.startswith("val.overall.ap_per_iou.")
         )
-        if keys:
-            xs = [float(k.split(".")[-1]) for k in keys]
-            ys = [agg["metrics"][k]["mean"] for k in keys]
-            ax.plot(xs, ys, marker="o", label="stage3 (cv-mean)")
+        if not thr_keys:
+            continue
+        iou_thresholds = [k.split(".")[-1] for k in thr_keys]
+        bars[stage] = [_safe(metrics, k, "mean") for k in thr_keys]
+
+    if not bars:
+        plt.close(fig)
+        return
+
+    x = list(range(len(iou_thresholds)))
+    for i, (stage, vals) in enumerate(bars.items()):
+        ax.bar(
+            [xi + (i - 1) * width for xi in x],
+            vals,
+            width=width,
+            color=STAGE_COLORS[stage],
+            label=STAGE_LABELS[stage],
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(iou_thresholds)
     ax.set_xlabel("IoU threshold")
     ax.set_ylabel("AP")
-    ax.set_title("AP per IoU threshold (last epoch of each stage)")
-    ax.grid(True, alpha=0.3)
+    ax.set_title("Best-epoch AP@IoU per stage")
+    ax.grid(axis="y", alpha=0.3)
     ax.legend()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "map_per_iou.png", dpi=120)
+    fig.tight_layout()
+    fig.savefig(plots_dir / "map_per_iou.png", dpi=120)
     plt.close(fig)
 
 
-def _safe_get_dict(d: Any, *keys) -> dict:
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return {}
-        cur = cur[k]
-    return cur if isinstance(cur, dict) else {}
+def _plot_collapse_diagnostics(analysis_dir: Path, plots_dir: Path) -> None:
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    ax_area, ax_existence, ax_fpr = axes
 
+    for stage in STAGES:
+        aggs = _stage_aggregates(analysis_dir, stage)
+        if not aggs:
+            continue
+        epochs = [e for e, _ in aggs]
+        area = [_safe(a, "metrics", "val.overall.mean_pred_box_area", "mean") for _, a in aggs]
+        existence = [
+            _safe(a, "metrics", "val.overall.mean_existence_prob", "mean") for _, a in aggs
+        ]
+        fpr = [_safe(a, "metrics", "val.overall.false_positive_rate", "mean") for _, a in aggs]
+        c = STAGE_COLORS[stage]
+        lbl = STAGE_LABELS[stage]
+        ax_area.plot(epochs, area, "-o", color=c, label=lbl)
+        ax_existence.plot(epochs, existence, "-o", color=c, label=lbl)
+        ax_fpr.plot(epochs, fpr, "-o", color=c, label=lbl)
 
-def plot_collapse_diagnostics(analysis_dir: Path, out_dir: Path) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    keys = [
-        ("mean_score_neg", "presence score on absent"),
-        ("frac_pred_near_corner", "fraction predicted near corner"),
-        ("argmax_cell_entropy", "argmax cell entropy (nats)"),
-        ("support_proto_norm_mean", "support prototype norm (mean)"),
-    ]
-    for ax, (k, title) in zip(axes.flat, keys):
-        xs: list[int] = []
-        ys: list[float] = []
-        cum = 0
-        for stage in ("stage1", "stage2"):
-            for ep, payload in _stage_epoch_files(analysis_dir, stage):
-                cum += 1
-                xs.append(cum)
-                ys.append(_safe_get(payload, "val", "overall", k))
-        for ep, agg in _stage3_aggregates(analysis_dir):
-            cum += 1
-            xs.append(cum)
-            ys.append(_safe_get(agg, "metrics", f"val.overall.{k}", "mean"))
-        ax.plot(xs, ys, marker="o")
+    ax_area.axhline(0.4, color="red", lw=0.7, ls="--", label="collapse threshold (0.4)")
+    ax_existence.axhline(0.9, color="red", lw=0.7, ls="--", label="collapse threshold (0.9)")
+
+    for ax, title, ylim in (
+        (ax_area, "Mean predicted box area", (0, 1)),
+        (ax_existence, "Mean existence_prob", (0, 1)),
+        (ax_fpr, "False-positive rate", (0, 1)),
+    ):
+        ax.set_xlabel("epoch")
         ax.set_title(title)
-        ax.grid(True, alpha=0.3)
-    fig.suptitle("Collapse diagnostics over time")
+        ax.set_ylim(*ylim)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+
     fig.tight_layout()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "collapse_diagnostics.png", dpi=120)
+    fig.savefig(plots_dir / "collapse_diagnostics.png", dpi=120)
     plt.close(fig)
 
 
-def plot_per_source_map(analysis_dir: Path, out_dir: Path) -> None:
-    fig, ax = plt.subplots(figsize=(12, 6))
-    sources = ["vizwiz_base", "vizwiz_novel", "hots", "insdet"]
-    series: dict[str, list[tuple[int, float]]] = {s: [] for s in sources}
-    cum = 0
-    for stage in ("stage1", "stage2"):
-        for ep, payload in _stage_epoch_files(analysis_dir, stage):
-            cum += 1
-            for s in sources:
-                v = _safe_get(payload, "val", "per_source", s, "map_50")
-                series[s].append((cum, v))
-    for ep, agg in _stage3_aggregates(analysis_dir):
-        cum += 1
-        for s in sources:
-            v = _safe_get(agg, "metrics", f"val.per_source.{s}.map_50", "mean")
-            series[s].append((cum, v))
-    for s, pts in series.items():
-        if pts:
-            xs, ys = zip(*pts)
-            ax.plot(xs, ys, marker="o", label=s)
-    ax.set_xlabel("epoch (concatenated)")
-    ax.set_ylabel("mAP@0.5")
-    ax.set_title("Per-source mAP@0.5 over time")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "per_source_map.png", dpi=120)
-    plt.close(fig)
-
-
-def plot_cv_envelope(analysis_dir: Path, out_dir: Path) -> None:
-    """Stage 3 only: mean ± min/max envelope per epoch on val.overall.map_50."""
-    s3_aggs = _stage3_aggregates(analysis_dir)
-    if not s3_aggs:
-        return
-    fig, ax = plt.subplots(figsize=(10, 6))
-    eps = [ep for ep, _ in s3_aggs]
-    means = [_safe_get(agg, "metrics", "val.overall.map_50", "mean") for _, agg in s3_aggs]
-    lows = [_safe_get(agg, "metrics", "val.overall.map_50", "min") for _, agg in s3_aggs]
-    highs = [_safe_get(agg, "metrics", "val.overall.map_50", "max") for _, agg in s3_aggs]
-    ax.plot(eps, means, marker="o", color="tab:green", label="map_50 mean")
-    ax.fill_between(eps, lows, highs, color="tab:green", alpha=0.2, label="min/max across folds")
-    ax.set_xlabel("Stage 3 epoch")
-    ax.set_ylabel("val mAP@0.5")
-    ax.set_title("Stage 3 cross-fold envelope")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "cv_envelope.png", dpi=120)
-    plt.close(fig)
-
-
-def plot_eval_report(analysis_dir: Path, out_dir: Path) -> None:
-    p = analysis_dir / "test_report.json"
-    if not p.exists():
-        return
-    report = _load_json(p)
-    overall = report.get("overall", {})
-    per_source = report.get("per_source", {})
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    keys = ["map_50", "map_5095", "iou_mean", "presence_acc", "presence_auroc",
-            "mean_score_neg", "frac_pred_near_corner"]
-    vals = [_safe_get(overall, k) for k in keys]
-    axes[0].barh(keys, vals, color="tab:blue")
-    axes[0].set_title("Overall test metrics")
-    axes[0].grid(True, alpha=0.3, axis="x")
-
-    sources = list(per_source.keys())
-    if sources:
-        map50s = [_safe_get(per_source[s], "map_50") for s in sources]
-        ious = [_safe_get(per_source[s], "iou_mean") for s in sources]
-        x = range(len(sources))
-        w = 0.35
-        axes[1].bar([i - w / 2 for i in x], map50s, w, label="map_50")
-        axes[1].bar([i + w / 2 for i in x], ious, w, label="iou_mean")
-        axes[1].set_xticks(list(x))
-        axes[1].set_xticklabels(sources, rotation=20)
-        axes[1].set_title("Per-source test metrics")
-        axes[1].grid(True, alpha=0.3, axis="y")
-        axes[1].legend()
+def _plot_per_source_map(analysis_dir: Path, plots_dir: Path) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    ax_50, ax_5095 = axes
+    sources = ("hots", "insdet")
+    for stage in STAGES:
+        aggs = _stage_aggregates(analysis_dir, stage)
+        if not aggs:
+            continue
+        epochs = [e for e, _ in aggs]
+        c = STAGE_COLORS[stage]
+        for src in sources:
+            map50 = [
+                _safe(a, "metrics", f"val.per_source.{src}.map_50", "mean") for _, a in aggs
+            ]
+            map5095 = [
+                _safe(a, "metrics", f"val.per_source.{src}.map_5095", "mean") for _, a in aggs
+            ]
+            ls = "-" if src == "hots" else "--"
+            ax_50.plot(epochs, map50, ls, marker="o", color=c,
+                       label=f"{STAGE_LABELS[stage]} / {src}")
+            ax_5095.plot(epochs, map5095, ls, marker="o", color=c,
+                         label=f"{STAGE_LABELS[stage]} / {src}")
+    for ax, title in ((ax_50, "Per-source mAP@50"), (ax_5095, "Per-source mAP@50-95")):
+        ax.set_xlabel("epoch")
+        ax.set_title(title)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7)
     fig.tight_layout()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "eval_report.png", dpi=120)
+    fig.savefig(plots_dir / "per_source_map.png", dpi=120)
+    plt.close(fig)
+
+
+def _plot_cv_envelope(analysis_dir: Path, plots_dir: Path) -> None:
+    """For each stage, plot mean (line) and [min, max] envelope across folds."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for stage in STAGES:
+        aggs = _stage_aggregates(analysis_dir, stage)
+        if not aggs:
+            continue
+        epochs = [e for e, _ in aggs]
+        means = [_safe(a, "metrics", "val.overall.map_50", "mean") for _, a in aggs]
+        mins = [_safe(a, "metrics", "val.overall.map_50", "min") for _, a in aggs]
+        maxs = [_safe(a, "metrics", "val.overall.map_50", "max") for _, a in aggs]
+        c = STAGE_COLORS[stage]
+        ax.plot(epochs, means, "-o", color=c, label=f"{STAGE_LABELS[stage]} mean")
+        ax.fill_between(epochs, mins, maxs, color=c, alpha=0.15)
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("mAP@50")
+    ax.set_title("Cross-fold mean ± [min, max] of val mAP@50")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(plots_dir / "cv_envelope.png", dpi=120)
+    plt.close(fig)
+
+
+def _plot_phase0(analysis_dir: Path, plots_dir: Path) -> None:
+    p = analysis_dir / "phase0" / "results.json"
+    res = _load_json(p)
+    if res is None:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4))
+    metrics = ("map_50", "map_75", "map_5095", "iou_mean", "existence_auroc")
+    datasets = list(res.keys())
+    width = 0.15
+    x = list(range(len(metrics)))
+    for i, ds in enumerate(datasets):
+        bucket = res[ds].get("overall", {})
+        vals = [float(bucket.get(m, 0.0)) for m in metrics]
+        ax.bar(
+            [xi + (i - len(datasets) / 2) * width for xi in x],
+            vals, width=width, label=ds,
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics, rotation=20)
+    ax.set_title("Phase 0 zero-shot baseline")
+    ax.set_ylim(0, 1)
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(plots_dir / "phase0_summary.png", dpi=120)
     plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Public entry
 # ---------------------------------------------------------------------------
 
 
 def plot_all_from_jsons(analysis_dir: str | Path) -> None:
     analysis_dir = Path(analysis_dir)
-    out_dir = analysis_dir / "plots"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    plot_training_curves(analysis_dir, out_dir)
-    plot_map_per_iou(analysis_dir, out_dir)
-    plot_collapse_diagnostics(analysis_dir, out_dir)
-    plot_per_source_map(analysis_dir, out_dir)
-    plot_cv_envelope(analysis_dir, out_dir)
-    plot_eval_report(analysis_dir, out_dir)
-    print(f"plots written to {out_dir}")
-
-
-if __name__ == "__main__":
-    import argparse
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--analysis-dir", default="analysis")
-    args = p.parse_args()
-    plot_all_from_jsons(args.analysis_dir)
+    plots_dir = analysis_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    _plot_training_curves(analysis_dir, plots_dir)
+    _plot_map_per_iou(analysis_dir, plots_dir)
+    _plot_collapse_diagnostics(analysis_dir, plots_dir)
+    _plot_per_source_map(analysis_dir, plots_dir)
+    _plot_cv_envelope(analysis_dir, plots_dir)
+    _plot_phase0(analysis_dir, plots_dir)
+    print(f"plots written to {plots_dir}")

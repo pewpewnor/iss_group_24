@@ -1,67 +1,53 @@
-"""Evaluation pipeline for the few-shot Siamese localiser.
+"""Evaluation pipeline for the OWLv2 few-shot localizer.
 
-Outputs the kitchen-sink metric set used both at training-time validation
-(per epoch / per fold JSON) and at the post-training test evaluation:
+Returns the kitchen-sink metric set:
 
   Localisation:
     iou_mean / iou_median / iou_p25 / iou_p75
     contain_mean / contain_at_iou_50 / contain_at_iou_75
 
   mAP:
-    map_50, map_5095, ap_per_iou (10 thresholds 0.50:0.05:0.95)
+    map_50, map_75, map_5095, ap_per_iou (10 thresholds)
     f1_50, precision_50, recall_50
 
-  Presence (image-level):
-    presence_acc / _pos / _neg
+  Existence (image-level):
+    existence_acc / acc_pos / acc_neg
+    existence_auroc, existence_pr_auc, existence_brier, existence_f1
+    false_positive_rate, false_negative_rate
     mean_score_pos / mean_score_neg
-    presence_auroc, presence_pr_auc, presence_brier
 
   Collapse diagnostics:
-    frac_pred_near_corner, frac_pred_tiny_box
-    argmax_cell_entropy, conf_map_mean/std_pos/neg
-    support_proto_norm_mean / std
+    mean_pred_box_area, frac_pred_box_too_big
+    mean_existence_prob, frac_high_existence
+    prototype_norm_mean / std
 
-  per_source: same metric set bucketed by inst.source.
-
-Inference uses ``decode_topk`` (top-K + NMS, presence-gated). Two-scale TTA
-(224 + 288) merges decoded boxes via additional NMS.
+  per_source: same metrics bucketed by inst.source.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
 import math
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torchvision.ops import batched_nms
 
-from modeling.dataset import EpisodeDataset, collate
-from modeling.loss import _containment_ratio, _iou_xyxy
-from modeling.model import FewShotLocalizer, decode_topk
+from modeling.loss import _containment_ratio, _cxcywh_to_xyxy, _iou_xyxy
+from modeling.model import OWLv2FewShotLocalizer
 
 
 IOU_THRESHOLDS: tuple[float, ...] = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
 
 
 # ---------------------------------------------------------------------------
-# Top-K AP utilities
+# Metric helpers
 # ---------------------------------------------------------------------------
 
 
-def _detections_to_pr_ap(
-    detections: list[tuple[float, bool]], n_gt: int
-) -> float:
-    """Return COCO-style 101-point AP from a flat list of (score, is_tp).
-
-    n_gt is the total positive count. Detections is a list across all images
-    (each image may contribute multiple detections after top-K + NMS).
-    """
+def _detections_to_ap(detections: list[tuple[float, bool]], n_gt: int) -> float:
+    """COCO-style 101-point AP from a flat list of (score, is_tp)."""
     if n_gt == 0 or not detections:
         return 0.0
     order = sorted(range(len(detections)), key=lambda i: -detections[i][0])
@@ -91,14 +77,12 @@ def _detections_to_pr_ap(
 
 
 def _binary_auroc(scores: list[float], labels: list[bool]) -> float:
-    """ROC-AUC by Mann-Whitney U-statistic."""
     pos = [s for s, y in zip(scores, labels) if y]
     neg = [s for s, y in zip(scores, labels) if not y]
     if not pos or not neg:
         return 0.0
     n_pos = len(pos)
     n_neg = len(neg)
-    # Combine, rank, average ranks for ties.
     combined = [(s, 1) for s in pos] + [(s, 0) for s in neg]
     combined.sort(key=lambda x: x[0])
     ranks = [0.0] * len(combined)
@@ -120,8 +104,7 @@ def _binary_pr_auc(scores: list[float], labels: list[bool]) -> float:
     if not labels or not any(labels):
         return 0.0
     order = sorted(range(len(scores)), key=lambda i: -scores[i])
-    tp = 0
-    fp = 0
+    tp = fp = 0
     precisions: list[float] = []
     recalls: list[float] = []
     n_pos = sum(labels)
@@ -132,7 +115,6 @@ def _binary_pr_auc(scores: list[float], labels: list[bool]) -> float:
             fp += 1
         precisions.append(tp / (tp + fp))
         recalls.append(tp / n_pos)
-    # Riemann-sum AUC under the PR curve.
     auc = 0.0
     prev_r = 0.0
     for p, r in zip(precisions, recalls):
@@ -156,140 +138,144 @@ def _quantile(values: list[float], q: float) -> float:
     return s[lo] * (1 - frac) + s[hi] * frac
 
 
-def _entropy_nats(probs: list[float]) -> float:
-    if not probs:
+def _safe_mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _safe_std(xs: list[float]) -> float:
+    if len(xs) < 2:
         return 0.0
-    s = sum(probs)
-    if s <= 0:
-        return 0.0
-    return -sum((p / s) * math.log((p / s) + 1e-12) for p in probs if p > 0)
+    m = _safe_mean(xs)
+    return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
 
 
 # ---------------------------------------------------------------------------
-# TTA helpers
-# ---------------------------------------------------------------------------
-
-
-def _resize_query(query_img: torch.Tensor, target: int) -> torch.Tensor:
-    if query_img.shape[-1] == target and query_img.shape[-2] == target:
-        return query_img
-    return F.interpolate(query_img, size=(target, target), mode="bilinear", align_corners=False)
-
-
-def _scale_boxes(boxes: torch.Tensor, src: int, dst: int) -> torch.Tensor:
-    if src == dst or boxes.numel() == 0:
-        return boxes
-    s = dst / float(src)
-    return boxes * s
-
-
-def _hflip_boxes(boxes: torch.Tensor, img_size: int) -> torch.Tensor:
-    """Flip xyxy boxes horizontally about an image of size ``img_size``."""
-    if boxes.numel() == 0:
-        return boxes
-    flipped = boxes.clone()
-    flipped[:, 0] = img_size - boxes[:, 2]
-    flipped[:, 2] = img_size - boxes[:, 0]
-    return flipped
-
-
-@torch.no_grad()
-def predict_topk_tta(
-    model: FewShotLocalizer,
-    support_imgs: torch.Tensor,
-    query_img: torch.Tensor,
-    base_size: int = 224,
-    tta_sizes: tuple[int, ...] = (224, 288),
-    top_k: int = 100,
-    conf_thr: float = 0.05,
-    nms_iou: float = 0.5,
-    use_hflip: bool = True,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], dict]:
-    """Multi-scale + horizontal-flip TTA. Decode at each (scale, flip) combo,
-    transform boxes back to ``base_size`` un-flipped coords, NMS-merge.
-
-    Args:
-        use_hflip: if True, run a second pass with the query (and supports for
-            consistency) horizontally flipped, then mirror the boxes back.
-    """
-    diags: dict[str, Any] = {"presence_score": None, "conf_map_p4": None,
-                             "argmax_cell": None, "support_proto_norm": None}
-
-    all_boxes: list[list[torch.Tensor]] = []
-    all_scores: list[list[torch.Tensor]] = []
-
-    for ti, sz in enumerate(tta_sizes):
-        q = _resize_query(query_img, sz)
-        out = model(support_imgs, q)
-        if ti == 0:
-            diags["presence_score"] = torch.sigmoid(out["presence_logit"]).detach().cpu()
-            cp4 = out["conf_p4"].detach().sigmoid().cpu()
-            diags["conf_map_p4"] = cp4
-            B, _, H, W = cp4.shape
-            flat = cp4.view(B, -1)
-            diags["argmax_cell"] = flat.argmax(dim=1)
-            diags["support_proto_norm"] = out["prototype"].detach().norm(dim=-1).cpu()
-        boxes_pi, scores_pi = decode_topk(
-            out, img_size=sz, top_k=top_k, conf_thr=conf_thr, nms_iou=nms_iou
-        )
-        boxes_pi = [_scale_boxes(b, src=sz, dst=base_size) for b in boxes_pi]
-        all_boxes.append(boxes_pi)
-        all_scores.append(scores_pi)
-
-        if use_hflip:
-            q_flip = torch.flip(q, dims=(-1,))
-            support_flip = torch.flip(support_imgs, dims=(-1,))
-            out_f = model(support_flip, q_flip)
-            boxes_pi_f, scores_pi_f = decode_topk(
-                out_f, img_size=sz, top_k=top_k, conf_thr=conf_thr, nms_iou=nms_iou
-            )
-            # Mirror boxes back to the un-flipped frame, then scale to base_size.
-            boxes_pi_f = [_hflip_boxes(b, sz) for b in boxes_pi_f]
-            boxes_pi_f = [_scale_boxes(b, src=sz, dst=base_size) for b in boxes_pi_f]
-            all_boxes.append(boxes_pi_f)
-            all_scores.append(scores_pi_f)
-
-    B = len(all_boxes[0])
-    out_boxes: list[torch.Tensor] = []
-    out_scores: list[torch.Tensor] = []
-    n_passes = len(all_boxes)
-    for i in range(B):
-        bx = torch.cat([all_boxes[t][i] for t in range(n_passes)], dim=0)
-        sc = torch.cat([all_scores[t][i] for t in range(n_passes)], dim=0)
-        if bx.numel() == 0:
-            out_boxes.append(bx)
-            out_scores.append(sc)
-            continue
-        cls = torch.zeros_like(sc, dtype=torch.long)
-        keep = batched_nms(bx, sc, cls, iou_threshold=nms_iou)
-        bx = bx[keep][:top_k]
-        sc = sc[keep][:top_k]
-        out_boxes.append(bx)
-        out_scores.append(sc)
-    return out_boxes, out_scores, diags
-
-
-# ---------------------------------------------------------------------------
-# Aggregation buckets
+# Per-image bucket
 # ---------------------------------------------------------------------------
 
 
 def _empty_bucket() -> dict[str, list]:
     return {
-        "iou": [],                      # IoU of top-1 box vs GT (present episodes only)
-        "contain": [],                  # containment of top-1 box (present only)
-        "presence_score": [],           # σ(presence_logit) per image
-        "is_present": [],               # bool per image
-        "topk_detections": [],          # list of (score, is_tp_at_iou_thresholds_dict)
-        "frac_corner": [],
-        "frac_tiny": [],
-        "argmax_cell_entropy_running": [],
-        "conf_mean_pos": [],
-        "conf_mean_neg": [],
-        "conf_std_pos": [],
-        "conf_std_neg": [],
-        "support_proto_norms": [],
+        "iou": [],
+        "contain": [],
+        "score": [],
+        "is_present": [],
+        "pred_box_area": [],
+        "existence_prob": [],
+        "prototype_norm": [],
     }
+
+
+def _bucket_metrics(b: dict[str, list], score_thr: float = 0.5) -> dict[str, float]:
+    n = len(b["is_present"])
+    n_pos = sum(b["is_present"])
+    n_neg = n - n_pos
+    out: dict[str, float] = {"n": n, "n_pos": n_pos, "n_neg": n_neg}
+    if n == 0:
+        return out
+
+    # Localisation (positive-only).
+    pos_iou = [iou for iou, p in zip(b["iou"], b["is_present"]) if p]
+    pos_cont = [c for c, p in zip(b["contain"], b["is_present"]) if p]
+    out["iou_mean"] = _safe_mean(pos_iou)
+    out["iou_median"] = _quantile(pos_iou, 0.5)
+    out["iou_p25"] = _quantile(pos_iou, 0.25)
+    out["iou_p75"] = _quantile(pos_iou, 0.75)
+    out["contain_mean"] = _safe_mean(pos_cont)
+    out["contain_at_iou_50"] = (
+        sum(1 for iou, c in zip(pos_iou, pos_cont) if iou >= 0.5) / max(len(pos_iou), 1)
+    )
+    out["contain_at_iou_75"] = (
+        sum(1 for iou, c in zip(pos_iou, pos_cont) if iou >= 0.75) / max(len(pos_iou), 1)
+    )
+
+    # mAP — one detection per image (top-1 box of the model).
+    # TP at IoU threshold = is_present AND IoU(pred, gt) >= threshold AND existence_prob > 0.5.
+    # FP = (existence_prob > 0.5 AND not present) OR (positive AND IoU < threshold).
+    final_score = b["existence_prob"]                          # use existence_prob as ranking score
+    ap_per_iou: dict[str, float] = {}
+    for thr in IOU_THRESHOLDS:
+        detections = []
+        for iou, score, present, ex in zip(
+            b["iou"], b["score"], b["is_present"], b["existence_prob"]
+        ):
+            if ex < 0.05:
+                continue                                       # too low to count even as FP under top-K=1 setting
+            is_tp = present and (iou >= thr)
+            detections.append((float(ex), bool(is_tp)))
+        ap = _detections_to_ap(detections, n_gt=n_pos)
+        ap_per_iou[f"{thr:.2f}"] = ap
+    out["ap_per_iou"] = ap_per_iou
+    out["map_50"] = ap_per_iou.get("0.50", 0.0)
+    out["map_75"] = ap_per_iou.get("0.75", 0.0)
+    out["map_5095"] = _safe_mean(list(ap_per_iou.values()))
+
+    # P/R/F1 at IoU=0.50.
+    tp = sum(1 for iou, p, ex in zip(b["iou"], b["is_present"], b["existence_prob"])
+             if p and iou >= 0.5 and ex > score_thr)
+    fp = sum(1 for p, ex in zip(b["is_present"], b["existence_prob"])
+             if (not p and ex > score_thr) or
+                (p and ex > score_thr and 0))                  # high-IoU pos already counted as tp
+    fp += sum(1 for iou, p, ex in zip(b["iou"], b["is_present"], b["existence_prob"])
+              if p and ex > score_thr and iou < 0.5)
+    fn_pos = sum(1 for iou, p, ex in zip(b["iou"], b["is_present"], b["existence_prob"])
+                 if p and (ex <= score_thr or iou < 0.5))
+    fn = sum(1 for p, ex in zip(b["is_present"], b["existence_prob"])
+             if p and ex <= score_thr)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(n_pos, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-6)
+    out["precision_50"] = precision
+    out["recall_50"] = recall
+    out["f1_50"] = f1
+
+    # Existence (image-level).
+    pred_pos = [ex > score_thr for ex in b["existence_prob"]]
+    correct = [pp == p for pp, p in zip(pred_pos, b["is_present"])]
+    out["existence_acc"] = _safe_mean([1.0 if c else 0.0 for c in correct])
+    if n_pos:
+        out["existence_acc_pos"] = _safe_mean(
+            [1.0 if pp else 0.0 for pp, p in zip(pred_pos, b["is_present"]) if p]
+        )
+    else:
+        out["existence_acc_pos"] = 0.0
+    if n_neg:
+        out["existence_acc_neg"] = _safe_mean(
+            [1.0 if not pp else 0.0 for pp, p in zip(pred_pos, b["is_present"]) if not p]
+        )
+    else:
+        out["existence_acc_neg"] = 0.0
+    out["existence_auroc"] = _binary_auroc(b["existence_prob"], b["is_present"])
+    out["existence_pr_auc"] = _binary_pr_auc(b["existence_prob"], b["is_present"])
+    out["existence_brier"] = _safe_mean(
+        [(ex - (1.0 if p else 0.0)) ** 2 for ex, p in zip(b["existence_prob"], b["is_present"])]
+    )
+    out["existence_f1"] = f1                                   # equal to f1_50 by construction
+    out["false_positive_rate"] = (
+        sum(1 for pp, p in zip(pred_pos, b["is_present"]) if pp and not p) / max(n_neg, 1)
+    )
+    out["false_negative_rate"] = (
+        sum(1 for pp, p in zip(pred_pos, b["is_present"]) if (not pp) and p) / max(n_pos, 1)
+    )
+    out["mean_score_pos"] = _safe_mean(
+        [ex for ex, p in zip(b["existence_prob"], b["is_present"]) if p]
+    )
+    out["mean_score_neg"] = _safe_mean(
+        [ex for ex, p in zip(b["existence_prob"], b["is_present"]) if not p]
+    )
+
+    # Collapse diagnostics.
+    out["mean_pred_box_area"] = _safe_mean(b["pred_box_area"])
+    out["frac_pred_box_too_big"] = (
+        sum(1 for a in b["pred_box_area"] if a > 0.4) / max(len(b["pred_box_area"]), 1)
+    )
+    out["mean_existence_prob"] = _safe_mean(b["existence_prob"])
+    out["frac_high_existence"] = (
+        sum(1 for ex in b["existence_prob"] if ex > 0.9) / max(len(b["existence_prob"]), 1)
+    )
+    out["prototype_norm_mean"] = _safe_mean(b["prototype_norm"])
+    out["prototype_norm_std"] = _safe_std(b["prototype_norm"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -299,374 +285,163 @@ def _empty_bucket() -> dict[str, list]:
 
 @torch.no_grad()
 def evaluate(
-    model: FewShotLocalizer,
+    model: OWLv2FewShotLocalizer,
     loader: DataLoader,
     device: torch.device,
     score_thr: float = 0.5,
-    iou_thr: float = 0.5,
-    img_size: int = 224,
-    use_tta: bool = True,
-    tta_sizes: tuple[int, ...] = (224, 288),
-    use_hflip: bool = True,
-    top_k: int = 100,
-    conf_thr: float = 0.03,
-    nms_iou: float = 0.5,
-    near_corner_px: int = 16,
-    tiny_box_frac: float = 0.05,
-) -> dict:
+) -> dict[str, Any]:
     """Run evaluation and return the kitchen-sink metric dict.
 
-    The returned dict has top-level keys:
-      ``overall``      — summary across all episodes.
-      ``per_source``   — same summary bucketed by source.
-      ``score_thr`` / ``iou_thr`` — echoed config.
+    Returns:
+        {
+          "overall": {...},
+          "per_source": {"hots": {...}, "insdet": {...}, "vizwiz_novel": {...}}
+        }
     """
     model.eval()
     overall = _empty_bucket()
     per_source: dict[str, dict[str, list]] = defaultdict(_empty_bucket)
-    # Accumulator for the (cy, cx) histogram entropy (single across the run).
-    argmax_hist: dict[int, int] = {}
 
     for batch in loader:
         support_imgs = batch["support_imgs"].to(device)
         query_img = batch["query_img"].to(device)
-        gt_bbox = batch["query_bbox"].to(device)
+        gt_bbox = batch["query_bbox"].to(device)                # cxcywh normalised
         is_present = batch["is_present"].to(device)
-        sources = batch.get("source", ["unknown"] * gt_bbox.shape[0])
+        sources = batch["source"]
 
-        if use_tta:
-            boxes_pi, scores_pi, diags = predict_topk_tta(
-                model,
-                support_imgs,
-                query_img,
-                base_size=img_size,
-                tta_sizes=tta_sizes,
-                top_k=top_k,
-                conf_thr=conf_thr,
-                nms_iou=nms_iou,
-                use_hflip=use_hflip,
-            )
-        else:
-            out = model(support_imgs, query_img)
-            boxes_pi, scores_pi = decode_topk(
-                out,
-                img_size=img_size,
-                top_k=top_k,
-                conf_thr=conf_thr,
-                nms_iou=nms_iou,
-            )
-            diags = {
-                "presence_score": torch.sigmoid(out["presence_logit"]).detach().cpu(),
-                "conf_map_p4": out["conf_p4"].detach().sigmoid().cpu(),
-                "argmax_cell": out["conf_p4"].view(out["conf_p4"].shape[0], -1).argmax(dim=1).cpu(),
-                "support_proto_norm": out["prototype"].detach().norm(dim=-1).cpu(),
-            }
+        out = model(support_imgs, query_img)
 
-        B = gt_bbox.shape[0]
-        presence_score = diags["presence_score"]
-        conf_map = diags["conf_map_p4"]                                              # (B,1,H,W)
-        argmax_cell = diags["argmax_cell"]
-        proto_norms = diags["support_proto_norm"]
+        pred_box = out["best_box"]                              # (B, 4) cxcywh
+        existence_prob = out["existence_prob"]
+        score = torch.sigmoid(out["best_score"])                # alternate score signal
+        prototype = out["prototype"]
 
-        for i in range(B):
-            present = bool(is_present[i].item())
-            score = float(presence_score[i].item())
-            src = sources[i] if i < len(sources) else "unknown"
+        pred_xyxy = _cxcywh_to_xyxy(pred_box).clamp(0, 1)
+        gt_xyxy = _cxcywh_to_xyxy(gt_bbox).clamp(0, 1)
+        iou = _iou_xyxy(pred_xyxy, gt_xyxy)
+        contain = _containment_ratio(pred_xyxy, gt_xyxy)
+        pred_area = (pred_box[..., 2].clamp(0, 1) * pred_box[..., 3].clamp(0, 1))
 
-            # Top-1 box for IoU/contain metrics.
-            if boxes_pi[i].numel() > 0:
-                box1 = boxes_pi[i][0:1]
-                iou_v = float(_iou_xyxy(box1[0], gt_bbox[i]).item()) if present else 0.0
-                contain_v = float(_containment_ratio(box1[0], gt_bbox[i]).item()) if present else 0.0
-            else:
-                iou_v = 0.0
-                contain_v = 0.0
-
-            # Detection-list for AP: every NMS-survivor with its (score, is_tp_dict).
-            det_entries: list[tuple[float, dict[float, bool]]] = []
-            n_dets = boxes_pi[i].shape[0]
-            for j in range(n_dets):
-                sc_j = float(scores_pi[i][j].item())
-                if present:
-                    iou_ij = float(_iou_xyxy(boxes_pi[i][j], gt_bbox[i]).item())
-                    is_tp = {tau: iou_ij >= tau for tau in IOU_THRESHOLDS}
-                else:
-                    is_tp = {tau: False for tau in IOU_THRESHOLDS}
-                det_entries.append((sc_j, is_tp))
-
-            # Collapse diagnostics — top-1 box only.
-            if boxes_pi[i].numel() > 0:
-                bx = boxes_pi[i][0]
-                cx = float(((bx[0] + bx[2]) * 0.5).item())
-                cy = float(((bx[1] + bx[3]) * 0.5).item())
-                near_corner = (
-                    cx <= near_corner_px or cy <= near_corner_px
-                    or cx >= img_size - near_corner_px or cy >= img_size - near_corner_px
-                )
-                area = max(0.0, float((bx[2] - bx[0]).item())) * max(
-                    0.0, float((bx[3] - bx[1]).item())
-                )
-                tiny = area < (tiny_box_frac * img_size * img_size)
-            else:
-                near_corner = False
-                tiny = False
-
-            cm = conf_map[i, 0]                                                       # (H, W)
-            cm_mean = float(cm.mean().item())
-            cm_std = float(cm.std().item())
-
-            # Argmax cell histogram (combined across sources/folds).
-            ac = int(argmax_cell[i].item())
-            argmax_hist[ac] = argmax_hist.get(ac, 0) + 1
-
-            for bucket in (overall, per_source[src]):
-                bucket["iou"].append(iou_v)
-                bucket["contain"].append(contain_v)
-                bucket["presence_score"].append(score)
-                bucket["is_present"].append(present)
-                bucket["topk_detections"].append(det_entries)
-                bucket["frac_corner"].append(1.0 if near_corner else 0.0)
-                bucket["frac_tiny"].append(1.0 if tiny else 0.0)
-                if present:
-                    bucket["conf_mean_pos"].append(cm_mean)
-                    bucket["conf_std_pos"].append(cm_std)
-                else:
-                    bucket["conf_mean_neg"].append(cm_mean)
-                    bucket["conf_std_neg"].append(cm_std)
-                bucket["support_proto_norms"].append(float(proto_norms[i].item()))
-
-    def _summarise(b: dict[str, list]) -> dict:
-        n = len(b["is_present"])
-        if n == 0:
-            return {}
-        n_pos = sum(b["is_present"])
-        n_neg = n - n_pos
-
-        # Localisation
-        ious_pos = [v for v, p in zip(b["iou"], b["is_present"]) if p]
-        contains_pos = [v for v, p in zip(b["contain"], b["is_present"]) if p]
-        iou_mean = sum(ious_pos) / max(len(ious_pos), 1)
-        contain_mean = sum(contains_pos) / max(len(contains_pos), 1)
-        contain_at_50 = sum(
-            1 for v, c, p in zip(b["iou"], b["contain"], b["is_present"]) if p and v >= 0.5
-        ) / max(n_pos, 1)
-        contain_at_75 = sum(
-            1 for v, c, p in zip(b["iou"], b["contain"], b["is_present"]) if p and v >= 0.75
-        ) / max(n_pos, 1)
-
-        # mAP via flattened detection list across episodes.
-        ap_per_iou: dict[str, float] = {}
-        for tau in IOU_THRESHOLDS:
-            flat: list[tuple[float, bool]] = []
-            for episode_dets in b["topk_detections"]:
-                for sc, is_tp in episode_dets:
-                    flat.append((sc, is_tp[tau]))
-            ap_per_iou[f"{tau:.2f}"] = round(_detections_to_pr_ap(flat, n_pos), 4)
-        map_5095 = sum(ap_per_iou.values()) / len(ap_per_iou)
-        map_50 = ap_per_iou["0.50"]
-
-        # F1 / precision / recall at IoU=0.5 — compute over top-1 detection per image.
-        tp_50 = sum(1 for v, p in zip(b["iou"], b["is_present"]) if p and v >= 0.5)
-        fp_50 = sum(1 for v, p in zip(b["iou"], b["is_present"]) if not p and False) + sum(
-            1 for v, p, ps in zip(b["iou"], b["is_present"], b["presence_score"])
-            if (not p) and ps >= 0.5
-        )
-        fn_50 = sum(1 for v, p in zip(b["iou"], b["is_present"]) if p and v < 0.5)
-        prec_50 = tp_50 / max(tp_50 + fp_50, 1)
-        rec_50 = tp_50 / max(n_pos, 1)
-        f1_50 = 2 * prec_50 * rec_50 / max(prec_50 + rec_50, 1e-6) if (prec_50 + rec_50) > 0 else 0.0
-
-        # Presence
-        pres_correct = sum(((s >= 0.5) == p) for s, p in zip(b["presence_score"], b["is_present"]))
-        pres_acc_pos = sum(
-            1 for s, p in zip(b["presence_score"], b["is_present"]) if p and s >= 0.5
-        ) / max(n_pos, 1)
-        pres_acc_neg = sum(
-            1 for s, p in zip(b["presence_score"], b["is_present"]) if not p and s < 0.5
-        ) / max(n_neg, 1)
-        mean_score_pos = sum(
-            s for s, p in zip(b["presence_score"], b["is_present"]) if p
-        ) / max(n_pos, 1)
-        mean_score_neg = sum(
-            s for s, p in zip(b["presence_score"], b["is_present"]) if not p
-        ) / max(n_neg, 1)
-        auroc = _binary_auroc(b["presence_score"], b["is_present"])
-        pr_auc = _binary_pr_auc(b["presence_score"], b["is_present"])
-        brier = sum(
-            (s - (1.0 if p else 0.0)) ** 2 for s, p in zip(b["presence_score"], b["is_present"])
-        ) / max(n, 1)
-
-        # Collapse diags
-        frac_corner = sum(b["frac_corner"]) / max(n, 1)
-        frac_tiny = sum(b["frac_tiny"]) / max(n, 1)
-
-        proto_norms = b["support_proto_norms"]
-        proto_mean = sum(proto_norms) / max(len(proto_norms), 1)
-        proto_std = (
-            (sum((x - proto_mean) ** 2 for x in proto_norms) / len(proto_norms)) ** 0.5
-            if proto_norms
-            else 0.0
-        )
-
-        return {
-            "n": n,
-            "n_pos": n_pos,
-            "n_neg": n_neg,
-            "iou_mean": round(iou_mean, 4),
-            "iou_median": round(_quantile(ious_pos, 0.5), 4),
-            "iou_p25": round(_quantile(ious_pos, 0.25), 4),
-            "iou_p75": round(_quantile(ious_pos, 0.75), 4),
-            "contain_mean": round(contain_mean, 4),
-            "contain_at_iou_50": round(contain_at_50, 4),
-            "contain_at_iou_75": round(contain_at_75, 4),
-            "map_50": round(map_50, 4),
-            "map_5095": round(map_5095, 4),
-            "ap_per_iou": ap_per_iou,
-            "f1_50": round(f1_50, 4),
-            "precision_50": round(prec_50, 4),
-            "recall_50": round(rec_50, 4),
-            "presence_acc": round(pres_correct / n, 4),
-            "presence_acc_pos": round(pres_acc_pos, 4),
-            "presence_acc_neg": round(pres_acc_neg, 4),
-            "mean_score_pos": round(mean_score_pos, 4),
-            "mean_score_neg": round(mean_score_neg, 4),
-            "presence_auroc": round(auroc, 4),
-            "presence_pr_auc": round(pr_auc, 4),
-            "presence_brier": round(brier, 4),
-            "frac_pred_near_corner": round(frac_corner, 4),
-            "frac_pred_tiny_box": round(frac_tiny, 4),
-            "conf_map_mean_pos": round(
-                sum(b["conf_mean_pos"]) / max(len(b["conf_mean_pos"]), 1), 4
-            ),
-            "conf_map_mean_neg": round(
-                sum(b["conf_mean_neg"]) / max(len(b["conf_mean_neg"]), 1), 4
-            ),
-            "conf_map_std_pos": round(
-                sum(b["conf_std_pos"]) / max(len(b["conf_std_pos"]), 1), 4
-            ),
-            "conf_map_std_neg": round(
-                sum(b["conf_std_neg"]) / max(len(b["conf_std_neg"]), 1), 4
-            ),
-            "support_proto_norm_mean": round(proto_mean, 4),
-            "support_proto_norm_std": round(proto_std, 4),
-        }
-
-    overall_summary = _summarise(overall)
-    overall_summary["argmax_cell_entropy"] = round(
-        _entropy_nats(list(argmax_hist.values())), 4
-    )
+        b = pred_box.size(0)
+        for i in range(b):
+            entry_iou = float(iou[i].item())
+            entry_contain = float(contain[i].item())
+            entry_score = float(score[i].item())
+            entry_present = bool(is_present[i].item())
+            entry_area = float(pred_area[i].item())
+            entry_existence = float(existence_prob[i].item())
+            entry_pnorm = float(prototype[i].norm().item())
+            for bucket in (overall, per_source[sources[i]]):
+                bucket["iou"].append(entry_iou)
+                bucket["contain"].append(entry_contain)
+                bucket["score"].append(entry_score)
+                bucket["is_present"].append(entry_present)
+                bucket["pred_box_area"].append(entry_area)
+                bucket["existence_prob"].append(entry_existence)
+                bucket["prototype_norm"].append(entry_pnorm)
 
     return {
-        "overall": overall_summary,
-        "per_source": {k: _summarise(v) for k, v in per_source.items()},
-        "score_thr": score_thr,
-        "iou_thr": iou_thr,
-        "img_size": img_size,
-        "tta_sizes": list(tta_sizes) if use_tta else [img_size],
+        "overall": _bucket_metrics(overall, score_thr),
+        "per_source": {k: _bucket_metrics(v, score_thr) for k, v in per_source.items()},
     }
 
 
 # ---------------------------------------------------------------------------
-# CLI runner
+# Phase 0 — zero-shot OWLv2 baseline
 # ---------------------------------------------------------------------------
 
 
-def run(
-    checkpoint: str | Path,
-    manifest: str | Path = "dataset/cleaned/manifest.json",
-    split: str = "test",
-    data_root: str | Path | None = None,
-    episodes: int = 600,
-    batch_size: int = 8,
-    num_workers: int = 2,
-    neg_prob: float = 0.5,
+@torch.no_grad()
+def evaluate_phase0(
+    owlv2_model,
+    loader: DataLoader,
+    device: torch.device,
     score_thr: float = 0.5,
-    iou_thr: float = 0.5,
-    seed: int = 42,
-    device: str | None = None,
-    report: str | Path = "analysis/test_report.json",
-    use_tta: bool = True,
-) -> dict:
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    device_t = torch.device(device)
+) -> dict[str, Any]:
+    """Zero-shot OWLv2 image-guided detection.
 
-    model = FewShotLocalizer(pretrained=False).to(device_t)
-    state = torch.load(str(checkpoint), map_location=device_t, weights_only=False)
-    model.load_state_dict(state["model"] if "model" in state else state, strict=False)
+    For each episode, run image-guided detection 4 times (one per support)
+    and average the per-patch logits.  Top-1 box → predicted bbox.
+    Existence = sigmoid(max averaged logit).
+    """
+    from modeling.loss import _cxcywh_to_xyxy as _to_xyxy
 
-    ds = EpisodeDataset(
-        manifest_path=str(manifest),
-        split=split,
-        data_root=str(data_root) if data_root else None,
-        episodes_per_epoch=episodes,
-        train=False,
-        augment=False,
-        seed=seed,
-    )
-    ds.set_neg_prob(neg_prob)
+    owlv2_model.eval()
+    overall = _empty_bucket()
+    per_source: dict[str, dict[str, list]] = defaultdict(_empty_bucket)
 
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate,
-        pin_memory=(device_t.type == "cuda"),
-    )
+    for batch in loader:
+        support_imgs = batch["support_imgs"].to(device)         # (B, 4, 3, S, S)
+        query_img = batch["query_img"].to(device)               # (B, 3, S, S)
+        gt_bbox = batch["query_bbox"]
+        is_present = batch["is_present"]
+        sources = batch["source"]
 
-    result = evaluate(
-        model,
-        loader,
-        device_t,
-        score_thr=score_thr,
-        iou_thr=iou_thr,
-        use_tta=use_tta,
-    )
-    out_path = Path(report)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(result, f, indent=2)
-    print(f"report -> {out_path}")
-    print(json.dumps(result["overall"], indent=2))
-    return result
+        b, v, c, s, _ = support_imgs.shape
 
+        # Compute query feature map once.
+        q_feature_map, _ = owlv2_model.image_embedder(
+            pixel_values=query_img, interpolate_pos_encoding=True
+        )                                                        # (B, gh, gw, D)
+        gh, gw, d = q_feature_map.shape[1:]
+        image_feats = q_feature_map.reshape(b, gh * gw, d)
+        target_pred_boxes = owlv2_model.box_predictor(
+            image_feats, q_feature_map, interpolate_pos_encoding=True
+        )                                                        # (B, P, 4) cxcywh
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--manifest", default="dataset/cleaned/manifest.json")
-    p.add_argument("--split", default="test")
-    p.add_argument("--data-root", default=None)
-    p.add_argument("--episodes", type=int, default=600)
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--neg-prob", type=float, default=0.5)
-    p.add_argument("--score-thr", type=float, default=0.5)
-    p.add_argument("--iou-thr", type=float, default=0.5)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", default=None)
-    p.add_argument("--report", default="analysis/test_report.json")
-    p.add_argument("--no-tta", action="store_true")
-    args = p.parse_args()
+        # For each support image, run embed_image_query to get a query embed,
+        # then class_predictor to get logits.
+        P = image_feats.size(1)
+        all_logits = []
+        for vi in range(v):
+            sup_v = support_imgs[:, vi]                          # (B, 3, S, S)
+            sup_feature_map, _ = owlv2_model.image_embedder(
+                pixel_values=sup_v, interpolate_pos_encoding=True
+            )                                                    # (B, gh, gw, D)
+            sup_h, sup_w = sup_feature_map.shape[1:3]
+            sup_feats = sup_feature_map.reshape(b, sup_h * sup_w, d)
+            q_emb, _, _ = owlv2_model.embed_image_query(
+                sup_feats, sup_feature_map, interpolate_pos_encoding=True
+            )                                                    # q_emb: (B, 1, D_q) or None
+            if q_emb is None:
+                continue
+            # embed_image_query already returns (B, 1, D_q) — see modeling_owlv2.py
+            # line 1334 (torch.stack of class_embeds[i][best_box_ind]).  No need
+            # to unsqueeze.
+            if q_emb.dim() == 2:
+                q_emb = q_emb.unsqueeze(1)
+            logits, _ = owlv2_model.class_predictor(image_feats, q_emb)  # (B, P, 1)
+            all_logits.append(logits.squeeze(-1))                # (B, P)
+        if not all_logits:
+            continue
+        avg_logits = torch.stack(all_logits, dim=0).mean(dim=0)  # (B, P)
+        best_idx = avg_logits.argmax(dim=-1).clamp(0, P - 1)     # (B,)
+        ar = torch.arange(b, device=device)
+        best_box = target_pred_boxes[ar, best_idx]               # (B, 4)
+        best_logit = avg_logits[ar, best_idx]
+        existence_prob = torch.sigmoid(best_logit)
 
-    run(
-        checkpoint=args.checkpoint,
-        manifest=args.manifest,
-        split=args.split,
-        data_root=args.data_root,
-        episodes=args.episodes,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        neg_prob=args.neg_prob,
-        score_thr=args.score_thr,
-        iou_thr=args.iou_thr,
-        seed=args.seed,
-        device=args.device,
-        report=args.report,
-        use_tta=not args.no_tta,
-    )
+        pred_xyxy = _to_xyxy(best_box).clamp(0, 1)
+        gt_xyxy = _to_xyxy(gt_bbox.to(device)).clamp(0, 1)
+        iou = _iou_xyxy(pred_xyxy, gt_xyxy)
+        contain = _containment_ratio(pred_xyxy, gt_xyxy)
+        pred_area = best_box[..., 2].clamp(0, 1) * best_box[..., 3].clamp(0, 1)
 
+        for i in range(b):
+            entry = {
+                "iou": float(iou[i].item()),
+                "contain": float(contain[i].item()),
+                "score": float(existence_prob[i].item()),
+                "is_present": bool(is_present[i].item()),
+                "pred_box_area": float(pred_area[i].item()),
+                "existence_prob": float(existence_prob[i].item()),
+                "prototype_norm": 0.0,
+            }
+            for bucket in (overall, per_source[sources[i]]):
+                for k, v_ in entry.items():
+                    bucket[k].append(v_)
 
-if __name__ == "__main__":
-    main()
+    return {
+        "overall": _bucket_metrics(overall, score_thr),
+        "per_source": {k: _bucket_metrics(v, score_thr) for k, v in per_source.items()},
+    }

@@ -1,13 +1,4 @@
-"""Universal checkpoint I/O for the three-stage trainer.
-
-- Atomic save (write tmp + os.replace).
-- RNG capture / restore (torch / numpy / python / cuda).
-- Resume-path resolution and arch-mismatch quarantine.
-- Disk hygiene (rolling per-(epoch, fold) checkpoints capped, stage-completion /
-  best / last protected).
-
-The checkpoint payload schema is documented in PLAN.md §3.
-"""
+"""Universal checkpoint I/O for the OWLv2 trainer."""
 
 from __future__ import annotations
 
@@ -63,7 +54,6 @@ def atomic_save(obj: Any, path: Path) -> None:
 
 
 def resolve_resume_path(resume: bool | str, out_dir: Path) -> Path | None:
-    """``True`` → ``last.pt`` (if exists). String → resolved against ``out_dir``."""
     if resume is False or resume is None:
         return None
     if resume is True:
@@ -75,39 +65,76 @@ def resolve_resume_path(resume: bool | str, out_dir: Path) -> Path | None:
     return p if p.exists() else None
 
 
-def try_load_state_dict(
-    model: torch.nn.Module, state: dict
-) -> tuple[bool, str]:
-    """Strict-by-shape load. Returns ``(ok, error_message)``.
+def try_load_model_state(model: torch.nn.Module, ckpt_model: dict) -> tuple[bool, str]:
+    """Load the per-component state_dicts from a checkpoint.
 
-    Refuses to load when any tensor's shape differs from the live model — the
-    silent ``strict=False`` fallback would leave architecture-mismatched
-    parameters at their fresh init, masking the bug.
+    Strict-by-shape: returns (False, reason) on any shape mismatch so the
+    caller can quarantine + start fresh rather than silently fall back to
+    a fresh init for mismatched layers.
     """
-    own_state = model.state_dict()
+    own = model.state_dict()
+    state: dict[str, torch.Tensor] = {}
+    if "aggregator" in ckpt_model:
+        for k, v in ckpt_model["aggregator"].items():
+            state[f"aggregator.{k}"] = v
+    if "existence_head" in ckpt_model:
+        for k, v in ckpt_model["existence_head"].items():
+            state[f"existence_head.{k}"] = v
+    if ckpt_model.get("class_head"):
+        for k, v in ckpt_model["class_head"].items():
+            state[f"owlv2.class_head.{k}"] = v
+    if ckpt_model.get("box_head"):
+        for k, v in ckpt_model["box_head"].items():
+            state[f"owlv2.box_head.{k}"] = v
+    if ckpt_model.get("layer_norm"):
+        for k, v in ckpt_model["layer_norm"].items():
+            state[f"owlv2.layer_norm.{k}"] = v
+    if ckpt_model.get("lora_state"):
+        # LoRA keys are wrapped by peft — they live under their own paths
+        # inside model.owlv2.  We just write them in directly.
+        for k, v in ckpt_model["lora_state"].items():
+            state[k] = v
+
     mismatches: list[str] = []
     for k, v in state.items():
-        if k in own_state and own_state[k].shape != v.shape:
+        if k in own and own[k].shape != v.shape:
             mismatches.append(
-                f"{k}: ckpt {tuple(v.shape)} vs model {tuple(own_state[k].shape)}"
+                f"{k}: ckpt {tuple(v.shape)} vs model {tuple(own[k].shape)}"
             )
     if mismatches:
         head = "; ".join(mismatches[:5])
         tail = f" (and {len(mismatches) - 5} more)" if len(mismatches) > 5 else ""
         return False, head + tail
     try:
-        model.load_state_dict(state, strict=False)
+        missing, unexpected = model.load_state_dict(state, strict=False)
         return True, ""
-    except RuntimeError as e:                                                 # noqa: BLE001
+    except RuntimeError as e:
         return False, str(e)
 
 
-def quarantine_incompatible(out_dir: Path, reason: str) -> Path:
-    """Move every ``*.pt`` under ``out_dir`` into ``out_dir/legacy_<ts>/``.
+def save_model_state(model: torch.nn.Module, lora_active: bool) -> dict:
+    """Pull the trainable component state_dicts out of ``model``."""
+    out: dict[str, Any] = {
+        "aggregator": model.aggregator.state_dict(),
+        "existence_head": model.existence_head.state_dict(),
+    }
+    # OWLv2 heads — only saved if currently unfrozen (any param requires grad).
+    head_trainable = any(p.requires_grad for p in model.owlv2.class_head.parameters())
+    if head_trainable:
+        out["class_head"] = model.owlv2.class_head.state_dict()
+        out["box_head"] = model.owlv2.box_head.state_dict()
+        out["layer_norm"] = model.owlv2.layer_norm.state_dict()
+    if lora_active:
+        # Save only LoRA-tagged parameters from owlv2.
+        out["lora_state"] = {
+            n: p.detach().cpu()
+            for n, p in model.owlv2.named_parameters()
+            if "lora_" in n
+        }
+    return out
 
-    Used when a loaded checkpoint's state_dict doesn't match the current
-    architecture. We never delete the user's data — just step around it.
-    """
+
+def quarantine_incompatible(out_dir: Path, reason: str) -> Path:
     ts = time.strftime("%Y%m%d_%H%M%S")
     backup = out_dir / f"legacy_{ts}"
     backup.mkdir(parents=True, exist_ok=True)
@@ -121,72 +148,18 @@ def quarantine_incompatible(out_dir: Path, reason: str) -> Path:
     print(
         f"⚠ Quarantined {len(moved)} incompatible checkpoint(s) into {backup}\n"
         f"  reason: {reason}\n"
-        f"  files : {', '.join(moved) if moved else '(none)'}\n"
-        f"  Training will start fresh."
+        f"  files : {', '.join(moved) if moved else '(none)'}"
     )
     return backup
 
 
-# ---------------------------------------------------------------------------
-# Resume decision tree
-# ---------------------------------------------------------------------------
-
-
-def next_resume_point(ckpt: dict, cfg: dict) -> dict:
-    """Given a loaded checkpoint, return the dict telling the trainer where
-    to start.
-
-    ``rebuild_optimizer`` is True iff resuming crosses a stage boundary —
-    optimiser + scheduler must be rebuilt because parameter groups change.
-    """
-    stage = int(ckpt["stage"])
-    epoch = int(ckpt["epoch"])
-    fold = int(ckpt["fold"]) if ckpt.get("fold") is not None else None
-    completed = bool(ckpt.get("stage_completed", False))
-
-    if stage == 1:
-        if completed or epoch >= cfg["stage1_epochs"]:
-            return {"stage": 2, "epoch": 1, "fold": 0, "rebuild_optimizer": True}
-        return {"stage": 1, "epoch": epoch + 1, "fold": 0, "rebuild_optimizer": False}
-    if stage == 2:
-        if completed or epoch >= cfg["stage2_epochs"]:
-            return {"stage": 3, "epoch": 1, "fold": 0, "rebuild_optimizer": True}
-        return {"stage": 2, "epoch": epoch + 1, "fold": 0, "rebuild_optimizer": False}
-    if stage == 3:
-        K = int(cfg["folds"])
-        if completed:
-            return {
-                "stage": 3, "epoch": cfg["stage3_epochs"] + 1, "fold": 0,
-                "rebuild_optimizer": False, "done": True,
-            }
-        if fold is None:
-            fold = -1
-        if fold + 1 < K:
-            return {"stage": 3, "epoch": epoch, "fold": fold + 1, "rebuild_optimizer": False}
-        if epoch + 1 <= cfg["stage3_epochs"]:
-            return {"stage": 3, "epoch": epoch + 1, "fold": 0, "rebuild_optimizer": False}
-        return {
-            "stage": 3, "epoch": cfg["stage3_epochs"] + 1, "fold": 0,
-            "rebuild_optimizer": False, "done": True,
-        }
-    raise ValueError(f"unknown stage {stage}")
-
-
-# ---------------------------------------------------------------------------
-# Disk hygiene
-# ---------------------------------------------------------------------------
-
-
 def hygiene(out_dir: Path, keep_last_n: int) -> None:
-    """Delete rolling per-(epoch, fold) checkpoints older than the last ``keep_last_n``.
-
-    Stage-completion files (``stage{1,2,3}_complete.pt``), ``last.pt``, and
-    ``best.pt`` are protected.
+    """Delete rolling per-(epoch, fold) checkpoints older than the last
+    ``keep_last_n``.  Stage-completion / best / last are protected.
     """
     rolling = sorted(
         [
-            p for p in out_dir.glob("ckpt_s*.pt")
-            if not p.name.startswith("stage")
+            p for p in out_dir.glob("ckpt_fold*_epoch*.pt")
         ],
         key=lambda p: p.stat().st_mtime,
     )

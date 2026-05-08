@@ -1,23 +1,26 @@
 """JSON analysis writers for the trainer.
 
-- ``write_json``                 : pretty-print + atomic write.
-- ``flatten_metrics``            : nested dict -> {dotted_key: float}.
-- ``aggregate_folds``            : recursive mean/min/max/std across the K
-                                    fold JSONs of a single Stage 3 epoch.
-- ``update_summary``             : rolling best-by-metric pointer.
+- ``write_json``         : pretty-print + atomic write.
+- ``flatten_metrics``    : nested dict -> {dotted_key: float}.
+- ``aggregate_folds``    : recursive mean/min/max/std across the K fold
+                           JSONs of a single epoch.
+- ``update_summary``     : rolling best-by-metric pointer.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
         json.dump(payload, f, indent=2, default=float)
+    os.replace(str(tmp), str(path))
 
 
 def flatten_metrics(d: Any, prefix: str = "") -> dict[str, float]:
