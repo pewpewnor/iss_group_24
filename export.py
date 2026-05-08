@@ -53,6 +53,7 @@ import torch
 import torch.nn as nn
 
 from modeling._checkpoint import try_load_model_state
+from modeling.evaluate import resolve_tile_cfg
 from modeling.model import OWLv2FewShotLocalizer
 
 
@@ -262,6 +263,13 @@ def main() -> None:
     p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--lora-dropout", type=float, default=0.1)
     p.add_argument("--lora-layers", type=int, default=4)
+    # Tile-inference recommended config (eval-time only — does not affect
+    # the exported graph itself; written to the sidecar so downstream
+    # callers know what eval setup the model was trained against).
+    p.add_argument("--tile-mode", default="pyramid_a",
+                   choices=["off", "pyramid_a", "hybrid_d"])
+    p.add_argument("--tile-levels", default="1,2")
+    p.add_argument("--tile-overlap", type=float, default=0.30)
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -285,16 +293,25 @@ def main() -> None:
     if "tflite" in formats:
         export_tflite(onnx_path, out_dir)
 
-    # Sidecar JSON with provenance.
+    # Sidecar JSON with provenance.  Includes the recommended tile-inference
+    # config — the exported graph is the *single-pass* model, but downstream
+    # callers (e.g. inference.py) can read this to mirror the eval setup the
+    # checkpoint was trained for.
     sidecar = out_dir / "export_info.json"
+    tile_cfg = resolve_tile_cfg({
+        "mode": args.tile_mode,
+        "levels": tuple(int(x) for x in args.tile_levels.split(",") if x.strip()),
+        "overlap": args.tile_overlap,
+    })
     info = {
         "checkpoint": str(args.checkpoint),
         "img_size": args.img_size,
         "formats": sorted(formats),
         "opset": args.opset,
         "lora_cfg": lora_cfg,
+        "recommended_tile_cfg": tile_cfg,
     }
-    sidecar.write_text(json.dumps(info, indent=2))
+    sidecar.write_text(json.dumps(info, indent=2, default=float))
     print(f"export complete → {out_dir}")
 
 

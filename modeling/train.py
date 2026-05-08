@@ -55,7 +55,12 @@ from modeling._logging import print_aggregate, print_epoch_log
 from modeling._optim import build_optimizer_for_stage, build_scheduler
 from modeling._train_loop import train_one_pass
 from modeling.dataset import collate
-from modeling.evaluate import evaluate, evaluate_phase0 as _evaluate_phase0
+from modeling.evaluate import (
+    DEFAULT_TILE_CFG,
+    evaluate,
+    evaluate_phase0 as _evaluate_phase0,
+    resolve_tile_cfg,
+)
 from modeling.model import OWLv2FewShotLocalizer
 
 
@@ -119,6 +124,11 @@ DEFAULT_CFG: dict[str, Any] = {
     "early_stop_patience_s1": 4,
     "early_stop_patience_s2": 5,
     "early_stop_patience_s3": 4,
+    # --- tile inference (eval-only) -------------------------------------
+    "tile_cfg": dict(DEFAULT_TILE_CFG),     # default: pyramid_a on insdet
+    # In-loop val cycles use single-pass eval (cheap).  Final post-stage
+    # evaluate_run() uses ``tile_cfg`` instead.
+    "in_loop_val_tile_cfg": {"mode": "off"},
     # --- misc -----------------------------------------------------------
     "seed": 42,
     "device": None,
@@ -256,6 +266,9 @@ def train_phase0(**user_kwargs) -> dict:
     out_dir, analysis_dir = _stage_dirs(cfg, "phase0")
     print(f"=== Phase 0 (zero-shot OWLv2) on {device} ===")
 
+    tile_cfg = resolve_tile_cfg(cfg.get("tile_cfg"))
+    needs_native = tile_cfg["mode"] != "off"
+
     _set_seed(int(cfg["seed"]))
     model = OWLv2FewShotLocalizer().to(device)
     owlv2 = model.owlv2
@@ -266,13 +279,17 @@ def train_phase0(**user_kwargs) -> dict:
         split="phase0", sources=None,
         batch_size=int(cfg["batch_size"]), num_workers=int(cfg["num_workers"]),
         img_size=int(cfg["img_size"]),
+        return_native=needs_native,
     )
     print(f"phase0/vizwiz_novel: {len(p0_ds)} instances")
 
     metrics: dict[str, Any] = {}
     if len(p0_ds) > 0:
         t0 = time.time()
-        metrics["vizwiz_novel"] = _evaluate_phase0(owlv2, p0_loader, device)
+        metrics["vizwiz_novel"] = _evaluate_phase0(
+            owlv2, p0_loader, device,
+            img_size=int(cfg["img_size"]), tile_cfg=tile_cfg,
+        )
         metrics["vizwiz_novel"]["wall_clock_seconds"] = round(time.time() - t0, 2)
         print(f"vizwiz_novel done in {metrics['vizwiz_novel']['wall_clock_seconds']}s")
 
@@ -286,43 +303,22 @@ def train_phase0(**user_kwargs) -> dict:
         img_size=int(cfg["img_size"]),
         seed=int(cfg["seed"]),
         n_support=int(cfg["n_support"]),
+        return_native=needs_native,
     )
     print(f"phase0/test: {len(test_ds.instances)} instances, "
           f"{len(test_ds)} episodes")
     if len(test_ds.instances) > 0:
         t0 = time.time()
-        metrics["test"] = _evaluate_phase0(owlv2, test_loader, device)
+        metrics["test"] = _evaluate_phase0(
+            owlv2, test_loader, device,
+            img_size=int(cfg["img_size"]), tile_cfg=tile_cfg,
+        )
         metrics["test"]["wall_clock_seconds"] = round(time.time() - t0, 2)
         print(f"test done in {metrics['test']['wall_clock_seconds']}s")
 
     write_json(out_dir / "results.json", metrics)
     write_json(analysis_dir / "results.json", metrics)
     print("Phase 0 complete. Results written to checkpoints/phase0/results.json")
-    return metrics
-
-
-# Alias so the notebook's "evaluate" cell can call the same logic against
-# the held-out test split only:
-def evaluate_phase0(**user_kwargs) -> dict:
-    """Evaluate the zero-shot OWLv2 baseline on the held-out test split only."""
-    cfg = _merge_cfg(user_kwargs)
-    device = _resolve_device(cfg)
-    print(f"=== Phase 0 evaluation on test split ===")
-    model = OWLv2FewShotLocalizer().to(device)
-    owlv2 = model.owlv2
-    test_ds, test_loader = build_val_loader(
-        manifest=cfg["manifest"], data_root=cfg["data_root"],
-        split="test", sources=None,
-        val_episodes=int(cfg.get("val_episodes_phase0", 200)),
-        batch_size=int(cfg["batch_size"]), num_workers=int(cfg["num_workers"]),
-        neg_prob=float(cfg["neg_prob"]),
-        img_size=int(cfg["img_size"]),
-        seed=int(cfg["seed"]),
-        n_support=int(cfg["n_support"]),
-    )
-    metrics = _evaluate_phase0(owlv2, test_loader, device)
-    out_dir, _ = _stage_dirs(cfg, "phase0")
-    write_json(out_dir / "evaluate.json", metrics)
     return metrics
 
 
@@ -469,7 +465,11 @@ def _run_stage(
                 use_box_loss=use_box_loss, scaler=scaler,
                 use_amp=bool(cfg["use_amp"]),
             )
-            val_metrics = evaluate(model, val_loader, device)
+            val_metrics = evaluate(
+                model, val_loader, device,
+                img_size=int(cfg["img_size"]),
+                tile_cfg=cfg.get("in_loop_val_tile_cfg"),
+            )
 
             payload = {
                 "stage": stage, "epoch": epoch, "fold": fold_idx,
@@ -595,18 +595,103 @@ def train_stage_2_3(**user_kwargs) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _persist_eval_results(
+    *,
+    metrics: dict,
+    cfg: dict,
+    stage: str,
+    tile_cfg: dict,
+    extra_provenance: dict,
+) -> dict[str, str]:
+    """Write the eval metrics + provenance to *all* the right places.
+
+    Locations:
+      - ``checkpoints/<stage>/test_eval_<tile_mode>.json``
+            Latest result for this (stage, tile_mode) pair.  Overwritten on
+            each call so the "current best view" is always at a stable path.
+      - ``analysis/<stage>/test_eval_<tile_mode>_<timestamp>.json``
+            Timestamped historical record — never overwritten.
+      - ``analysis/eval_log.jsonl``
+            Single rolling log of every eval across every stage / tile mode.
+            One JSON object per line, append-only.
+
+    Returns the dict of paths written.
+    """
+    payload = {
+        "stage": stage,
+        "tile_cfg": tile_cfg,
+        "config": cfg,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **extra_provenance,
+        "metrics": metrics,
+    }
+    tile_mode = str(tile_cfg.get("mode", "off"))
+    ts = time.strftime("%Y%m%d_%H%M%S")
+
+    out_dir = Path(cfg["out_root"]) / _stage_dir_name(stage)
+    analysis_dir = Path(cfg["analysis_root"]) / _stage_dir_name(stage)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    latest_path = out_dir / f"test_eval_{tile_mode}.json"
+    timestamped_path = analysis_dir / f"test_eval_{tile_mode}_{ts}.json"
+
+    write_json(latest_path, payload)
+    write_json(timestamped_path, payload)
+
+    # Append a flat one-line summary to the rolling log.
+    log_path = Path(cfg["analysis_root"]) / "eval_log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    overall = metrics.get("overall", {}) if isinstance(metrics, dict) else {}
+    summary = {
+        "timestamp": payload["timestamp"],
+        "stage": stage,
+        "tile_mode": tile_mode,
+        "checkpoint": extra_provenance.get("checkpoint"),
+        "map_50": float(overall.get("map_50", 0.0)),
+        "map_75": float(overall.get("map_75", 0.0)),
+        "map_5095": float(overall.get("map_5095", 0.0)),
+        "iou_mean": float(overall.get("iou_mean", 0.0)),
+        "existence_auroc": float(overall.get("existence_auroc", 0.0)),
+        "existence_acc": float(overall.get("existence_acc", 0.0)),
+        "false_positive_rate": float(overall.get("false_positive_rate", 0.0)),
+        "n": int(overall.get("n", 0)),
+        "results_path": str(latest_path),
+    }
+    with open(log_path, "a") as f:
+        f.write(json.dumps(summary, default=float) + "\n")
+
+    return {
+        "latest": str(latest_path),
+        "timestamped": str(timestamped_path),
+        "log": str(log_path),
+    }
+
+
 def evaluate_run(checkpoint: str, **user_kwargs) -> dict:
-    """Load ``checkpoint`` and evaluate on the held-out test split."""
+    """Load ``checkpoint`` and evaluate on the held-out test split.
+
+    Supports tiled inference via the ``tile_cfg`` kwarg — see
+    ``modeling.evaluate.DEFAULT_TILE_CFG``.  Pass
+    ``tile_cfg={"mode": "off"}`` to disable tiling entirely.
+
+    Persists results to:
+      - ``<checkpoint_dir>/test_eval_<tile_mode>.json``       (latest, overwritten)
+      - ``<analysis_root>/<stage>/test_eval_<tile_mode>_<ts>.json``   (history)
+      - ``<analysis_root>/eval_log.jsonl``                    (rolling one-liner)
+    """
     cfg = _merge_cfg(user_kwargs)
     device = _resolve_device(cfg)
-    print(f"=== Evaluating {checkpoint} on test split ===")
+    tile_cfg = resolve_tile_cfg(cfg.get("tile_cfg"))
+    needs_native = tile_cfg["mode"] != "off"
+    print(f"=== Evaluating {checkpoint} on test split (tile_mode={tile_cfg['mode']}) ===")
 
     model = OWLv2FewShotLocalizer().to(device)
     ckpt_path = Path(checkpoint)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    stage = ckpt.get("stage")
+    stage = ckpt.get("stage", "unknown")
     lora_active = stage == "2_3"
     if lora_active:
         # Re-attach LoRA so the state_dict has matching keys.
@@ -630,10 +715,91 @@ def evaluate_run(checkpoint: str, **user_kwargs) -> dict:
         img_size=int(cfg["img_size"]),
         seed=int(cfg["seed"]),
         n_support=int(cfg["n_support"]),
+        return_native=needs_native,
     )
-    metrics = evaluate(model, test_loader, device)
-    out_dir = ckpt_path.parent
-    write_json(out_dir / "test_eval.json", metrics)
-    print(f"Test mAP@50 = {metrics['overall'].get('map_50', 0.0):.4f}  "
-          f"existence_auroc = {metrics['overall'].get('existence_auroc', 0.0):.4f}")
+    t0 = time.time()
+    metrics = evaluate(
+        model, test_loader, device,
+        img_size=int(cfg["img_size"]),
+        tile_cfg=tile_cfg,
+    )
+    metrics["wall_clock_seconds"] = round(time.time() - t0, 2)
+
+    paths = _persist_eval_results(
+        metrics=metrics,
+        cfg=cfg,
+        stage=str(stage),
+        tile_cfg=tile_cfg,
+        extra_provenance={
+            "checkpoint": str(ckpt_path),
+            "split": "test",
+            "test_episodes": int(cfg.get("test_episodes", 400)),
+        },
+    )
+    print(
+        f"Test mAP@50 = {metrics['overall'].get('map_50', 0.0):.4f}  "
+        f"existence_auroc = {metrics['overall'].get('existence_auroc', 0.0):.4f}  "
+        f"({metrics['wall_clock_seconds']:.1f}s)"
+    )
+    print(f"  → results saved to: {paths['latest']}")
+    print(f"  → history snapshot: {paths['timestamped']}")
+    print(f"  → rolling log     : {paths['log']}")
+    return metrics
+
+
+def evaluate_phase0(**user_kwargs) -> dict:
+    """Evaluate the zero-shot OWLv2 baseline on the held-out test split only.
+
+    Supports tiled inference via the ``tile_cfg`` kwarg — see
+    ``modeling.evaluate.DEFAULT_TILE_CFG``.
+
+    Persists results to:
+      - ``<out_root>/phase0/test_eval_<tile_mode>.json``       (latest, overwritten)
+      - ``<analysis_root>/phase0/test_eval_<tile_mode>_<ts>.json``  (history)
+      - ``<analysis_root>/eval_log.jsonl``                     (rolling one-liner)
+    """
+    cfg = _merge_cfg(user_kwargs)
+    device = _resolve_device(cfg)
+    tile_cfg = resolve_tile_cfg(cfg.get("tile_cfg"))
+    needs_native = tile_cfg["mode"] != "off"
+    print(f"=== Phase 0 evaluation on test split (tile_mode={tile_cfg['mode']}) ===")
+    model = OWLv2FewShotLocalizer().to(device)
+    owlv2 = model.owlv2
+    test_ds, test_loader = build_val_loader(
+        manifest=cfg["manifest"], data_root=cfg["data_root"],
+        split="test", sources=None,
+        val_episodes=int(cfg.get("val_episodes_phase0", 200)),
+        batch_size=int(cfg["batch_size"]), num_workers=int(cfg["num_workers"]),
+        neg_prob=float(cfg["neg_prob"]),
+        img_size=int(cfg["img_size"]),
+        seed=int(cfg["seed"]),
+        n_support=int(cfg["n_support"]),
+        return_native=needs_native,
+    )
+    t0 = time.time()
+    metrics = _evaluate_phase0(
+        owlv2, test_loader, device,
+        img_size=int(cfg["img_size"]), tile_cfg=tile_cfg,
+    )
+    metrics["wall_clock_seconds"] = round(time.time() - t0, 2)
+
+    paths = _persist_eval_results(
+        metrics=metrics,
+        cfg=cfg,
+        stage="phase0",
+        tile_cfg=tile_cfg,
+        extra_provenance={
+            "checkpoint": None,                                    # zero-shot
+            "split": "test",
+            "test_episodes": int(cfg.get("val_episodes_phase0", 200)),
+        },
+    )
+    print(
+        f"Phase 0 mAP@50 = {metrics['overall'].get('map_50', 0.0):.4f}  "
+        f"existence_auroc = {metrics['overall'].get('existence_auroc', 0.0):.4f}  "
+        f"({metrics['wall_clock_seconds']:.1f}s)"
+    )
+    print(f"  → results saved to: {paths['latest']}")
+    print(f"  → history snapshot: {paths['timestamped']}")
+    print(f"  → rolling log     : {paths['log']}")
     return metrics

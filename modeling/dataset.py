@@ -180,6 +180,7 @@ class EpisodeDataset(Dataset):
         img_size: int = DEFAULT_IMG_SIZE,
         seed: int | None = None,
         sources: list[str] | None = None,
+        return_native: bool = False,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.data_root = (
@@ -204,6 +205,7 @@ class EpisodeDataset(Dataset):
         self._support_aug = _SupportAugment(img_size, train)
         self._query_tf = _QueryTransform(img_size, train)
         self._seed = seed if seed is not None else 0
+        self.return_native = return_native
 
     # --- fold management ----------------------------------------------------
 
@@ -282,28 +284,41 @@ class EpisodeDataset(Dataset):
         is_negative = rng.random() < self.neg_prob if self.train else False
         if not is_negative:
             q_img, q_bbox_xyxy = self._sample_query_positive(instance, rng)
+            native_w, native_h = q_img.size
+            native_bbox = list(q_bbox_xyxy)
             q_t, bbox_resized = self._query_tf(q_img, q_bbox_xyxy, rng if self.train else None)
             assert bbox_resized is not None
             bbox_norm = _xyxy_to_cxcywh_norm(bbox_resized, self.img_size)
-            return {
+            episode = {
                 "support_imgs": support_t,
                 "query_img": q_t,
                 "query_bbox": torch.tensor(bbox_norm, dtype=torch.float32),
                 "is_present": torch.tensor(True, dtype=torch.bool),
                 "instance_id": instance["instance_id"],
                 "source": instance.get("source", ""),
+                "native_size": torch.tensor([native_w, native_h], dtype=torch.int32),
+                "native_bbox": torch.tensor(native_bbox, dtype=torch.float32),
             }
+            if self.return_native:
+                episode["query_native"] = q_img
+            return episode
         else:
             q_img = self._sample_query_negative(instance, rng)
+            native_w, native_h = q_img.size
             q_t, _ = self._query_tf(q_img, None, rng if self.train else None)
-            return {
+            episode = {
                 "support_imgs": support_t,
                 "query_img": q_t,
                 "query_bbox": torch.zeros(4, dtype=torch.float32),
                 "is_present": torch.tensor(False, dtype=torch.bool),
                 "instance_id": instance["instance_id"],
                 "source": instance.get("source", ""),
+                "native_size": torch.tensor([native_w, native_h], dtype=torch.int32),
+                "native_bbox": torch.zeros(4, dtype=torch.float32),
             }
+            if self.return_native:
+                episode["query_native"] = q_img
+            return episode
 
     def __len__(self) -> int:
         return self.episodes_per_epoch
@@ -344,6 +359,7 @@ class Phase0Dataset(Dataset):
         img_size: int = DEFAULT_IMG_SIZE,
         split: str = "phase0",
         sources: list[str] | None = None,
+        return_native: bool = False,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.data_root = (
@@ -360,6 +376,7 @@ class Phase0Dataset(Dataset):
         self.img_size = img_size
         self._support_aug = _SupportAugment(img_size, train=False)
         self._query_tf = _QueryTransform(img_size, train=False)
+        self.return_native = return_native
 
     def _resolve(self, p: str) -> Path:
         path = Path(p)
@@ -405,17 +422,23 @@ class Phase0Dataset(Dataset):
         )                                                            # (4, 3, S, S)
 
         q_img = self._load(q_entry["path"])
+        native_w, native_h = q_img.size
         q_t, bbox_resized = self._query_tf(q_img, list(q_entry["bbox"]))
         assert bbox_resized is not None
         bbox_norm = _xyxy_to_cxcywh_norm(bbox_resized, self.img_size)
-        return {
+        episode = {
             "support_imgs": s_t,
             "query_img": q_t,
             "query_bbox": torch.tensor(bbox_norm, dtype=torch.float32),
             "is_present": torch.tensor(True, dtype=torch.bool),
             "instance_id": instance["instance_id"],
             "source": instance.get("source", ""),
+            "native_size": torch.tensor([native_w, native_h], dtype=torch.int32),
+            "native_bbox": torch.tensor(list(q_entry["bbox"]), dtype=torch.float32),
         }
+        if self.return_native:
+            episode["query_native"] = q_img
+        return episode
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +447,7 @@ class Phase0Dataset(Dataset):
 
 
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "support_imgs": torch.stack([b["support_imgs"] for b in batch], dim=0),
         "query_img": torch.stack([b["query_img"] for b in batch], dim=0),
         "query_bbox": torch.stack([b["query_bbox"] for b in batch], dim=0),
@@ -432,3 +455,11 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "instance_id": [b["instance_id"] for b in batch],
         "source": [b["source"] for b in batch],
     }
+    if "native_size" in batch[0]:
+        out["native_size"] = torch.stack([b["native_size"] for b in batch], dim=0)
+    if "native_bbox" in batch[0]:
+        out["native_bbox"] = torch.stack([b["native_bbox"] for b in batch], dim=0)
+    if "query_native" in batch[0]:
+        # PIL images can't be stacked — keep as a list.
+        out["query_native"] = [b["query_native"] for b in batch]
+    return out

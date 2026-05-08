@@ -64,6 +64,7 @@ def build_val_loader(
     img_size: int,
     seed: int,
     n_support: int,
+    return_native: bool = False,
 ) -> tuple[EpisodeDataset, DataLoader]:
     ds = EpisodeDataset(
         manifest_path=manifest,
@@ -76,6 +77,7 @@ def build_val_loader(
         train=False,
         img_size=img_size,
         seed=seed,
+        return_native=return_native,
     )
     loader = DataLoader(
         ds,
@@ -98,6 +100,7 @@ def build_phase0_loader(
     batch_size: int,
     num_workers: int,
     img_size: int,
+    return_native: bool = False,
 ) -> tuple[Phase0Dataset, DataLoader]:
     ds = Phase0Dataset(
         manifest_path=manifest,
@@ -105,6 +108,7 @@ def build_phase0_loader(
         split=split,
         sources=sources,
         img_size=img_size,
+        return_native=return_native,
     )
     loader = DataLoader(
         ds,
