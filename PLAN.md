@@ -710,7 +710,7 @@ existence_kl_threshold = 0.85
 
 neg_prob             = 0.5
 support_box_pad      = 0.05
-keep_last_n          = 6
+keep_last_n          = 0   # 0 ⇒ keep every (epoch, fold) ckpt (Colab/Drive default)
 
 ema                  = OFF (small dataset, EMA on tiny aggregator hurts)
 ```

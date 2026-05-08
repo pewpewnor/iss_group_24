@@ -163,7 +163,14 @@ def quarantine_incompatible(out_dir: Path, reason: str) -> Path:
 def hygiene(out_dir: Path, keep_last_n: int) -> None:
     """Delete rolling per-(epoch, fold) checkpoints older than the last
     ``keep_last_n``.  Stage-completion / best / last are protected.
+
+    ``keep_last_n <= 0`` disables the cull entirely — every per-(epoch, fold)
+    checkpoint is preserved.  Use this when you need full forensic history
+    or when running on a flaky platform (e.g. Colab) where any fold's
+    checkpoint may be the resume target after a kill.
     """
+    if keep_last_n <= 0:
+        return
     rolling = sorted(
         [
             p for p in out_dir.glob("ckpt_fold*_epoch*.pt")

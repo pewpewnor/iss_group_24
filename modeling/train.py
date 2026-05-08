@@ -129,7 +129,10 @@ DEFAULT_CFG: dict[str, Any] = {
     # --- I/O ------------------------------------------------------------
     "out_root": "checkpoints",
     "analysis_root": "analysis",
-    "keep_last_n": 6,
+    # 0 ⇒ keep every per-(epoch, fold) rolling ckpt (recommended on
+    # Colab / Drive where any fold may be the resume target).  Set to a
+    # positive integer to cap forensic history when local disk is tight.
+    "keep_last_n": 0,
     # --- early stopping --------------------------------------------------
     "early_stop_patience_s1": 4,
     "early_stop_patience_s2": 5,
@@ -387,7 +390,9 @@ def _run_stage(
     )
     scaler = _make_scaler(bool(cfg["use_amp"]), device)
 
-    # If we resumed within the stage, restore opt + sched.
+    # If we resumed within the stage, restore opt + sched + loop position.
+    resume_epoch = 1
+    resume_fold  = 0
     if resume_path is not None:
         ckpt_full = torch.load(str(resume_path), map_location="cpu", weights_only=False)
         if ckpt_full.get("stage") == stage and not ckpt_full.get("stage_completed"):
@@ -397,8 +402,26 @@ def _run_stage(
                 if scaler is not None and ckpt_full.get("scaler"):
                     scaler.load_state_dict(ckpt_full["scaler"])
                 restore_rng(ckpt_full.get("rng"))
+                # Advance past the last completed (epoch, fold).
+                saved_epoch = int(ckpt_full["epoch"])
+                saved_fold  = int(ckpt_full["fold"])
+                # Next to run is the fold after the saved one; if that fold
+                # was the last fold of the epoch, advance to the next epoch.
+                if saved_fold >= K - 1:
+                    resume_epoch = saved_epoch + 1
+                    resume_fold  = 0
+                else:
+                    resume_epoch = saved_epoch
+                    resume_fold  = saved_fold + 1
+                best_metric = {
+                    "value": float(ckpt_full.get("best_aggregate_map_50", -1.0)),
+                    "epoch": saved_epoch, "fold": saved_fold,
+                }
+                early_stop_counter = int(ckpt_full.get("early_stop_counter", 0))
+                metrics_history    = list(ckpt_full.get("metrics_history", []))
                 print(f"  restored optimizer + scheduler at "
-                      f"epoch={ckpt_full['epoch']} fold={ckpt_full['fold']}")
+                      f"epoch={saved_epoch} fold={saved_fold}; "
+                      f"resuming from epoch={resume_epoch} fold={resume_fold}")
             except Exception as e:
                 print(f"  warning: failed to restore optimizer/scheduler ({e}); fresh")
 
@@ -431,14 +454,22 @@ def _run_stage(
 
     box_freeze_epochs = int(cfg.get("stage_1_2_box_freeze_epochs", 3)) if stage == "1_2" else 0
 
-    for epoch in range(1, n_epochs + 1):
+    for epoch in range(resume_epoch, n_epochs + 1):
         # Stage 1.2 box-head warmup: freeze the box_head for the first N epochs.
         if stage == "1_2":
             for p in model.owlv2.box_head.parameters():
                 p.requires_grad = epoch > box_freeze_epochs
 
-        fold_jsons: list[dict] = []
+        # Pre-populate fold_jsons with already-completed folds from history
+        # so the epoch aggregate at the end of this epoch is correct.
+        fold_jsons: list[dict] = [
+            m for m in metrics_history
+            if m.get("epoch") == epoch and m.get("fold", -1) < resume_fold
+        ] if epoch == resume_epoch else []
         for fold_idx in range(K):
+            # Skip folds already completed in a previous run.
+            if epoch == resume_epoch and fold_idx < resume_fold:
+                continue
             t0 = time.time()
             fold = fold_plan[fold_idx]
             train_ids = set(fold["train_ids"])
