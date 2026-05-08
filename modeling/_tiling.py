@@ -273,7 +273,14 @@ def _merge_boundary_pairs(
     out_existences: list[float] = []
 
     for i in range(n):
-        if used[i] or scores[i] < min_partial_score:
+        if used[i]:
+            continue
+        if scores[i] < min_partial_score:
+            # Below merge threshold — keep as-is, don't try to merge.
+            out_boxes.append(boxes[i])
+            out_scores.append(scores[i])
+            out_existences.append(existences[i])
+            used[i] = True
             continue
         bi, ti = boxes[i], tiles[i]
         li, top_i, ri, bot_i = _box_touches_edge(bi, ti, edge_px)
@@ -486,6 +493,15 @@ def detect_tiled(
             boxes_native, scores, existences, tile_of_box,
             edge_px=edge_px, min_partial_score=merge_min_score,
         )
+
+    if not boxes_native:
+        return {
+            "best_box_native_xyxy": torch.zeros(4, device=device),
+            "best_score": torch.zeros((), device=device),
+            "existence_prob": torch.zeros((), device=device),
+            "all_boxes_native_xyxy": torch.zeros((0, 4), device=device),
+            "all_scores": torch.zeros((0,), device=device),
+        }
 
     boxes_t = torch.stack(boxes_native, dim=0)                       # (N, 4)
     scores_t = torch.tensor(scores, device=device, dtype=torch.float32)
