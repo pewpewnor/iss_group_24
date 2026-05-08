@@ -280,8 +280,10 @@ class EpisodeDataset(Dataset):
         s_imgs = [self._support_aug(self._load(s["path"]), rng) for s in supports]
         support_t = torch.stack(s_imgs, dim=0)                       # (4, 3, S, S)
 
-        # Query: positive or negative.
-        is_negative = rng.random() < self.neg_prob if self.train else False
+        # Query: positive or negative.  ``neg_prob`` applies at both train
+        # and eval time — without negative episodes at eval, AUROC / FPR /
+        # mean_score_neg are all degenerate (n_neg=0 in the metric bucket).
+        is_negative = rng.random() < self.neg_prob
         if not is_negative:
             q_img, q_bbox_xyxy = self._sample_query_positive(instance, rng)
             native_w, native_h = q_img.size

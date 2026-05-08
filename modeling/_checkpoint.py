@@ -80,6 +80,11 @@ def try_load_model_state(model: torch.nn.Module, ckpt_model: dict) -> tuple[bool
     if "existence_head" in ckpt_model:
         for k, v in ckpt_model["existence_head"].items():
             state[f"existence_head.{k}"] = v
+    # Top-level scalar parameter (residual aggregator gate).  Stored under
+    # its own key in the ckpt dict so older checkpoints without it keep
+    # loading at alpha=0 (the default init).
+    if "aggregator_alpha" in ckpt_model:
+        state["aggregator_alpha"] = ckpt_model["aggregator_alpha"]
     if ckpt_model.get("class_head"):
         for k, v in ckpt_model["class_head"].items():
             state[f"owlv2.class_head.{k}"] = v
@@ -117,6 +122,8 @@ def save_model_state(model: torch.nn.Module, lora_active: bool) -> dict:
     out: dict[str, Any] = {
         "aggregator": model.aggregator.state_dict(),
         "existence_head": model.existence_head.state_dict(),
+        # Top-level residual aggregator gate (scalar tensor).
+        "aggregator_alpha": model.aggregator_alpha.detach().cpu(),
     }
     # OWLv2 heads — only saved if currently unfrozen (any param requires grad).
     head_trainable = any(p.requires_grad for p in model.owlv2.class_head.parameters())

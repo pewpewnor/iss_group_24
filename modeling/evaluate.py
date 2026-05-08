@@ -359,27 +359,38 @@ def evaluate(
         native_bbox = batch.get("native_bbox")
         query_native_list = batch.get("query_native")
 
-        # Default: run single-pass forward for the whole batch.
-        out = model(support_imgs, query_img)
-
-        pred_box_norm = out["best_box"]                          # (B, 4) cxcywh in [0,1]
-        existence_prob = out["existence_prob"]
-        score_logit = out["best_score"]
-        prototype = out["prototype"]
-
-        # Per-episode loop — apply tiling for InsDet (or whatever
-        # for_sources is configured) and use single-pass for the rest.
-        for i in range(b):
-            src = sources[i]
-            present = bool(is_present[i].item())
-            pnorm = float(prototype[i].norm().item())
-
-            do_tile = (
+        # Decide which episodes go single-pass vs tiled.
+        will_tile = [
+            (
                 tile_mode != "off"
-                and src in tile_for_sources
+                and sources[i] in tile_for_sources
                 and query_native_list is not None
                 and native_size is not None
             )
+            for i in range(b)
+        ]
+        any_single_pass = not all(will_tile)
+
+        # Only run the batched single-pass forward if at least one episode
+        # in the batch needs it.  This was the dominant cost on tile-heavy
+        # batches: every InsDet episode ran a wasted single-pass forward
+        # before being re-detected via tiling.
+        if any_single_pass:
+            out = model(support_imgs, query_img)
+            pred_box_norm = out["best_box"]
+            existence_prob = out["existence_prob"]
+            score_logit = out["best_score"]
+            prototype = out["prototype"]
+        else:
+            pred_box_norm = None
+            existence_prob = None
+            score_logit = None
+            prototype = None
+
+        for i in range(b):
+            src = sources[i]
+            present = bool(is_present[i].item())
+            do_tile = will_tile[i]
 
             if do_tile:
                 native_pil = query_native_list[i]
@@ -399,6 +410,9 @@ def evaluate(
                     merge_partial_boxes=bool(cfg.get("merge_partial_boxes", True)),
                     merge_min_score=float(cfg.get("merge_min_score", 0.2)),
                 )
+                # Prototype norm is reported as a diagnostic; pull from the
+                # tile path's prototype (computed inside detect_tiled).
+                pnorm = float(tiled.get("prototype_norm", 0.0))
                 # Convert native xyxy → normalised xyxy of the *native* frame.
                 nw, nh = int(native_size[i, 0].item()), int(native_size[i, 1].item())
                 pred_xyxy_native = tiled["best_box_native_xyxy"]
@@ -438,6 +452,7 @@ def evaluate(
                 area = float(
                     pred_box_norm[i, 2].clamp(0, 1) * pred_box_norm[i, 3].clamp(0, 1)
                 )
+                pnorm = float(prototype[i].norm().item())
 
             for bucket in (overall, per_source[src]):
                 bucket["iou"].append(iou_v)
@@ -496,9 +511,42 @@ def evaluate_phase0(
     tile_mode = cfg["mode"]
     tile_for_sources = set(cfg["for_sources"])
 
-    def _phase0_logits_for_query(query_tensor: torch.Tensor, supports_v: torch.Tensor):
-        """Run image-guided detection on a single query tensor, averaging
-        over supports.  Returns (avg_logits, target_pred_boxes)."""
+    def _embed_supports_to_q_embs(supports_v: torch.Tensor) -> torch.Tensor | None:
+        """Embed each of the V support views into a single query embedding.
+
+        ``supports_v`` shape: ``(B, V, 3, S, S)``.
+        Returns ``(B, V, D_q)`` or ``None`` if no support produced an embedding.
+        """
+        b_s, v, _, _, _ = supports_v.shape
+        per_view: list[torch.Tensor] = []                            # each: (B, D_q)
+        for vi in range(v):
+            sup_v = supports_v[:, vi]
+            sup_feature_map, _ = owlv2_model.image_embedder(
+                pixel_values=sup_v, interpolate_pos_encoding=True
+            )
+            sup_h, sup_w, sd = sup_feature_map.shape[1:]
+            sup_feats = sup_feature_map.reshape(b_s, sup_h * sup_w, sd)
+            q_emb, _, _ = owlv2_model.embed_image_query(
+                sup_feats, sup_feature_map, interpolate_pos_encoding=True
+            )
+            if q_emb is None:
+                continue
+            if q_emb.dim() == 3:
+                q_emb = q_emb.squeeze(1)                              # (B, D_q)
+            per_view.append(q_emb)
+        if not per_view:
+            return None
+        return torch.stack(per_view, dim=1)                           # (B, V_kept, D_q)
+
+    def _logits_and_boxes_for_query(
+        query_tensor: torch.Tensor, q_embs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed the query, compute averaged class logits using cached
+        support q_embs, and return target box predictions.
+
+        ``q_embs``: ``(B, V_kept, D_q)`` cached support embeddings.
+        Returns ``(avg_logits (B, P), target_pred_boxes (B, P, 4))``.
+        """
         b_q = query_tensor.size(0)
         q_feature_map, _ = owlv2_model.image_embedder(
             pixel_values=query_tensor, interpolate_pos_encoding=True
@@ -508,27 +556,14 @@ def evaluate_phase0(
         target_pred_boxes = owlv2_model.box_predictor(
             image_feats, q_feature_map, interpolate_pos_encoding=True
         )
-        v = supports_v.size(1)
-        all_logits = []
-        for vi in range(v):
-            sup_v = supports_v[:, vi]
-            sup_feature_map, _ = owlv2_model.image_embedder(
-                pixel_values=sup_v, interpolate_pos_encoding=True
-            )
-            sup_h, sup_w = sup_feature_map.shape[1:3]
-            sup_feats = sup_feature_map.reshape(supports_v.size(0), sup_h * sup_w, d)
-            q_emb, _, _ = owlv2_model.embed_image_query(
-                sup_feats, sup_feature_map, interpolate_pos_encoding=True
-            )
-            if q_emb is None:
-                continue
-            if q_emb.dim() == 2:
-                q_emb = q_emb.unsqueeze(1)
-            logits, _ = owlv2_model.class_predictor(image_feats, q_emb)
-            all_logits.append(logits.squeeze(-1))
-        if not all_logits:
-            return None, None
-        avg_logits = torch.stack(all_logits, dim=0).mean(dim=0)
+        # Average logits across cached supports.
+        v_kept = q_embs.size(1)
+        per_view_logits: list[torch.Tensor] = []
+        for vi in range(v_kept):
+            qe = q_embs[:, vi:vi + 1]                                  # (B, 1, D_q)
+            logits, _ = owlv2_model.class_predictor(image_feats, qe)   # (B, P, 1)
+            per_view_logits.append(logits.squeeze(-1))
+        avg_logits = torch.stack(per_view_logits, dim=0).mean(dim=0)
         return avg_logits, target_pred_boxes
 
     for batch in loader:
@@ -543,42 +578,59 @@ def evaluate_phase0(
 
         b = support_imgs.size(0)
 
-        # Single-pass logits + boxes for the whole batch.
-        avg_logits, target_pred_boxes = _phase0_logits_for_query(query_img, support_imgs)
-        if avg_logits is None:
+        # Cache support embeddings ONCE per batch.  These are reused for
+        # both the batched single-pass forward and every tile of every
+        # tiled episode.
+        q_embs_batch = _embed_supports_to_q_embs(support_imgs)        # (B, V, D_q) or None
+        if q_embs_batch is None:
             continue
-        P = avg_logits.size(1)
+
+        # Decide which episodes go single-pass vs tiled.
+        will_tile = [
+            (
+                tile_mode != "off"
+                and sources[i] in tile_for_sources
+                and query_native_list is not None
+                and native_size is not None
+            )
+            for i in range(b)
+        ]
+        any_single_pass = not all(will_tile)
+
+        if any_single_pass:
+            avg_logits, target_pred_boxes = _logits_and_boxes_for_query(
+                query_img, q_embs_batch
+            )
+            P = avg_logits.size(1)
+        else:
+            avg_logits = None
+            target_pred_boxes = None
+            P = 0
 
         for i in range(b):
             src = sources[i]
             present = bool(is_present[i].item())
-            do_tile = (
-                tile_mode != "off"
-                and src in tile_for_sources
-                and query_native_list is not None
-                and native_size is not None
-            )
+            do_tile = will_tile[i]
 
             if do_tile:
                 native_pil = query_native_list[i]
                 nw, nh = int(native_size[i, 0].item()), int(native_size[i, 1].item())
                 tiles = pyramid_tiles((nw, nh), levels=tuple(cfg["levels"]),
                                       overlap=float(cfg["overlap"]))
-                tile_results: list[tuple[torch.Tensor, float, float]] = []  # (xyxy_native, score, ex)
+                tile_results: list[tuple[torch.Tensor, float, float]] = []
+                q_embs_i = q_embs_batch[i:i + 1]                         # (1, V, D_q)
 
                 def _run(tile):
                     tt = crop_and_normalize(native_pil, tile, img_size).unsqueeze(0).to(device)
-                    avg_l, t_boxes = _phase0_logits_for_query(tt, support_imgs[i:i + 1])
-                    if avg_l is None:
-                        return None
+                    avg_l, t_boxes = _logits_and_boxes_for_query(tt, q_embs_i)
                     P_l = avg_l.size(1)
                     bi = avg_l.argmax(dim=-1).clamp(0, P_l - 1)
                     ar = torch.arange(1, device=device)
-                    bb_local = t_boxes[ar, bi][0]                 # (4,) cxcywh tile-local
+                    bb_local = t_boxes[ar, bi][0]
                     sc_logit = float(avg_l[ar, bi][0].item())
                     sc = 1.0 / (1.0 + pow(2.71828, -sc_logit))
                     bx = _tile_local_cxcywh_to_native_xyxy(bb_local, tile)
-                    return bx, sc, sc                              # use sigmoid as both score and existence
+                    return bx, sc, sc
 
                 for tile in tiles:
                     r = _run(tile)
@@ -638,7 +690,7 @@ def evaluate_phase0(
                         * (pred_xyxy_norm[3] - pred_xyxy_norm[1])
                     )
             else:
-                # Single-pass branch.
+                # Single-pass branch (only runs when avg_logits was computed).
                 bi = int(avg_logits[i].argmax().clamp(0, P - 1).item())
                 bb = target_pred_boxes[i, bi]
                 pred_xyxy = _to_xyxy(bb).clamp(0, 1)

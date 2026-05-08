@@ -38,14 +38,22 @@ def build_optimizer_for_stage(
         p.requires_grad = True
     for p in model.existence_head.parameters():
         p.requires_grad = True
+    model.aggregator_alpha.requires_grad = True
 
     groups: list[dict] = [
-        {"params": list(model.aggregator.parameters()),
+        # Aggregator network + the residual gate scalar.  The gate joins this
+        # group so it sees the same LR / weight decay schedule.
+        {"params": list(model.aggregator.parameters()) + [model.aggregator_alpha],
          "lr": float(cfg["lr_aggregator"]),
          "weight_decay": wd, "name": "aggregator"},
+        # Existence head: tiny (~5K params) + the *only* learner driving the
+        # focal loss in Stage 1.1.  Standard weight decay was pulling its
+        # bias toward zero → constant-output collapse.  Disable WD entirely
+        # for this group; the head is small enough that overfit is not the
+        # failure mode we're worried about.
         {"params": list(model.existence_head.parameters()),
          "lr": float(cfg["lr_existence"]),
-         "weight_decay": wd, "name": "existence_head"},
+         "weight_decay": 0.0, "name": "existence_head"},
     ]
 
     if stage in ("1_2", "2_3"):

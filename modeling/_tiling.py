@@ -386,10 +386,14 @@ def detect_tiled(
     device = support_imgs.device
     nw, nh = query_native.size
 
-    # Encode supports once.
+    # Encode supports once.  Mirror the residual-baseline prototype
+    # construction from ``OWLv2FewShotLocalizer.forward`` so tile inference
+    # uses exactly the same prototype the trained model produces.
     with torch.no_grad():
+        baseline_proto = model.compute_baseline_prototype(support_imgs)  # (1, D_q)
         support_tokens = model.encode_support(support_imgs)
-        prototype = model.aggregator(support_tokens)                 # (1, D_q)
+        correction = model.aggregator(support_tokens)                # (1, D_q)
+        prototype = baseline_proto + model.aggregator_alpha * correction
 
     # First-pass tiles.
     tiles = pyramid_tiles((nw, nh), levels=levels, overlap=overlap)
@@ -511,4 +515,5 @@ def detect_tiled(
         "existence_prob": best_existence,
         "all_boxes_native_xyxy": boxes_kept,
         "all_scores": scores_kept,
+        "prototype_norm": float(prototype.norm().item()),
     }

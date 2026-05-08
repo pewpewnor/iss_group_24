@@ -91,13 +91,16 @@ DEFAULT_CFG: dict[str, Any] = {
     "warmup_frac": 0.05,
     # --- LRs (per stage; trainer picks the right key) ------------------
     "lr_aggregator_s1": 5e-4,
-    "lr_existence_s1":  5e-4,
+    "lr_existence_s1":  2e-3,                # bumped from 5e-4 — existence head is the
+                                             # *only* learner driving the focal loss; tiny
+                                             # head + small LR was a recipe for constant-
+                                             # output collapse.
     "lr_aggregator_s2": 1e-4,
-    "lr_existence_s2":  2e-4,
+    "lr_existence_s2":  4e-4,
     "lr_box_s2":        5e-5,
     "lr_class_s2":      5e-5,
     "lr_aggregator_s3": 5e-5,
-    "lr_existence_s3":  5e-5,
+    "lr_existence_s3":  1e-4,
     "lr_box_s3":        2e-5,
     "lr_class_s3":      2e-5,
     "lr_lora_s3":       1e-4,

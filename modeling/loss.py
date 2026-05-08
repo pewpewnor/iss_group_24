@@ -142,6 +142,80 @@ def existence_mean_kl(
     return kl
 
 
+def existence_margin_loss(
+    existence_logit: torch.Tensor,
+    is_present: torch.Tensor,
+    margin: float = 1.0,
+) -> torch.Tensor:
+    """Hinge-style separation loss between positive and negative logits.
+
+    Forces ``mean_pos_logit - mean_neg_logit >= margin`` over the batch.
+    Directly attacks the constant-output collapse mode where
+    ``existence_head`` outputs the same value for every episode.
+
+    Returns a scalar tensor.  Returns 0 if either pos or neg episodes
+    are absent in the batch (margin is undefined in that case).
+    """
+    is_present_b = is_present.bool()
+    pos_logits = existence_logit[is_present_b]
+    neg_logits = existence_logit[~is_present_b]
+    if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+        return existence_logit.new_zeros(())
+    gap = pos_logits.mean() - neg_logits.mean()
+    return F.relu(margin - gap)
+
+
+def nt_xent_prototype_loss(
+    prototype: torch.Tensor,
+    instance_id: list[str],
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """SimCLR-style NT-Xent contrastive loss on prototypes.
+
+    Treats prototypes from the same instance (different sampled support
+    sets within a batch) as positive pairs; all other in-batch prototypes
+    are negatives.  Forces the aggregator to produce instance-discriminative
+    embeddings even when the focal loss has degenerated.
+
+    Args:
+        prototype   : (B, D) prototypes for each episode.
+        instance_id : list of length B; same string ⇒ same instance.
+        temperature : NT-Xent softmax temperature.
+
+    Returns the InfoNCE loss averaged over anchor positions that have
+    at least one positive partner.  Returns 0 when no positive pairs
+    exist in the batch (i.e. every episode is from a different instance).
+    """
+    b = prototype.size(0)
+    if b < 2:
+        return prototype.new_zeros(())
+
+    # L2-normalise prototypes for cosine-similarity logits.
+    p_norm = F.normalize(prototype, dim=-1)
+    sim = p_norm @ p_norm.t() / temperature                          # (B, B)
+    # Mask self-similarity.
+    eye = torch.eye(b, dtype=torch.bool, device=sim.device)
+    sim = sim.masked_fill(eye, float("-inf"))
+
+    # Build positive mask: same instance_id and not self.
+    pos_mask = torch.zeros((b, b), dtype=torch.bool, device=sim.device)
+    for i in range(b):
+        for j in range(b):
+            if i != j and instance_id[i] == instance_id[j]:
+                pos_mask[i, j] = True
+
+    # Loss per anchor row that has at least one positive.
+    has_pos = pos_mask.any(dim=1)
+    if not has_pos.any():
+        return prototype.new_zeros(())
+
+    log_prob = F.log_softmax(sim, dim=1)                              # (B, B)
+    pos_log_prob = log_prob.masked_fill(~pos_mask, 0.0).sum(dim=1)
+    n_pos_per_row = pos_mask.sum(dim=1).clamp(min=1)
+    per_row = -(pos_log_prob / n_pos_per_row)
+    return per_row[has_pos].mean()
+
+
 # ---------------------------------------------------------------------------
 # Combined total loss
 # ---------------------------------------------------------------------------
@@ -160,6 +234,14 @@ def total_loss(
     anti_collapse_weight: float = 0.1,
     box_size_threshold: float = 0.6,
     existence_kl_threshold: float = 0.85,
+    # New separation / discriminative terms (added to fight existence-head
+    # collapse and to push the aggregator toward instance-discriminative
+    # prototypes).
+    margin_weight: float = 0.5,
+    margin_value: float = 1.0,
+    contrastive_weight: float = 0.1,
+    contrastive_temp: float = 0.1,
+    instance_id: list[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute combined loss + per-term diagnostics.
 
@@ -168,6 +250,16 @@ def total_loss(
         gt_bbox_cxcywh      : (B, 4) normalised cxcywh.
         is_present          : (B,) bool.
         use_box_loss        : disable for Stage 1.1 (existence-only).
+        margin_weight       : weight on the pos/neg existence-logit margin
+                              loss.  Set to 0 to disable.
+        margin_value        : required gap between mean(pos_logit) and
+                              mean(neg_logit).
+        contrastive_weight  : weight on the NT-Xent contrastive loss applied
+                              to prototypes.  Set to 0 to disable.
+        contrastive_temp    : temperature for NT-Xent.
+        instance_id         : optional list of instance ids per batch element.
+                              Required when contrastive_weight > 0; otherwise
+                              the contrastive term silently no-ops.
     """
     targets = is_present.float()
     existence_logit = out["existence_logit"]
@@ -178,6 +270,24 @@ def total_loss(
 
     losses: dict[str, torch.Tensor] = {"focal": focal}
     total = focal
+
+    # Margin loss: forbid the constant-output collapse.
+    if margin_weight > 0.0:
+        margin = existence_margin_loss(existence_logit, is_present, margin=margin_value)
+        losses["margin"] = margin
+        total = total + margin_weight * margin
+    else:
+        losses["margin"] = focal.new_zeros(())
+
+    # NT-Xent on prototypes: instance-discriminative pressure.
+    if contrastive_weight > 0.0 and instance_id is not None and "prototype" in out:
+        nt = nt_xent_prototype_loss(
+            out["prototype"], instance_id, temperature=contrastive_temp
+        )
+        losses["nt_xent"] = nt
+        total = total + contrastive_weight * nt
+    else:
+        losses["nt_xent"] = focal.new_zeros(())
 
     # Box loss only on confident-positive predictions of positive episodes.
     if use_box_loss:

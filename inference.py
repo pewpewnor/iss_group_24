@@ -35,6 +35,8 @@ Use as a CLI:
         --supports s1.jpg s2.jpg s3.jpg s4.jpg \\
         --query    scene.jpg \\
         --tile-mode pyramid_a
+
+    python inference.py --checkpoint checkpoints/stage_1_1/last.pt --supports dataset/aggregated/test/support/hots_banana/001.png dataset/aggregated/test/support/hots_banana/002.png dataset/aggregated/test/support/hots_banana/003.png dataset/aggregated/test/support/hots_banana/004.png --query dataset/aggregated/test/query/hots_banana/001.png
 """
 
 from __future__ import annotations

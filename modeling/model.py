@@ -376,6 +376,13 @@ class OWLv2FewShotLocalizer(nn.Module):
         )
         self.existence_head = ExistenceHead(dropout=existence_dropout)
 
+        # Residual aggregator gate.  At init alpha=0 so the prototype equals
+        # OWLv2's image-guided baseline (mean of per-view embed_image_query
+        # outputs).  This guarantees Stage 1.1 starts at *at least* the
+        # Phase-0 zero-shot quality and improves from there as the
+        # aggregator learns a useful correction term.
+        self.aggregator_alpha = nn.Parameter(torch.zeros(()))
+
         # Default: backbone frozen.
         self.freeze_owlv2_all()
 
@@ -475,14 +482,55 @@ class OWLv2FewShotLocalizer(nn.Module):
         image_feats = feature_map.reshape(b, gh * gw, d)
         return image_feats, feature_map
 
+    @torch.no_grad()
+    def compute_baseline_prototype(
+        self, support_imgs: torch.Tensor
+    ) -> torch.Tensor:
+        """Mean over views of OWLv2's ``embed_image_query`` output.
+
+        This is the per-support query embedding that OWLv2's native image-
+        guided detection would derive — the same path Phase 0 uses.  We
+        average across the V support views to get a single (B, D_q)
+        prototype baseline that is stable from epoch 0 (zero-shot quality).
+
+        The result is detached: this baseline is a pre-trained signal we
+        do not want gradient flowing into.  Gradient enters the prototype
+        path exclusively via the learned ``aggregator`` correction.
+        """
+        b, v, c, h, w = support_imgs.shape
+        baselines: list[torch.Tensor] = []
+        for vi in range(v):
+            sup_v = support_imgs[:, vi]                              # (B, 3, S, S)
+            sup_fm, _ = self.owlv2.image_embedder(
+                pixel_values=sup_v, interpolate_pos_encoding=True
+            )                                                        # (B, gh, gw, D_v)
+            sup_h, sup_w, sd = sup_fm.shape[1:]
+            sup_feats = sup_fm.reshape(b, sup_h * sup_w, sd)
+            q_emb, _, _ = self.owlv2.embed_image_query(
+                sup_feats, sup_fm, interpolate_pos_encoding=True
+            )
+            if q_emb is None:
+                continue
+            if q_emb.dim() == 3:
+                q_emb = q_emb.squeeze(1)                              # (B, D_q)
+            baselines.append(q_emb)
+        if not baselines:
+            # Fallback: zero baseline (effectively disables the residual init).
+            return torch.zeros(b, self.query_dim, device=support_imgs.device)
+        return torch.stack(baselines, dim=0).mean(dim=0)             # (B, D_q)
+
     def forward(
         self,
         support_imgs: torch.Tensor,
         query_img: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         # Support → prototype.
+        # Baseline: mean of OWLv2's per-support image-guided query embed.
+        # Detached so gradient never reaches OWLv2 through the baseline path.
+        baseline_proto = self.compute_baseline_prototype(support_imgs)  # (B, D_q)
         support_tokens = self.encode_support(support_imgs)           # (B, V, P, D_v)
-        prototype = self.aggregator(support_tokens)                  # (B, D_q)
+        correction = self.aggregator(support_tokens)                 # (B, D_q)
+        prototype = baseline_proto + self.aggregator_alpha * correction
         query_embeds = prototype.unsqueeze(1)                        # (B, 1, D_q)
 
         # Query → patch features.
