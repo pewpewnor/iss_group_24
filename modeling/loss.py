@@ -221,7 +221,16 @@ def task_aligned_assign(
     # Per-cell IoU(pred, gt).
     pred_xyxy = decoded_boxes.permute(0, 2, 3, 1)                            # (B, H, W, 4)
     gt_xyxy = gt_bbox.view(B, 1, 1, 4).expand_as(pred_xyxy)
-    cell_iou = _iou_xyxy(pred_xyxy, gt_xyxy).clamp(min=0.0, max=1.0)
+    cell_iou = _iou_xyxy(pred_xyxy, gt_xyxy)
+    # NaN/Inf can leak in if upstream ``reg_logits`` go non-finite (AMP fp16
+    # overflow, exploding grads after stage-2 unfreeze, etc.). ``clamp`` does
+    # NOT sanitize NaN, and downstream ``int(top_iou.sum().round())`` crashes
+    # with "cannot convert float NaN to integer". Replace non-finite IoU with
+    # 0 so the assigner gracefully falls into its cold-start branch; the
+    # loss itself will still go NaN through reg_logits and AMP's GradScaler
+    # will skip the step.
+    cell_iou = torch.nan_to_num(cell_iou, nan=0.0, posinf=0.0, neginf=0.0)
+    cell_iou = cell_iou.clamp(min=0.0, max=1.0)
     # Mask iou to candidates (so non-candidates don't get picked by topk).
     cell_iou_masked = torch.where(candidate, cell_iou, cell_iou.new_zeros(()))
 
@@ -454,16 +463,25 @@ def nt_xent_loss(prototypes: torch.Tensor, temperature: float = 0.1) -> torch.Te
         b, k, d = prototypes.shape
         if b * k < 2 or k < 2:
             return torch.zeros((), device=prototypes.device)
-        z = F.normalize(prototypes.reshape(b * k, d), dim=-1)
+        # Compute in float32 — masked_fill with large negative constants
+        # overflows fp16, and 0 * -inf produces NaN at the diagonal.
+        z = F.normalize(prototypes.reshape(b * k, d).float(), dim=-1)
         sim = z @ z.T / temperature
         eye = torch.eye(b * k, dtype=torch.bool, device=z.device)
-        sim = sim.masked_fill(eye, -1e9)
+        sim = sim.masked_fill(eye, float("-inf"))
         ep_idx = torch.arange(b, device=z.device).repeat_interleave(k)
         pos_mask = (ep_idx.unsqueeze(0) == ep_idx.unsqueeze(1)) & ~eye
         log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+        # Use ``torch.where`` rather than multiply: 0 * -inf = NaN, but
+        # ``where(False, -inf, 0)`` cleanly returns 0.
+        pos_log = torch.where(pos_mask, log_prob, log_prob.new_zeros(()))
         pos_count = pos_mask.sum(dim=1).clamp(min=1)
-        loss = -(log_prob * pos_mask.float()).sum(dim=1) / pos_count
-        return loss.mean()
+        # Episodes with no in-batch positives contribute 0 (excluded via mask).
+        has_pos = pos_mask.any(dim=1)
+        loss_rows = -pos_log.sum(dim=1) / pos_count
+        if not has_pos.any():
+            return torch.zeros((), device=prototypes.device)
+        return loss_rows[has_pos].mean()
     B = prototypes.shape[0]
     if B < 2:
         return torch.zeros((), device=prototypes.device)

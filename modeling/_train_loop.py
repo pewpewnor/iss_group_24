@@ -149,9 +149,16 @@ def train_one_pass(
             )
             loss = losses["loss"]
 
-            nt_v = vr_v = bt_v = trip_v = 0.0
+        # Prototype regularisation losses run in fp32 — small tensors, and
+        # masked_fill with large negative constants overflows fp16 (max ~65504).
+        nt_v = vr_v = bt_v = trip_v = 0.0
+        with torch.amp.autocast("cuda", enabled=False):
             per_shot = out.get("per_shot_prototype")
             con_target = per_shot if per_shot is not None else out["prototype"]
+            if con_target is not None:
+                con_target = con_target.float()
+            per_shot_f = per_shot.float() if per_shot is not None else None
+            proto_f = out["prototype"].float() if out.get("prototype") is not None else None
             if cfg["contrastive"] and con_target is not None:
                 nt = nt_xent_loss(con_target, temperature=cfg["contrastive_temp"])
                 loss = loss + cfg["contrastive_weight"] * nt
@@ -160,16 +167,17 @@ def train_one_pass(
                 vr = vicreg_loss(con_target)
                 loss = loss + cfg["vicreg_weight"] * vr
                 vr_v = float(vr.detach().item())
-            if cfg["barlow"] and per_shot is not None:
-                bt = barlow_twins_loss(per_shot)
+            if cfg["barlow"] and per_shot_f is not None:
+                bt = barlow_twins_loss(per_shot_f)
                 loss = loss + cfg["barlow_weight"] * bt
                 bt_v = float(bt.detach().item())
-            if cfg["triplet"]:
-                trip = triplet_loss(out["prototype"], list(batch["instance_id"]))
+            if cfg["triplet"] and proto_f is not None:
+                trip = triplet_loss(proto_f, list(batch["instance_id"]))
                 loss = loss + cfg["triplet_weight"] * trip
                 trip_v = float(trip.detach().item())
 
         optimizer.zero_grad(set_to_none=True)
+        stepped = True
         if amp_enabled and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -177,8 +185,15 @@ def train_one_pass(
                 [p for g in optimizer.param_groups for p in g["params"]],
                 cfg["grad_clip"],
             )
+            # Track whether the optimizer actually stepped — under AMP
+            # ``scaler.step`` becomes a no-op on inf/NaN gradients (early-
+            # training instability). Advancing the LR scheduler in that case
+            # triggers PyTorch's "lr_scheduler.step() before optimizer.step()"
+            # warning AND skips one cosine value.
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            stepped = scaler.get_scale() >= scale_before
         else:
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(
@@ -186,10 +201,11 @@ def train_one_pass(
                 cfg["grad_clip"],
             )
             optimizer.step()
-        scheduler.step()
 
-        if ema is not None:
-            ema.update(model)
+        if stepped:
+            scheduler.step()
+            if ema is not None:
+                ema.update(model)
 
         running["loss"] += float(loss.item())
         for k in (

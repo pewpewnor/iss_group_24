@@ -48,7 +48,8 @@ def build_proto_cache(
             batch_support.append(torch.stack(imgs))
         support_imgs_t = torch.stack(batch_support).to(device)
         tokens, _, _ = model.encode_support(support_imgs_t)
-        prototypes = model.support_pool(tokens)
+        # Bag-level summary (B, DIM) for cosine-similarity-based hard-neg mining.
+        prototypes = model.support_pool.forward_bag(tokens)
         for i, instance in enumerate(batch_instances):
             cache[instance["instance_id"]] = prototypes[i].cpu()
     if was_training:

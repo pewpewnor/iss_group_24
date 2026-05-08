@@ -1,5 +1,5 @@
 {
   "stage_completed": true,
   "epochs_run": 5,
-  "best_val_map_50": 0.0192
+  "best_val_map_50": 0.01
 }

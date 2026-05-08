@@ -9,12 +9,20 @@
       "value": 0.0965
     },
     "stage2.val.map_50": {
-      "epoch": 1,
-      "value": 0.0151
+      "epoch": 7,
+      "value": 0.0217
     },
     "stage2.val.iou_mean": {
-      "epoch": 5,
-      "value": 0.077
+      "epoch": 8,
+      "value": 0.0874
+    },
+    "stage3.val.map_50_mean": {
+      "epoch": 6,
+      "value": 0.16076666666666664
+    },
+    "stage3.val.iou_mean_mean": {
+      "epoch": 8,
+      "value": 0.1843
     }
   }
 }

@@ -1,0 +1,1428 @@
+{
+  "epoch": 3,
+  "n_folds": 3,
+  "metrics": {
+    "epoch": {
+      "mean": 3.0,
+      "min": 3.0,
+      "max": 3.0,
+      "std": 0.0
+    },
+    "fold": {
+      "mean": 1.0,
+      "min": 0.0,
+      "max": 2.0,
+      "std": 0.816496580927726
+    },
+    "lr.group_0": {
+      "mean": 4.7858861753038965e-06,
+      "min": 4.711006417512035e-06,
+      "max": 4.856737106550968e-06,
+      "std": 5.956247148687139e-08
+    },
+    "lr.group_1": {
+      "mean": 4.7858861753038965e-06,
+      "min": 4.711006417512035e-06,
+      "max": 4.856737106550968e-06,
+      "std": 5.956247148687139e-08
+    },
+    "lr.group_2": {
+      "mean": 9.56346997781344e-05,
+      "min": 9.410806961417375e-05,
+      "max": 9.707919121315131e-05,
+      "std": 1.214345081946675e-06
+    },
+    "stage": {
+      "mean": 3.0,
+      "min": 3.0,
+      "max": 3.0,
+      "std": 0.0
+    },
+    "train.attn": {
+      "mean": 0.17720215238871115,
+      "min": 0.17282080470073607,
+      "max": 0.17963187011980242,
+      "std": 0.003104222678025847
+    },
+    "train.aux": {
+      "mean": 2.7817255553378857,
+      "min": 2.6354713632214453,
+      "max": 2.869414952493483,
+      "std": 0.10409859796358167
+    },
+    "train.barlow": {
+      "mean": 0.08564996078450193,
+      "min": 0.08384112521044669,
+      "max": 0.08825195400464919,
+      "std": 0.0018860323347541287
+    },
+    "train.centerness": {
+      "mean": 1.1605239465672483,
+      "min": 1.1314402809066157,
+      "max": 1.178206657209704,
+      "std": 0.020724539715441758
+    },
+    "train.contrastive_presence": {
+      "mean": 1.0707676554879835,
+      "min": 0.9605754652330952,
+      "max": 1.1504317300934945,
+      "std": 0.08045837313174986
+    },
+    "train.dfl": {
+      "mean": 1.0180741372287914,
+      "min": 0.9884427160986008,
+      "max": 1.0553905973511357,
+      "std": 0.02786634253341082
+    },
+    "train.entropy_reg": {
+      "mean": 0.520113903989074,
+      "min": 0.4315112483116888,
+      "max": 0.5987503797777237,
+      "std": 0.06863781916484724
+    },
+    "train.feature_spread": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "train.giou": {
+      "mean": 2.2876488592035025,
+      "min": 2.1480552515675946,
+      "max": 2.4502469570406022,
+      "std": 0.12443702996893324
+    },
+    "train.grad_norm": {
+      "mean": Infinity,
+      "min": 26.537083933430335,
+      "max": Infinity,
+      "std": NaN
+    },
+    "train.loss": {
+      "mean": 7.647446596494285,
+      "min": 7.241203869542768,
+      "max": 7.927969701828495,
+      "std": 0.29412683720177124
+    },
+    "train.n_steps": {
+      "mean": 62.0,
+      "min": 62.0,
+      "max": 62.0,
+      "std": 0.0
+    },
+    "train.neg_qfl": {
+      "mean": 0.0001575751913806407,
+      "min": 0.0001379066169970282,
+      "max": 0.00017397666893122086,
+      "std": 1.4905650000836291e-05
+    },
+    "train.nt_xent": {
+      "mean": 1.291639084457069,
+      "min": 1.2774048101517461,
+      "max": 1.3024731816784028,
+      "std": 0.010512745150577573
+    },
+    "train.pred_iou": {
+      "mean": 0.32800529064029776,
+      "min": 0.24878815753806022,
+      "max": 0.4109554507078663,
+      "std": 0.06625712218948429
+    },
+    "train.presence": {
+      "mean": 0.08777151050506742,
+      "min": 0.08144795876597205,
+      "max": 0.09347617235635558,
+      "std": 0.004929959368588092
+    },
+    "train.proto_norm": {
+      "mean": 33.20335394336331,
+      "min": 30.737696893753544,
+      "max": 35.60290435052687,
+      "std": 1.9867626037505215
+    },
+    "train.qfl": {
+      "mean": 0.5423462539110132,
+      "min": 0.4789397774204131,
+      "max": 0.6146350279450417,
+      "std": 0.0557522595115984
+    },
+    "train.reg_l2_prior": {
+      "mean": 824.8279304094212,
+      "min": 808.8258706369708,
+      "max": 845.4986247401083,
+      "std": 15.33122814945734
+    },
+    "train.triplet": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "train.vicreg": {
+      "mean": 0.6079810880204682,
+      "min": 0.5975858819100165,
+      "max": 0.6170566851092923,
+      "std": 0.008003502161916521
+    },
+    "val.img_size": {
+      "mean": 224.0,
+      "min": 224.0,
+      "max": 224.0,
+      "std": 0.0
+    },
+    "val.iou_thr": {
+      "mean": 0.5,
+      "min": 0.5,
+      "max": 0.5,
+      "std": 0.0
+    },
+    "val.overall.ap_per_iou.0.50": {
+      "mean": 0.048600000000000004,
+      "min": 0.0404,
+      "max": 0.0646,
+      "std": 0.011314886948912336
+    },
+    "val.overall.ap_per_iou.0.55": {
+      "mean": 0.030466666666666666,
+      "min": 0.0226,
+      "max": 0.0436,
+      "std": 0.009347132656001459
+    },
+    "val.overall.ap_per_iou.0.60": {
+      "mean": 0.014900000000000002,
+      "min": 0.0041,
+      "max": 0.0274,
+      "std": 0.009587839520281234
+    },
+    "val.overall.ap_per_iou.0.65": {
+      "mean": 0.008833333333333334,
+      "min": 0.0021,
+      "max": 0.0138,
+      "std": 0.004937160677510461
+    },
+    "val.overall.ap_per_iou.0.70": {
+      "mean": 0.006999999999999999,
+      "min": 0.0008,
+      "max": 0.0109,
+      "std": 0.00443245605355165
+    },
+    "val.overall.ap_per_iou.0.75": {
+      "mean": 0.0039000000000000003,
+      "min": 0.0,
+      "max": 0.0099,
+      "std": 0.004305810028322197
+    },
+    "val.overall.ap_per_iou.0.80": {
+      "mean": 0.00013333333333333334,
+      "min": 0.0,
+      "max": 0.0004,
+      "std": 0.00018856180831641268
+    },
+    "val.overall.ap_per_iou.0.85": {
+      "mean": 6.666666666666667e-05,
+      "min": 0.0,
+      "max": 0.0002,
+      "std": 9.428090415820634e-05
+    },
+    "val.overall.ap_per_iou.0.90": {
+      "mean": 6.666666666666667e-05,
+      "min": 0.0,
+      "max": 0.0002,
+      "std": 9.428090415820634e-05
+    },
+    "val.overall.ap_per_iou.0.95": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.overall.argmax_cell_entropy": {
+      "mean": 4.087166666666667,
+      "min": 4.0554,
+      "max": 4.1246,
+      "std": 0.028533528036719012
+    },
+    "val.overall.conf_map_mean_neg": {
+      "mean": 0.027866666666666668,
+      "min": 0.0274,
+      "max": 0.0285,
+      "std": 0.000464279609239471
+    },
+    "val.overall.conf_map_mean_pos": {
+      "mean": 0.024900000000000002,
+      "min": 0.0239,
+      "max": 0.0255,
+      "std": 0.0007118052168020864
+    },
+    "val.overall.conf_map_std_neg": {
+      "mean": 0.028999999999999998,
+      "min": 0.0278,
+      "max": 0.0302,
+      "std": 0.0009797958971132724
+    },
+    "val.overall.conf_map_std_pos": {
+      "mean": 0.027366666666666668,
+      "min": 0.0254,
+      "max": 0.0288,
+      "std": 0.001438363267359428
+    },
+    "val.overall.contain_at_iou_50": {
+      "mean": 0.11113333333333335,
+      "min": 0.0763,
+      "max": 0.1404,
+      "std": 0.026463097996182443
+    },
+    "val.overall.contain_at_iou_75": {
+      "mean": 0.014466666666666668,
+      "min": 0.0,
+      "max": 0.0351,
+      "std": 0.014978280571844315
+    },
+    "val.overall.contain_mean": {
+      "mean": 0.1989,
+      "min": 0.1822,
+      "max": 0.2114,
+      "std": 0.012285221474058442
+    },
+    "val.overall.f1_50": {
+      "mean": 0.1428,
+      "min": 0.0978,
+      "max": 0.1768,
+      "std": 0.03317629675938331
+    },
+    "val.overall.frac_pred_near_corner": {
+      "mean": 0.004166666666666667,
+      "min": 0.0,
+      "max": 0.0083,
+      "std": 0.0033885427874268048
+    },
+    "val.overall.frac_pred_tiny_box": {
+      "mean": 0.11943333333333334,
+      "min": 0.1042,
+      "max": 0.1333,
+      "std": 0.011919265450894568
+    },
+    "val.overall.iou_mean": {
+      "mean": 0.13863333333333333,
+      "min": 0.1306,
+      "max": 0.1437,
+      "std": 0.005744756062899647
+    },
+    "val.overall.iou_median": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.overall.iou_p25": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.overall.iou_p75": {
+      "mean": 0.22516666666666665,
+      "min": 0.1542,
+      "max": 0.2713,
+      "std": 0.050928861060197374
+    },
+    "val.overall.map_50": {
+      "mean": 0.048600000000000004,
+      "min": 0.0404,
+      "max": 0.0646,
+      "std": 0.011314886948912336
+    },
+    "val.overall.map_5095": {
+      "mean": 0.0114,
+      "min": 0.0073,
+      "max": 0.017,
+      "std": 0.004099593475781065
+    },
+    "val.overall.mean_score_neg": {
+      "mean": 0.4443333333333333,
+      "min": 0.4387,
+      "max": 0.4493,
+      "std": 0.004353032148846238
+    },
+    "val.overall.mean_score_pos": {
+      "mean": 0.5700333333333333,
+      "min": 0.5645,
+      "max": 0.5748,
+      "std": 0.00423975890299855
+    },
+    "val.overall.n": {
+      "mean": 240.0,
+      "min": 240.0,
+      "max": 240.0,
+      "std": 0.0
+    },
+    "val.overall.n_neg": {
+      "mean": 122.66666666666667,
+      "min": 120.0,
+      "max": 126.0,
+      "std": 2.494438257849294
+    },
+    "val.overall.n_pos": {
+      "mean": 117.33333333333333,
+      "min": 114.0,
+      "max": 120.0,
+      "std": 2.494438257849294
+    },
+    "val.overall.precision_50": {
+      "mean": 0.20033333333333334,
+      "min": 0.1364,
+      "max": 0.2388,
+      "std": 0.04551815266706485
+    },
+    "val.overall.presence_acc": {
+      "mean": 0.7180666666666666,
+      "min": 0.7125,
+      "max": 0.725,
+      "std": 0.005193799722318465
+    },
+    "val.overall.presence_acc_neg": {
+      "mean": 0.576,
+      "min": 0.5328,
+      "max": 0.6,
+      "std": 0.030609802351534345
+    },
+    "val.overall.presence_acc_pos": {
+      "mean": 0.8664,
+      "min": 0.85,
+      "max": 0.8983,
+      "std": 0.022559698579546674
+    },
+    "val.overall.presence_auroc": {
+      "mean": 0.8043,
+      "min": 0.7695,
+      "max": 0.8221,
+      "std": 0.02460948326695765
+    },
+    "val.overall.presence_brier": {
+      "mean": 0.20099999999999998,
+      "min": 0.1978,
+      "max": 0.2062,
+      "std": 0.0037094473981982763
+    },
+    "val.overall.presence_pr_auc": {
+      "mean": 0.7607666666666667,
+      "min": 0.7196,
+      "max": 0.7865,
+      "std": 0.029411373461450046
+    },
+    "val.overall.recall_50": {
+      "mean": 0.11113333333333335,
+      "min": 0.0763,
+      "max": 0.1404,
+      "std": 0.026463097996182443
+    },
+    "val.overall.support_proto_norm_mean": {
+      "mean": 6.8322666666666665,
+      "min": 6.7365,
+      "max": 6.9916,
+      "std": 0.11342998819634165
+    },
+    "val.overall.support_proto_norm_std": {
+      "mean": 0.3895,
+      "min": 0.3274,
+      "max": 0.4363,
+      "std": 0.04575565538815939
+    },
+    "val.per_source.hots.ap_per_iou.0.50": {
+      "mean": 0.019733333333333332,
+      "min": 0.0022,
+      "max": 0.0407,
+      "std": 0.015903947797812828
+    },
+    "val.per_source.hots.ap_per_iou.0.55": {
+      "mean": 0.017566666666666668,
+      "min": 0.0022,
+      "max": 0.0367,
+      "std": 0.014334186021148497
+    },
+    "val.per_source.hots.ap_per_iou.0.60": {
+      "mean": 0.009466666666666667,
+      "min": 0.0022,
+      "max": 0.0216,
+      "std": 0.008635327954912245
+    },
+    "val.per_source.hots.ap_per_iou.0.65": {
+      "mean": 0.005533333333333334,
+      "min": 0.0,
+      "max": 0.0144,
+      "std": 0.006333684200807264
+    },
+    "val.per_source.hots.ap_per_iou.0.70": {
+      "mean": 0.005533333333333334,
+      "min": 0.0,
+      "max": 0.0144,
+      "std": 0.006333684200807264
+    },
+    "val.per_source.hots.ap_per_iou.0.75": {
+      "mean": 0.0014999999999999998,
+      "min": 0.0,
+      "max": 0.0045,
+      "std": 0.0021213203435596424
+    },
+    "val.per_source.hots.ap_per_iou.0.80": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.hots.ap_per_iou.0.85": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.hots.ap_per_iou.0.90": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.hots.ap_per_iou.0.95": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.hots.conf_map_mean_neg": {
+      "mean": 0.024999999999999998,
+      "min": 0.0218,
+      "max": 0.0268,
+      "std": 0.0022686266036231408
+    },
+    "val.per_source.hots.conf_map_mean_pos": {
+      "mean": 0.019933333333333334,
+      "min": 0.0158,
+      "max": 0.0231,
+      "std": 0.0030575952787916323
+    },
+    "val.per_source.hots.conf_map_std_neg": {
+      "mean": 0.024966666666666665,
+      "min": 0.0205,
+      "max": 0.0293,
+      "std": 0.0035938218591849477
+    },
+    "val.per_source.hots.conf_map_std_pos": {
+      "mean": 0.022699999999999998,
+      "min": 0.0149,
+      "max": 0.028,
+      "std": 0.005632642955723953
+    },
+    "val.per_source.hots.contain_at_iou_50": {
+      "mean": 0.05736666666666667,
+      "min": 0.0,
+      "max": 0.0952,
+      "std": 0.04124660255369189
+    },
+    "val.per_source.hots.contain_at_iou_75": {
+      "mean": 0.031733333333333336,
+      "min": 0.0,
+      "max": 0.0952,
+      "std": 0.04487771037930622
+    },
+    "val.per_source.hots.contain_mean": {
+      "mean": 0.0897,
+      "min": 0.0826,
+      "max": 0.0995,
+      "std": 0.007158677717753934
+    },
+    "val.per_source.hots.f1_50": {
+      "mean": 0.08976666666666666,
+      "min": 0.0,
+      "max": 0.1481,
+      "std": 0.06441761318838886
+    },
+    "val.per_source.hots.frac_pred_near_corner": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.hots.frac_pred_tiny_box": {
+      "mean": 0.48869999999999997,
+      "min": 0.4615,
+      "max": 0.5263,
+      "std": 0.02745760368276881
+    },
+    "val.per_source.hots.iou_mean": {
+      "mean": 0.04633333333333334,
+      "min": 0.0172,
+      "max": 0.073,
+      "std": 0.02284693025818178
+    },
+    "val.per_source.hots.iou_median": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.hots.iou_p25": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.hots.iou_p75": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.hots.map_50": {
+      "mean": 0.019733333333333332,
+      "min": 0.0022,
+      "max": 0.0407,
+      "std": 0.015903947797812828
+    },
+    "val.per_source.hots.map_5095": {
+      "mean": 0.005933333333333333,
+      "min": 0.0011,
+      "max": 0.0132,
+      "std": 0.005230891149911477
+    },
+    "val.per_source.hots.mean_score_neg": {
+      "mean": 0.3788666666666667,
+      "min": 0.3539,
+      "max": 0.3914,
+      "std": 0.01765414650695097
+    },
+    "val.per_source.hots.mean_score_pos": {
+      "mean": 0.6488333333333333,
+      "min": 0.6427,
+      "max": 0.6596,
+      "std": 0.007637771635467711
+    },
+    "val.per_source.hots.n": {
+      "mean": 41.0,
+      "min": 38.0,
+      "max": 46.0,
+      "std": 3.559026084010437
+    },
+    "val.per_source.hots.n_neg": {
+      "mean": 18.666666666666668,
+      "min": 17.0,
+      "max": 20.0,
+      "std": 1.247219128924647
+    },
+    "val.per_source.hots.n_pos": {
+      "mean": 22.333333333333332,
+      "min": 20.0,
+      "max": 26.0,
+      "std": 2.6246692913372702
+    },
+    "val.per_source.hots.precision_50": {
+      "mean": 0.20633333333333334,
+      "min": 0.0,
+      "max": 0.3333,
+      "std": 0.14718814112858716
+    },
+    "val.per_source.hots.presence_acc": {
+      "mean": 0.8872333333333334,
+      "min": 0.8696,
+      "max": 0.8974,
+      "std": 0.012517276949169967
+    },
+    "val.per_source.hots.presence_acc_neg": {
+      "mean": 0.7680666666666666,
+      "min": 0.75,
+      "max": 0.7895,
+      "std": 0.016300579403471783
+    },
+    "val.per_source.hots.presence_acc_pos": {
+      "mean": 0.9871666666666666,
+      "min": 0.9615,
+      "max": 1.0,
+      "std": 0.01814907405045471
+    },
+    "val.per_source.hots.presence_auroc": {
+      "mean": 0.9186666666666667,
+      "min": 0.9132,
+      "max": 0.9216,
+      "std": 0.003868964834279168
+    },
+    "val.per_source.hots.presence_brier": {
+      "mean": 0.14336666666666667,
+      "min": 0.1386,
+      "max": 0.1488,
+      "std": 0.004190730511763096
+    },
+    "val.per_source.hots.presence_pr_auc": {
+      "mean": 0.8922333333333333,
+      "min": 0.8341,
+      "max": 0.9242,
+      "std": 0.04117461461736941
+    },
+    "val.per_source.hots.recall_50": {
+      "mean": 0.05736666666666667,
+      "min": 0.0,
+      "max": 0.0952,
+      "std": 0.04124660255369189
+    },
+    "val.per_source.hots.support_proto_norm_mean": {
+      "mean": 6.9302,
+      "min": 6.7236,
+      "max": 7.1399,
+      "std": 0.16996789892996447
+    },
+    "val.per_source.hots.support_proto_norm_std": {
+      "mean": 0.24766666666666667,
+      "min": 0.209,
+      "max": 0.3022,
+      "std": 0.03966840332332804
+    },
+    "val.per_source.insdet.ap_per_iou.0.50": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.55": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.60": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.65": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.70": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.75": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.80": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.85": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.90": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.ap_per_iou.0.95": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.conf_map_mean_neg": {
+      "mean": 0.0218,
+      "min": 0.021,
+      "max": 0.0223,
+      "std": 0.000571547606649408
+    },
+    "val.per_source.insdet.conf_map_mean_pos": {
+      "mean": 0.013233333333333333,
+      "min": 0.0129,
+      "max": 0.0137,
+      "std": 0.0003399346342395191
+    },
+    "val.per_source.insdet.conf_map_std_neg": {
+      "mean": 0.022966666666666666,
+      "min": 0.0214,
+      "max": 0.0251,
+      "std": 0.001562761089297473
+    },
+    "val.per_source.insdet.conf_map_std_pos": {
+      "mean": 0.015,
+      "min": 0.0141,
+      "max": 0.0162,
+      "std": 0.0008831760866327844
+    },
+    "val.per_source.insdet.contain_at_iou_50": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.contain_at_iou_75": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.contain_mean": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.f1_50": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.frac_pred_near_corner": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.frac_pred_tiny_box": {
+      "mean": 0.014133333333333333,
+      "min": 0.0109,
+      "max": 0.0206,
+      "std": 0.004572623851673008
+    },
+    "val.per_source.insdet.iou_mean": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.iou_median": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.iou_p25": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.iou_p75": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.map_50": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.map_5095": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.mean_score_neg": {
+      "mean": 0.4062666666666666,
+      "min": 0.379,
+      "max": 0.4275,
+      "std": 0.020254437099614053
+    },
+    "val.per_source.insdet.mean_score_pos": {
+      "mean": 0.5764333333333334,
+      "min": 0.5699,
+      "max": 0.5853,
+      "std": 0.0064999145293526146
+    },
+    "val.per_source.insdet.n": {
+      "mean": 93.66666666666667,
+      "min": 92.0,
+      "max": 97.0,
+      "std": 2.357022603955158
+    },
+    "val.per_source.insdet.n_neg": {
+      "mean": 50.666666666666664,
+      "min": 49.0,
+      "max": 53.0,
+      "std": 1.699673171197595
+    },
+    "val.per_source.insdet.n_pos": {
+      "mean": 43.0,
+      "min": 42.0,
+      "max": 44.0,
+      "std": 0.816496580927726
+    },
+    "val.per_source.insdet.precision_50": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.presence_acc": {
+      "mean": 0.8195,
+      "min": 0.7629,
+      "max": 0.8913,
+      "std": 0.05350962530236965
+    },
+    "val.per_source.insdet.presence_acc_neg": {
+      "mean": 0.6995999999999999,
+      "min": 0.5849,
+      "max": 0.82,
+      "std": 0.09606376354623351
+    },
+    "val.per_source.insdet.presence_acc_pos": {
+      "mean": 0.9612333333333334,
+      "min": 0.9302,
+      "max": 0.9773,
+      "std": 0.02194847501662824
+    },
+    "val.per_source.insdet.presence_auroc": {
+      "mean": 0.8515333333333333,
+      "min": 0.7942,
+      "max": 0.9071,
+      "std": 0.046108157870622224
+    },
+    "val.per_source.insdet.presence_brier": {
+      "mean": 0.18130000000000002,
+      "min": 0.1699,
+      "max": 0.1931,
+      "std": 0.009475582655787804
+    },
+    "val.per_source.insdet.presence_pr_auc": {
+      "mean": 0.7700333333333332,
+      "min": 0.6889,
+      "max": 0.847,
+      "std": 0.06461126492768546
+    },
+    "val.per_source.insdet.recall_50": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.insdet.support_proto_norm_mean": {
+      "mean": 6.918666666666667,
+      "min": 6.6861,
+      "max": 7.117,
+      "std": 0.17757185087232227
+    },
+    "val.per_source.insdet.support_proto_norm_std": {
+      "mean": 0.2577333333333333,
+      "min": 0.2396,
+      "max": 0.2883,
+      "std": 0.02173880299270306
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.50": {
+      "mean": 0.08926666666666666,
+      "min": 0.0713,
+      "max": 0.1129,
+      "std": 0.017449418965175382
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.55": {
+      "mean": 0.05179999999999999,
+      "min": 0.0387,
+      "max": 0.0727,
+      "std": 0.014936086055813508
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.60": {
+      "mean": 0.019533333333333333,
+      "min": 0.0145,
+      "max": 0.029,
+      "std": 0.006698424358674873
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.65": {
+      "mean": 0.011733333333333333,
+      "min": 0.0064,
+      "max": 0.0165,
+      "std": 0.004142731251508143
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.70": {
+      "mean": 0.0044,
+      "min": 0.0017,
+      "max": 0.0079,
+      "std": 0.0025935818218569212
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.75": {
+      "mean": 0.0011666666666666665,
+      "min": 0.0,
+      "max": 0.0034,
+      "std": 0.001579732748143038
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.80": {
+      "mean": 0.0007999999999999999,
+      "min": 0.0,
+      "max": 0.0024,
+      "std": 0.001131370849898476
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.85": {
+      "mean": 0.0005666666666666666,
+      "min": 0.0,
+      "max": 0.0017,
+      "std": 0.0008013876853447539
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.90": {
+      "mean": 0.0005666666666666666,
+      "min": 0.0,
+      "max": 0.0017,
+      "std": 0.0008013876853447539
+    },
+    "val.per_source.vizwiz_base.ap_per_iou.0.95": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.vizwiz_base.conf_map_mean_neg": {
+      "mean": 0.035166666666666666,
+      "min": 0.0343,
+      "max": 0.0363,
+      "std": 0.0008379870059984361
+    },
+    "val.per_source.vizwiz_base.conf_map_mean_pos": {
+      "mean": 0.037,
+      "min": 0.0359,
+      "max": 0.0376,
+      "std": 0.0007788880963698609
+    },
+    "val.per_source.vizwiz_base.conf_map_std_neg": {
+      "mean": 0.03663333333333333,
+      "min": 0.0353,
+      "max": 0.039,
+      "std": 0.0016779617264870963
+    },
+    "val.per_source.vizwiz_base.conf_map_std_pos": {
+      "mean": 0.039066666666666666,
+      "min": 0.0383,
+      "max": 0.0404,
+      "std": 0.0009463379711052251
+    },
+    "val.per_source.vizwiz_base.contain_at_iou_50": {
+      "mean": 0.20493333333333333,
+      "min": 0.1702,
+      "max": 0.2609,
+      "std": 0.03995633728069791
+    },
+    "val.per_source.vizwiz_base.contain_at_iou_75": {
+      "mean": 0.014499999999999999,
+      "min": 0.0,
+      "max": 0.0435,
+      "std": 0.020506096654409875
+    },
+    "val.per_source.vizwiz_base.contain_mean": {
+      "mean": 0.4061333333333333,
+      "min": 0.3758,
+      "max": 0.4236,
+      "std": 0.021530959621489733
+    },
+    "val.per_source.vizwiz_base.f1_50": {
+      "mean": 0.22893333333333332,
+      "min": 0.1975,
+      "max": 0.2824,
+      "std": 0.03800090642193799
+    },
+    "val.per_source.vizwiz_base.frac_pred_near_corner": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.vizwiz_base.frac_pred_tiny_box": {
+      "mean": 0.058100000000000006,
+      "min": 0.0543,
+      "max": 0.0619,
+      "std": 0.003102687007525357
+    },
+    "val.per_source.vizwiz_base.iou_mean": {
+      "mean": 0.2865333333333333,
+      "min": 0.2818,
+      "max": 0.2939,
+      "std": 0.0052790992497668485
+    },
+    "val.per_source.vizwiz_base.iou_median": {
+      "mean": 0.27153333333333335,
+      "min": 0.2469,
+      "max": 0.285,
+      "std": 0.017443687173938367
+    },
+    "val.per_source.vizwiz_base.iou_p25": {
+      "mean": 0.023733333333333332,
+      "min": 0.008,
+      "max": 0.0423,
+      "std": 0.014145513619361989
+    },
+    "val.per_source.vizwiz_base.iou_p75": {
+      "mean": 0.47226666666666667,
+      "min": 0.4459,
+      "max": 0.5174,
+      "std": 0.03206455294488845
+    },
+    "val.per_source.vizwiz_base.map_50": {
+      "mean": 0.08926666666666666,
+      "min": 0.0713,
+      "max": 0.1129,
+      "std": 0.017449418965175382
+    },
+    "val.per_source.vizwiz_base.map_5095": {
+      "mean": 0.018,
+      "min": 0.015,
+      "max": 0.0235,
+      "std": 0.003894440481849308
+    },
+    "val.per_source.vizwiz_base.mean_score_neg": {
+      "mean": 0.5057333333333333,
+      "min": 0.4931,
+      "max": 0.5133,
+      "std": 0.008991230295250053
+    },
+    "val.per_source.vizwiz_base.mean_score_pos": {
+      "mean": 0.5295333333333333,
+      "min": 0.5254,
+      "max": 0.5325,
+      "std": 0.00301367254727885
+    },
+    "val.per_source.vizwiz_base.n": {
+      "mean": 91.66666666666667,
+      "min": 86.0,
+      "max": 97.0,
+      "std": 4.496912521077347
+    },
+    "val.per_source.vizwiz_base.n_neg": {
+      "mean": 44.333333333333336,
+      "min": 39.0,
+      "max": 51.0,
+      "std": 4.988876515698588
+    },
+    "val.per_source.vizwiz_base.n_pos": {
+      "mean": 47.333333333333336,
+      "min": 46.0,
+      "max": 49.0,
+      "std": 1.247219128924647
+    },
+    "val.per_source.vizwiz_base.precision_50": {
+      "mean": 0.25993333333333335,
+      "min": 0.2353,
+      "max": 0.3077,
+      "std": 0.03378168471557067
+    },
+    "val.per_source.vizwiz_base.presence_acc": {
+      "mean": 0.5643,
+      "min": 0.5109,
+      "max": 0.6047,
+      "std": 0.0393815523648658
+    },
+    "val.per_source.vizwiz_base.presence_acc_neg": {
+      "mean": 0.3765,
+      "min": 0.3256,
+      "max": 0.4706,
+      "std": 0.06661296170165885
+    },
+    "val.per_source.vizwiz_base.presence_acc_pos": {
+      "mean": 0.733,
+      "min": 0.6735,
+      "max": 0.8298,
+      "std": 0.06904534741747628
+    },
+    "val.per_source.vizwiz_base.presence_auroc": {
+      "mean": 0.6171666666666668,
+      "min": 0.5739,
+      "max": 0.662,
+      "std": 0.03598373089173621
+    },
+    "val.per_source.vizwiz_base.presence_brier": {
+      "mean": 0.2406,
+      "min": 0.2375,
+      "max": 0.2423,
+      "std": 0.0021954498400100155
+    },
+    "val.per_source.vizwiz_base.presence_pr_auc": {
+      "mean": 0.6535000000000001,
+      "min": 0.6276,
+      "max": 0.6989,
+      "std": 0.03220879796991289
+    },
+    "val.per_source.vizwiz_base.recall_50": {
+      "mean": 0.20493333333333333,
+      "min": 0.1702,
+      "max": 0.2609,
+      "std": 0.03995633728069791
+    },
+    "val.per_source.vizwiz_base.support_proto_norm_mean": {
+      "mean": 6.715433333333333,
+      "min": 6.5164,
+      "max": 6.8516,
+      "std": 0.14388403509616896
+    },
+    "val.per_source.vizwiz_base.support_proto_norm_std": {
+      "mean": 0.4817,
+      "min": 0.4479,
+      "max": 0.5397,
+      "std": 0.04119902911477402
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.50": {
+      "mean": 0.6332333333333333,
+      "min": 0.1485,
+      "max": 1.0,
+      "std": 0.3574914109302333
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.55": {
+      "mean": 0.3564333333333333,
+      "min": 0.1485,
+      "max": 0.6683,
+      "std": 0.22457309624163702
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.60": {
+      "mean": 0.30693333333333334,
+      "min": 0.0,
+      "max": 0.6683,
+      "std": 0.27553398257847533
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.65": {
+      "mean": 0.19636666666666666,
+      "min": 0.0,
+      "max": 0.3366,
+      "std": 0.14303403635343426
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.70": {
+      "mean": 0.19636666666666666,
+      "min": 0.0,
+      "max": 0.3366,
+      "std": 0.14303403635343426
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.75": {
+      "mean": 0.11220000000000001,
+      "min": 0.0,
+      "max": 0.3366,
+      "std": 0.15867476169826125
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.80": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.85": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.90": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.vizwiz_novel.ap_per_iou.0.95": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "std": 0.0
+    },
+    "val.per_source.vizwiz_novel.conf_map_mean_neg": {
+      "mean": 0.031599999999999996,
+      "min": 0.0266,
+      "max": 0.0379,
+      "std": 0.0047038990918882055
+    },
+    "val.per_source.vizwiz_novel.conf_map_mean_pos": {
+      "mean": 0.0321,
+      "min": 0.0276,
+      "max": 0.0353,
+      "std": 0.0032751590292177664
+    },
+    "val.per_source.vizwiz_novel.conf_map_std_neg": {
+      "mean": 0.03303333333333333,
+      "min": 0.0256,
+      "max": 0.0394,
+      "std": 0.005684090858606051
+    },
+    "val.per_source.vizwiz_novel.conf_map_std_pos": {
+      "mean": 0.04580000000000001,
+      "min": 0.0386,
+      "max": 0.05,
+      "std": 0.005114684741017769
+    },
+    "val.per_source.vizwiz_novel.contain_at_iou_50": {
+      "mean": 0.5476333333333333,
+      "min": 0.1429,
+      "max": 1.0,
+      "std": 0.35152695803056444
+    },
+    "val.per_source.vizwiz_novel.contain_at_iou_75": {
+      "mean": 0.11109999999999999,
+      "min": 0.0,
+      "max": 0.3333,
+      "std": 0.15711912677965087
+    },
+    "val.per_source.vizwiz_novel.contain_mean": {
+      "mean": 0.5108,
+      "min": 0.3001,
+      "max": 0.7503,
+      "std": 0.18491816207897663
+    },
+    "val.per_source.vizwiz_novel.f1_50": {
+      "mean": 0.3543,
+      "min": 0.1538,
+      "max": 0.5455,
+      "std": 0.16004601421674539
+    },
+    "val.per_source.vizwiz_novel.frac_pred_near_corner": {
+      "mean": 0.08460000000000001,
+      "min": 0.0,
+      "max": 0.1538,
+      "std": 0.06372587125074608
+    },
+    "val.per_source.vizwiz_novel.frac_pred_tiny_box": {
+      "mean": 0.16153333333333333,
+      "min": 0.0,
+      "max": 0.3846,
+      "std": 0.16292954169074297
+    },
+    "val.per_source.vizwiz_novel.iou_mean": {
+      "mean": 0.40680000000000005,
+      "min": 0.2611,
+      "max": 0.6882,
+      "std": 0.19902172410736138
+    },
+    "val.per_source.vizwiz_novel.iou_median": {
+      "mean": 0.43603333333333333,
+      "min": 0.276,
+      "max": 0.6355,
+      "std": 0.1493905470756284
+    },
+    "val.per_source.vizwiz_novel.iou_p25": {
+      "mean": 0.2253333333333333,
+      "min": 0.0147,
+      "max": 0.6355,
+      "std": 0.2900670305674573
+    },
+    "val.per_source.vizwiz_novel.iou_p75": {
+      "mean": 0.5478666666666666,
+      "min": 0.3966,
+      "max": 0.7146,
+      "std": 0.13028280350410368
+    },
+    "val.per_source.vizwiz_novel.map_50": {
+      "mean": 0.6332333333333333,
+      "min": 0.1485,
+      "max": 1.0,
+      "std": 0.3574914109302333
+    },
+    "val.per_source.vizwiz_novel.map_5095": {
+      "mean": 0.18016666666666667,
+      "min": 0.0297,
+      "max": 0.3098,
+      "std": 0.11529534056307547
+    },
+    "val.per_source.vizwiz_novel.mean_score_neg": {
+      "mean": 0.5009,
+      "min": 0.4515,
+      "max": 0.5584,
+      "std": 0.04401598194595534
+    },
+    "val.per_source.vizwiz_novel.mean_score_pos": {
+      "mean": 0.5611,
+      "min": 0.4957,
+      "max": 0.6023,
+      "std": 0.04676266316909963
+    },
+    "val.per_source.vizwiz_novel.n": {
+      "mean": 13.666666666666666,
+      "min": 10.0,
+      "max": 18.0,
+      "std": 3.2998316455372216
+    },
+    "val.per_source.vizwiz_novel.n_neg": {
+      "mean": 9.0,
+      "min": 7.0,
+      "max": 11.0,
+      "std": 1.632993161855452
+    },
+    "val.per_source.vizwiz_novel.n_pos": {
+      "mean": 4.666666666666667,
+      "min": 3.0,
+      "max": 7.0,
+      "std": 1.699673171197595
+    },
+    "val.per_source.vizwiz_novel.precision_50": {
+      "mean": 0.2758,
+      "min": 0.1667,
+      "max": 0.375,
+      "std": 0.08532576789380023
+    },
+    "val.per_source.vizwiz_novel.presence_acc": {
+      "mean": 0.5569999999999999,
+      "min": 0.5,
+      "max": 0.6154,
+      "std": 0.04712225235137498
+    },
+    "val.per_source.vizwiz_novel.presence_acc_neg": {
+      "mean": 0.4252,
+      "min": 0.2857,
+      "max": 0.5455,
+      "std": 0.10692829372995717
+    },
+    "val.per_source.vizwiz_novel.presence_acc_pos": {
+      "mean": 0.8571333333333334,
+      "min": 0.5714,
+      "max": 1.0,
+      "std": 0.20204397761103618
+    },
+    "val.per_source.vizwiz_novel.presence_auroc": {
+      "mean": 0.6642666666666667,
+      "min": 0.5325,
+      "max": 0.8889,
+      "std": 0.1596316663099427
+    },
+    "val.per_source.vizwiz_novel.presence_brier": {
+      "mean": 0.24273333333333333,
+      "min": 0.205,
+      "max": 0.2714,
+      "std": 0.027855500155066125
+    },
+    "val.per_source.vizwiz_novel.presence_pr_auc": {
+      "mean": 0.5287333333333334,
+      "min": 0.3833,
+      "max": 0.6792,
+      "std": 0.12085308804035126
+    },
+    "val.per_source.vizwiz_novel.recall_50": {
+      "mean": 0.5476333333333333,
+      "min": 0.1429,
+      "max": 1.0,
+      "std": 0.35152695803056444
+    },
+    "val.per_source.vizwiz_novel.support_proto_norm_mean": {
+      "mean": 6.7392,
+      "min": 6.6662,
+      "max": 6.8372,
+      "std": 0.07201388754955544
+    },
+    "val.per_source.vizwiz_novel.support_proto_norm_std": {
+      "mean": 0.2577333333333333,
+      "min": 0.1395,
+      "max": 0.4437,
+      "std": 0.13310462885347835
+    },
+    "val.score_thr": {
+      "mean": 0.5,
+      "min": 0.5,
+      "max": 0.5,
+      "std": 0.0
+    },
+    "wall_clock_seconds": {
+      "mean": 210.8033333333333,
+      "min": 194.19,
+      "max": 220.22,
+      "std": 11.782309715086523
+    }
+  }
+}

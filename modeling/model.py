@@ -421,6 +421,18 @@ class PerShotAttentionPool(nn.Module):
         out = self._pool(q, tokens)
         return out.squeeze(1)
 
+    def forward(
+        self, tokens: torch.Tensor, k: int | None = None
+    ) -> torch.Tensor:
+        """Default ``__call__`` path. Delegates to ``forward_bag`` (the most
+        common usage: bag-level summary used by ``build_proto_cache`` and
+        anywhere that wants a ``(B, DIM)`` prototype). Pass ``k`` to get
+        ``forward_per_shot`` semantics instead.
+        """
+        if k is None:
+            return self.forward_bag(tokens)
+        return self.forward_per_shot(tokens, k)
+
 
 # ---------------------------------------------------------------------------
 # Cross-attention bridge — DETR-style 3-layer decoder
