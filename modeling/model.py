@@ -251,35 +251,48 @@ class MultiViewAggregator(nn.Module):
 class ExistenceHead(nn.Module):
     """8 hand-crafted scalars → 64 → 64 → 1 → sigmoid.
 
-    Features (computed in :meth:`compute_features`):
+    Two input streams concat into the head's MLP:
 
-      0. softmax-temperature differentiable max patch logit
-      1. top-5 mean
-      2. top-5 std
-      3. mean over all patches
-      4. cosine(prototype, GAP(query))
-      5. ||prototype||
-      6. ||GAP(query)||
-      7. entropy of softmax over patch logits
+    1. ``N_FEAT_GLOBAL`` scalar features (global summaries):
+       0. softmax-temperature differentiable max patch logit
+       1. top-5 mean
+       2. top-5 std
+       3. mean over all patches
+       4. cosine(prototype, GAP(query))
+       5. ||prototype||
+       6. ||GAP(query)||
+       7. entropy of softmax over patch logits
+
+    2. ``TOP_K`` sorted-descending patch logits (the *shape* of the
+       per-patch matching distribution).  A peaky distribution (one
+       strong patch above noise) → present.  A flat distribution
+       (no patch dominates) → absent.
+
+    Concatenated → LayerNorm → 2× Linear+GELU → 1 logit.
+
+    Total params: ~10K (same order as before).
     """
 
-    N_FEAT = 8
+    N_FEAT_GLOBAL = 8
+    TOP_K = 20
 
     def __init__(self, dropout: float = 0.2) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(self.N_FEAT)
+        in_dim = self.N_FEAT_GLOBAL + self.TOP_K
+        self.norm = nn.LayerNorm(in_dim)
         self.fc = nn.Sequential(
-            nn.Linear(self.N_FEAT, 64),
+            nn.Linear(in_dim, 96),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 64),
+            nn.Linear(96, 64),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1),
         )
 
-    @staticmethod
+    @classmethod
     def compute_features(
+        cls,
         pred_logits: torch.Tensor,
         prototype: torch.Tensor,
         image_feats: torch.Tensor,
@@ -287,8 +300,8 @@ class ExistenceHead(nn.Module):
     ) -> torch.Tensor:
         """pred_logits: (B, P), prototype: (B, D_q), image_feats: (B, P, D_v).
 
-        Returns ``(B, N_FEAT)`` feature tensor. Pure tensor ops — fully
-        differentiable through the existence head.
+        Returns ``(B, N_FEAT_GLOBAL + TOP_K)`` feature tensor. Pure tensor
+        ops — fully differentiable through the existence head.
         """
         b, p = pred_logits.shape
         # 0. soft-max over patches
@@ -304,16 +317,11 @@ class ExistenceHead(nn.Module):
         gap = image_feats.mean(dim=1)                                # (B, D_v)
         gap_norm = F.normalize(gap, dim=-1)
         proto_norm = F.normalize(prototype, dim=-1)
-        # When dims differ (vision 768 vs query 512), project gap onto prototype dim
-        # by truncation/zero-padding.  We keep cosine on equal dim:
         d_q = prototype.size(-1)
         d_v = gap.size(-1)
         if d_q == d_v:
             f4 = (gap_norm * proto_norm).sum(dim=-1)
         else:
-            # Use the L2-normalised gap and prototype after PCA-equivalent
-            # mean-reduction along the larger dim.  Practical proxy: compare
-            # magnitudes via dot product of the first min(d_q, d_v) dims.
             d = min(d_q, d_v)
             f4 = (gap_norm[:, :d] * proto_norm[:, :d]).sum(dim=-1)
         # 5, 6. norms
@@ -322,7 +330,20 @@ class ExistenceHead(nn.Module):
         # 7. entropy of softmax over patches
         entropy = -(soft_w * (soft_w + 1e-12).log()).sum(dim=-1)     # (B,)
         f7 = entropy
-        return torch.stack([f0, f1, f2, f3, f4, f5, f6, f7], dim=-1)  # (B, 8)
+        global_feats = torch.stack(
+            [f0, f1, f2, f3, f4, f5, f6, f7], dim=-1
+        )                                                              # (B, 8)
+
+        # Top-K sorted-descending raw patch logits (the distribution shape).
+        k = cls.TOP_K
+        if p >= k:
+            topk_vals, _ = pred_logits.topk(k, dim=-1)               # (B, K) sorted desc
+        else:
+            # Pad with the minimum logit if we have fewer patches than K.
+            topk_vals, _ = pred_logits.topk(p, dim=-1)
+            pad = pred_logits.min(dim=-1, keepdim=True).values.expand(b, k - p)
+            topk_vals = torch.cat([topk_vals, pad], dim=-1)
+        return torch.cat([global_feats, topk_vals], dim=-1)          # (B, 8 + K)
 
     def forward(
         self,

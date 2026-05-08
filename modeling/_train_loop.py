@@ -18,6 +18,7 @@ from modeling.model import OWLv2FewShotLocalizer
 _RUNNING_KEYS = (
     "loss", "focal", "l1", "giou", "box_loss",
     "box_area_penalty", "existence_kl",
+    "margin", "nt_xent",
     "grad_norm",
 )
 
@@ -56,6 +57,7 @@ def train_one_pass(
         query_img = batch["query_img"].to(device, non_blocking=True)
         gt_bbox = batch["query_bbox"].to(device, non_blocking=True)
         is_present = batch["is_present"].to(device, non_blocking=True)
+        instance_id = batch.get("instance_id")
 
         with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
             out = model(support_imgs, query_img)
@@ -69,6 +71,11 @@ def train_one_pass(
                 anti_collapse_weight=float(cfg["anti_collapse_weight"]),
                 box_size_threshold=float(cfg["box_size_threshold"]),
                 existence_kl_threshold=float(cfg["existence_kl_threshold"]),
+                margin_weight=float(cfg.get("margin_weight", 0.5)),
+                margin_value=float(cfg.get("margin_value", 1.0)),
+                contrastive_weight=float(cfg.get("contrastive_weight", 0.1)),
+                contrastive_temp=float(cfg.get("contrastive_temp", 0.1)),
+                instance_id=instance_id,
             )
             loss = losses["loss"] / accum_steps
 
@@ -99,7 +106,9 @@ def train_one_pass(
             running["grad_norm"] += float(gn)
 
         running["loss"] += float(losses["loss"].detach().item())
-        for k in ("focal", "l1", "giou", "box_loss", "box_area_penalty", "existence_kl"):
+        for k in ("focal", "l1", "giou", "box_loss",
+                  "box_area_penalty", "existence_kl",
+                  "margin", "nt_xent"):
             v = losses.get(k)
             if v is not None:
                 running[k] += float(v.detach().item()) if torch.is_tensor(v) else float(v)

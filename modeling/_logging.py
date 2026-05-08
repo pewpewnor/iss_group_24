@@ -6,7 +6,8 @@ from typing import Any
 
 
 _TRAIN_PRIORITY = (
-    "loss", "focal", "l1", "giou", "box_loss",
+    "loss", "focal", "margin", "nt_xent",
+    "l1", "giou", "box_loss",
     "box_area_penalty", "existence_kl",
     "grad_norm", "n_steps",
 )
@@ -14,6 +15,8 @@ _TRAIN_PRIORITY = (
 _VAL_PRIORITY = (
     "n", "n_pos", "n_neg",
     "map_50", "map_75", "map_5095",
+    "map_50_existence_only", "map_50_score_only",
+    "map_5095_existence_only", "map_5095_score_only",
     "f1_50", "precision_50", "recall_50",
     "iou_mean", "iou_median", "iou_p25", "iou_p75",
     "contain_mean", "contain_at_iou_50", "contain_at_iou_75",

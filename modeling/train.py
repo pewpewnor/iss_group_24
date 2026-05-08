@@ -117,6 +117,13 @@ DEFAULT_CFG: dict[str, Any] = {
     "anti_collapse_weight": 0.1,
     "box_size_threshold": 0.6,
     "existence_kl_threshold": 0.85,
+    # Existence-head separation loss: forbids constant-output collapse.
+    "margin_weight": 0.5,
+    "margin_value": 1.0,
+    # Prototype contrastive loss: instance-discriminative pressure on the
+    # aggregator (NT-Xent over in-batch prototypes).
+    "contrastive_weight": 0.1,
+    "contrastive_temp": 0.1,
     # --- AMP ------------------------------------------------------------
     "use_amp": True,
     # --- I/O ------------------------------------------------------------
@@ -654,6 +661,8 @@ def _persist_eval_results(
         "map_50": float(overall.get("map_50", 0.0)),
         "map_75": float(overall.get("map_75", 0.0)),
         "map_5095": float(overall.get("map_5095", 0.0)),
+        "map_50_existence_only": float(overall.get("map_50_existence_only", 0.0)),
+        "map_50_score_only": float(overall.get("map_50_score_only", 0.0)),
         "iou_mean": float(overall.get("iou_mean", 0.0)),
         "existence_auroc": float(overall.get("existence_auroc", 0.0)),
         "existence_acc": float(overall.get("existence_acc", 0.0)),

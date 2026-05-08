@@ -197,6 +197,34 @@ def _empty_bucket() -> dict[str, list]:
     }
 
 
+def _ap_for_score(
+    iou_list: list[float],
+    score_list: list[float],
+    is_present_list: list[bool],
+    n_pos: int,
+    score_floor: float = 0.0,
+) -> tuple[dict[str, float], float, float, float]:
+    """Compute COCO-style AP across IOU_THRESHOLDS using ``score_list`` for ranking.
+
+    Returns (ap_per_iou_dict, map_50, map_75, map_5095).
+    """
+    ap_per_iou: dict[str, float] = {}
+    for thr in IOU_THRESHOLDS:
+        detections = []
+        for iou, score, present in zip(iou_list, score_list, is_present_list):
+            if score < score_floor:
+                continue
+            is_tp = present and (iou >= thr)
+            detections.append((float(score), bool(is_tp)))
+        ap_per_iou[f"{thr:.2f}"] = _detections_to_ap(detections, n_gt=n_pos)
+    return (
+        ap_per_iou,
+        ap_per_iou.get("0.50", 0.0),
+        ap_per_iou.get("0.75", 0.0),
+        _safe_mean(list(ap_per_iou.values())),
+    )
+
+
 def _bucket_metrics(b: dict[str, list], score_thr: float = 0.5) -> dict[str, float]:
     n = len(b["is_present"])
     n_pos = sum(b["is_present"])
@@ -221,25 +249,43 @@ def _bucket_metrics(b: dict[str, list], score_thr: float = 0.5) -> dict[str, flo
     )
 
     # mAP — one detection per image (top-1 box of the model).
-    # TP at IoU threshold = is_present AND IoU(pred, gt) >= threshold AND existence_prob > 0.5.
-    # FP = (existence_prob > 0.5 AND not present) OR (positive AND IoU < threshold).
-    final_score = b["existence_prob"]                          # use existence_prob as ranking score
-    ap_per_iou: dict[str, float] = {}
-    for thr in IOU_THRESHOLDS:
-        detections = []
-        for iou, score, present, ex in zip(
-            b["iou"], b["score"], b["is_present"], b["existence_prob"]
-        ):
-            if ex < 0.05:
-                continue                                       # too low to count even as FP under top-K=1 setting
-            is_tp = present and (iou >= thr)
-            detections.append((float(ex), bool(is_tp)))
-        ap = _detections_to_ap(detections, n_gt=n_pos)
-        ap_per_iou[f"{thr:.2f}"] = ap
-    out["ap_per_iou"] = ap_per_iou
-    out["map_50"] = ap_per_iou.get("0.50", 0.0)
-    out["map_75"] = ap_per_iou.get("0.75", 0.0)
-    out["map_5095"] = _safe_mean(list(ap_per_iou.values()))
+    #
+    # We report mAP under three different ranking scores so a degenerate
+    # signal (e.g., collapsed existence head) doesn't hide useful detection
+    # quality from the other signal:
+    #
+    #   map_50, map_75, map_5095, ap_per_iou:
+    #       Default rank by ``existence_prob × score`` (multiplicative).
+    #       This is the "deployed" view — the score the model would emit.
+    #
+    #   map_50_existence_only:
+    #       Rank by ``existence_prob`` alone.  This is what the previous
+    #       impl reported; useful as a baseline diagnostic.
+    #
+    #   map_50_score_only:
+    #       Rank by ``score`` alone (= sigmoid(top1 class-head logit) for
+    #       trained model, or sigmoid(avg_logit) for Phase 0).  This is the
+    #       "is the bbox path actually finding the object" view, *unmasked*
+    #       by the existence head.  Crucial when existence collapses.
+    combined = [ex * sc for ex, sc in zip(b["existence_prob"], b["score"])]
+    ap_combined, m50, m75, m5095 = _ap_for_score(
+        b["iou"], combined, b["is_present"], n_pos, score_floor=0.0,
+    )
+    out["ap_per_iou"] = ap_combined
+    out["map_50"] = m50
+    out["map_75"] = m75
+    out["map_5095"] = m5095
+
+    _, m50_ex, _, m5095_ex = _ap_for_score(
+        b["iou"], b["existence_prob"], b["is_present"], n_pos, score_floor=0.05,
+    )
+    _, m50_sc, _, m5095_sc = _ap_for_score(
+        b["iou"], b["score"], b["is_present"], n_pos, score_floor=0.0,
+    )
+    out["map_50_existence_only"] = m50_ex
+    out["map_5095_existence_only"] = m5095_ex
+    out["map_50_score_only"] = m50_sc
+    out["map_5095_score_only"] = m5095_sc
 
     # P/R/F1 at IoU=0.50.
     tp = sum(1 for iou, p, ex in zip(b["iou"], b["is_present"], b["existence_prob"])
