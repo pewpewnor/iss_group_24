@@ -147,22 +147,34 @@ def existence_margin_loss(
     is_present: torch.Tensor,
     margin: float = 1.0,
 ) -> torch.Tensor:
-    """Hinge-style separation loss between positive and negative logits.
+    """Per-sample hinge that pushes pos logits above ``+margin/2`` and neg
+    logits below ``-margin/2``.
 
-    Forces ``mean_pos_logit - mean_neg_logit >= margin`` over the batch.
-    Directly attacks the constant-output collapse mode where
-    ``existence_head`` outputs the same value for every episode.
+    Concretely::
 
-    Returns a scalar tensor.  Returns 0 if either pos or neg episodes
-    are absent in the batch (margin is undefined in that case).
+        per_sample = relu(margin/2 - logit)         if  is_present
+                     relu(margin/2 + logit)         if !is_present
+
+    The mean of these terms is returned.  Unlike the batch-level
+    "mean(pos) - mean(neg) >= margin" formulation, this works at any
+    batch size, in particular ``batch_size == 1`` where a batch may
+    contain *only* positives or *only* negatives — exactly the laptop
+    regime where the original margin loss silently no-op'd.
+
+    Geometry note: the hinge is symmetric around 0, so once the head
+    learns ``logit > +margin/2`` for positives and ``logit < -margin/2``
+    for negatives, the loss is zero and the gradient stops pulling.
+    Margin/2 = 0.5 corresponds to ``existence_prob`` thresholds of
+    ``sigmoid(+0.5) ≈ 0.62`` (positive) and ``sigmoid(-0.5) ≈ 0.38``
+    (negative) — a comfortable separation while still leaving room for
+    the focal loss to drive confident predictions further apart.
     """
-    is_present_b = is_present.bool()
-    pos_logits = existence_logit[is_present_b]
-    neg_logits = existence_logit[~is_present_b]
-    if pos_logits.numel() == 0 or neg_logits.numel() == 0:
-        return existence_logit.new_zeros(())
-    gap = pos_logits.mean() - neg_logits.mean()
-    return F.relu(margin - gap)
+    half = margin / 2.0
+    # sign = +1 for present, -1 for absent.
+    sign = 2.0 * is_present.float() - 1.0
+    # We want sign*logit >= half; penalise the shortfall.
+    violation = F.relu(half - sign * existence_logit)
+    return violation.mean()
 
 
 def nt_xent_prototype_loss(
@@ -291,7 +303,7 @@ def total_loss(
 
     # Box loss only on confident-positive predictions of positive episodes.
     if use_box_loss:
-        gate = (existence_prob.detach() > 0.5) & is_present
+        gate = (existence_prob.detach() > 0.5) & is_present.bool()
         if gate.any():
             pb = pred_box[gate]
             gb = gt_bbox_cxcywh[gate]
