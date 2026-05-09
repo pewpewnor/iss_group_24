@@ -48,7 +48,7 @@
   "use_amp": true,
   "out_root": "./checkpoints",
   "analysis_root": "./analysis",
-  "keep_last_n": 6,
+  "keep_last_n": 0,
   "early_stop_patience_s1": 4,
   "early_stop_patience_s2": 5,
   "early_stop_patience_s3": 4,

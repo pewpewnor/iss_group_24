@@ -34,8 +34,17 @@ def train_one_pass(
     use_box_loss: bool,
     scaler: "torch.amp.GradScaler | None" = None,
     use_amp: bool = False,
+    progress: bool = True,
+    progress_every: int = 10,
 ) -> dict[str, float]:
-    """One sweep through ``loader``.  Returns averaged train metrics."""
+    """One sweep through ``loader``.  Returns averaged train metrics.
+
+    Emits a one-line progress update every ``progress_every`` batches when
+    ``progress`` is True (default).  Without this the train pass is silent
+    for its entire duration, which on a 200-episode batch=4 fold takes
+    ~3-5 minutes on Colab and looks indistinguishable from a hang.
+    """
+    import time as _time
     model.train()
     # Always set OWLv2 vision_model to eval for batchnorm-like behaviour
     # (it doesn't have BN but this signals it's not training even if a
@@ -51,6 +60,11 @@ def train_one_pass(
 
     optimizer.zero_grad(set_to_none=True)
     accum_count = 0
+
+    n_batches_total = len(loader) if hasattr(loader, "__len__") else None
+    t_start = _time.time()
+    if progress:
+        print(f"  training : {n_batches_total or '?'} batches", flush=True)
 
     for batch_idx, batch in enumerate(loader):
         support_imgs = batch["support_imgs"].to(device, non_blocking=True)
@@ -113,6 +127,26 @@ def train_one_pass(
             if v is not None:
                 running[k] += float(v.detach().item()) if torch.is_tensor(v) else float(v)
         n_batches += 1
+
+        if progress and (n_batches % progress_every == 0
+                         or n_batches == n_batches_total):
+            elapsed = _time.time() - t_start
+            rate = n_batches / max(elapsed, 1e-6)
+            avg_loss = running["loss"] / max(n_batches, 1)
+            if n_batches_total:
+                remaining = (n_batches_total - n_batches) / max(rate, 1e-6)
+                pct = 100.0 * n_batches / n_batches_total
+                msg = (f"  [{n_batches}/{n_batches_total} = {pct:5.1f}%]  "
+                       f"elapsed={elapsed:6.1f}s  "
+                       f"eta={remaining:6.1f}s  "
+                       f"rate={rate:.2f} batch/s  "
+                       f"loss={avg_loss:.4f}")
+            else:
+                msg = (f"  [{n_batches} batches]  "
+                       f"elapsed={elapsed:6.1f}s  "
+                       f"rate={rate:.2f} batch/s  "
+                       f"loss={avg_loss:.4f}")
+            print(msg, flush=True)
 
     if n_batches > 0:
         for k in running:

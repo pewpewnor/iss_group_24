@@ -475,6 +475,9 @@ def _run_stage(
             train_ids = set(fold["train_ids"])
             val_ids = set(fold["val_ids"])
 
+            print(f"▶ stage {stage} epoch {epoch}/{n_epochs} fold {fold_idx}/{K - 1}",
+                  flush=True)
+
             train_ds, train_loader = build_train_loader(
                 manifest=cfg["manifest"], data_root=cfg["data_root"],
                 split="train", sources=None,
@@ -510,6 +513,7 @@ def _run_stage(
                 model, val_loader, device,
                 img_size=int(cfg["img_size"]),
                 tile_cfg=cfg.get("in_loop_val_tile_cfg"),
+                progress_every=10,                            # in-loop val: terser
             )
 
             payload = {
@@ -535,9 +539,16 @@ def _run_stage(
                 metrics_history=metrics_history, stage_completed=False,
                 lora_active=lora_active,
             )
-            atomic_save(ckpt, out_dir / f"ckpt_fold{fold_idx}_epoch{epoch:03d}.pt")
+            rolling_path = out_dir / f"ckpt_fold{fold_idx}_epoch{epoch:03d}.pt"
+            atomic_save(ckpt, rolling_path)
             atomic_save(ckpt, out_dir / "last.pt")
             hygiene(out_dir, int(cfg["keep_last_n"]))
+            try:
+                size_mb = rolling_path.stat().st_size / (1024 * 1024)
+                print(f"  ✓ saved {rolling_path.name} + last.pt  ({size_mb:.1f} MB)",
+                      flush=True)
+            except OSError:
+                print(f"  ✓ saved {rolling_path.name} + last.pt", flush=True)
 
             print_epoch_log(
                 header=f"stage {stage} epoch {epoch}/{n_epochs} fold {fold_idx}/{K - 1}",
@@ -563,7 +574,15 @@ def _run_stage(
                 metrics_history=metrics_history, stage_completed=False,
                 lora_active=lora_active,
             )
-            atomic_save(best_ckpt, out_dir / "best.pt")
+            best_path = out_dir / "best.pt"
+            atomic_save(best_ckpt, best_path)
+            try:
+                size_mb = best_path.stat().st_size / (1024 * 1024)
+                print(f"  ✓ saved best.pt at epoch {epoch} (map_50={map50:.4f}, "
+                      f"{size_mb:.1f} MB)", flush=True)
+            except OSError:
+                print(f"  ✓ saved best.pt at epoch {epoch} (map_50={map50:.4f})",
+                      flush=True)
             early_stop_counter = 0
         else:
             early_stop_counter += 1
@@ -592,7 +611,13 @@ def _run_stage(
         metrics_history=metrics_history, stage_completed=True,
         lora_active=lora_active,
     )
-    atomic_save(final_ckpt, out_dir / "stage_complete.pt")
+    final_path = out_dir / "stage_complete.pt"
+    atomic_save(final_ckpt, final_path)
+    try:
+        size_mb = final_path.stat().st_size / (1024 * 1024)
+        print(f"  ✓ saved stage_complete.pt  ({size_mb:.1f} MB)", flush=True)
+    except OSError:
+        print("  ✓ saved stage_complete.pt", flush=True)
     write_json(analysis_dir / "complete.json", {
         "stage_completed": True,
         "epochs_run": epoch,

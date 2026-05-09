@@ -382,7 +382,7 @@ def evaluate(
     img_size: int = 768,
     tile_cfg: dict | None = None,
     progress: bool = True,
-    progress_every: int = 10,
+    progress_every: int = 1,
 ) -> dict[str, Any]:
     """Run evaluation and return the kitchen-sink metric dict.
 
@@ -578,7 +578,7 @@ def evaluate_phase0(
     img_size: int = 768,
     tile_cfg: dict | None = None,
     progress: bool = True,
-    progress_every: int = 5,
+    progress_every: int = 1,
 ) -> dict[str, Any]:
     """Zero-shot OWLv2 image-guided detection.
 
