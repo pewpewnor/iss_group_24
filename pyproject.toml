@@ -1,7 +1,7 @@
 [project]
 name = "iss-group-24"
-version = "0.2.0"
-description = "OWLv2-based few-shot single-object localizer."
+version = "0.3.0"
+description = "Few-shot multi-shot localizer (OWLv2) + siamese existence (DINOv2)."
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.0",
@@ -11,7 +11,7 @@ dependencies = [
     "torchvision>=0.19",
     "transformers>=4.40",
     "accelerate>=0.30",
-    "peft>=0.10,<0.16",
+    "peft>=0.10",
     "huggingface_hub>=0.23",
     "matplotlib>=3.7",
 ]

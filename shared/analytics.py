@@ -1,11 +1,4 @@
-"""JSON analysis writers for the trainer.
-
-- ``write_json``         : pretty-print + atomic write.
-- ``flatten_metrics``    : nested dict -> {dotted_key: float}.
-- ``aggregate_folds``    : recursive mean/min/max/std across the K fold
-                           JSONs of a single epoch.
-- ``update_summary``     : rolling best-by-metric pointer.
-"""
+"""JSON analysis writers for both trainers."""
 
 from __future__ import annotations
 
@@ -29,7 +22,7 @@ def flatten_metrics(d: Any, prefix: str = "") -> dict[str, float]:
         for k, v in d.items():
             key = f"{prefix}.{k}" if prefix else str(k)
             out.update(flatten_metrics(v, key))
-    elif isinstance(d, (int, float)):
+    elif isinstance(d, (int, float)) and not isinstance(d, bool):
         out[prefix] = float(d)
     return out
 
@@ -48,10 +41,7 @@ def aggregate_folds(fold_jsons: list[dict]) -> dict:
         m = sum(vals) / len(vals)
         var = sum((x - m) ** 2 for x in vals) / max(len(vals), 1)
         metrics[k] = {
-            "mean": m,
-            "min": min(vals),
-            "max": max(vals),
-            "std": var ** 0.5,
+            "mean": m, "min": min(vals), "max": max(vals), "std": var ** 0.5,
         }
     return {
         "epoch": fold_jsons[0].get("epoch") if fold_jsons else None,
@@ -60,10 +50,8 @@ def aggregate_folds(fold_jsons: list[dict]) -> dict:
     }
 
 
-def update_summary(
-    analysis_dir: Path, headline: dict[str, tuple[int, float]]
-) -> None:
-    """Rolling best-by-metric pointer at ``analysis/summary.json``."""
+def update_summary(analysis_dir: Path, headline: dict[str, tuple[int, float]]) -> None:
+    """Rolling best-by-metric pointer at <analysis_dir>/summary.json."""
     summary_path = analysis_dir / "summary.json"
     if summary_path.exists():
         with open(summary_path) as f:
