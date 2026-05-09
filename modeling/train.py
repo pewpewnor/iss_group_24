@@ -355,6 +355,15 @@ def _run_stage(
 
     print(f"\n=== Stage {stage} on {device} ===")
 
+    # Drop any GPU memory from previous stages / cells.  Critical on Colab
+    # where running stages 1.1 → 1.2 → 2.3 in one notebook session leaves
+    # the allocator fragmented and stage 2.3 can OOM during val despite
+    # fitting in VRAM in isolation.
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     _set_seed(int(cfg["seed"]))
     model = OWLv2FewShotLocalizer().to(device)
 
