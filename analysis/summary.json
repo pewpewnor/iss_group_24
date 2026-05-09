@@ -15,6 +15,14 @@
     "1_2.val.iou_mean_mean": {
       "epoch": 10,
       "value": 0.2508472896663944
+    },
+    "2_3.val.map_50_mean": {
+      "epoch": 3,
+      "value": 0.1658143697209106
+    },
+    "2_3.val.iou_mean_mean": {
+      "epoch": 6,
+      "value": 0.30031699850886423
     }
   }
 }
