@@ -10,6 +10,9 @@ _TRAIN_PRIORITY = (
     "l1", "giou", "box_loss",
     "box_area_penalty", "existence_kl",
     "grad_norm", "n_steps",
+    # Residual aggregator gate scalar.  alpha=0 ⇒ baseline-only prototype;
+    # alpha grows as the model learns to trust the aggregator's correction.
+    "aggregator_alpha",
 )
 
 _VAL_PRIORITY = (
@@ -24,6 +27,9 @@ _VAL_PRIORITY = (
     "existence_auroc", "existence_pr_auc", "existence_brier", "existence_f1",
     "false_positive_rate", "false_negative_rate",
     "mean_score_pos", "mean_score_neg",
+    # Prototype-quality diagnostic (raw class-head sigmoid; isolates the
+    # support-prototype path from the existence head).
+    "proto_score_pos", "proto_score_neg", "proto_score_gap",
     "mean_pred_box_area", "frac_pred_box_too_big",
     "mean_existence_prob", "frac_high_existence",
     "prototype_norm_mean", "prototype_norm_std",
@@ -32,6 +38,7 @@ _VAL_PRIORITY = (
 _PER_SOURCE_KEYS = (
     "n", "n_pos", "map_50", "map_5095", "iou_mean", "f1_50",
     "existence_acc", "mean_score_pos", "mean_score_neg",
+    "proto_score_gap",                                       # ← per-source
     "false_positive_rate",
 )
 
@@ -112,7 +119,9 @@ def print_aggregate(stage: str, epoch: int, aggregate: dict) -> None:
         ("val.overall.existence_acc",           "exist_acc"),
         ("val.overall.existence_auroc",         "exist_auroc"),
         ("val.overall.false_positive_rate",     "fpr"),
+        ("val.overall.proto_score_gap",         "proto_gap"),
         ("val.overall.mean_pred_box_area",      "pred_area"),
+        ("train.aggregator_alpha",              "agg_alpha"),
     )
     for key, label in keys:
         m = metrics.get(key)

@@ -118,4 +118,13 @@ def train_one_pass(
         for k in running:
             running[k] /= max(n_batches, 1)
     running["n_steps"] = n_batches
+    # Snapshot the residual aggregator gate at end-of-pass.  This is a
+    # global scalar — not a per-batch quantity — so we don't average it.
+    # It tells us whether the aggregator's correction is being trusted
+    # by the model: alpha=0 means "use only the OWLv2 image-guided
+    # baseline prototype", alpha>0 means "blend in the learned correction".
+    try:
+        running["aggregator_alpha"] = float(model.aggregator_alpha.detach().item())
+    except AttributeError:
+        running["aggregator_alpha"] = 0.0
     return running

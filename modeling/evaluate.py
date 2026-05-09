@@ -340,6 +340,19 @@ def _bucket_metrics(b: dict[str, list], score_thr: float = 0.5) -> dict[str, flo
     out["mean_score_neg"] = _safe_mean(
         [ex for ex, p in zip(b["existence_prob"], b["is_present"]) if not p]
     )
+    # Prototype-quality diagnostic: gap between mean(score) on positives
+    # and mean(score) on negatives, where ``score`` is sigmoid of the
+    # raw class-head top-1 logit (i.e. prototype↔best-patch cosine sim).
+    # This isolates prototype quality from the existence head — it is the
+    # signal that ultimately determines map_50_score_only and is the
+    # canonical per-source health metric for the support-prototype path.
+    out["proto_score_pos"] = _safe_mean(
+        [s for s, p in zip(b["score"], b["is_present"]) if p]
+    )
+    out["proto_score_neg"] = _safe_mean(
+        [s for s, p in zip(b["score"], b["is_present"]) if not p]
+    )
+    out["proto_score_gap"] = out["proto_score_pos"] - out["proto_score_neg"]
 
     # Collapse diagnostics.
     out["mean_pred_box_area"] = _safe_mean(b["pred_box_area"])
