@@ -237,51 +237,6 @@ class EpisodeDataset(Dataset):
     def _load(self, p: str) -> Image.Image:
         return Image.open(self._resolve(p)).convert("RGB")
 
-    def _load_support(
-        self,
-        entry: dict[str, Any],
-        pad_frac: float = 0.15,
-    ) -> Image.Image:
-        """Load a support image, cropping it to a tight (padded) bbox crop
-        when the manifest provides a usable bbox.
-
-        Rationale: HOTS supports are already tight object cutouts (their
-        bbox spans the entire image), but InsDet supports are full-frame
-        product photos with cluttered backgrounds — feeding the whole frame
-        to OWLv2's ``embed_image_query`` heuristic produces a generic-scene
-        embedding rather than an object embedding, killing per-source
-        prototype quality on InsDet.  Cropping to bbox + a small pad ports
-        InsDet supports onto the same "object on roughly-clean background"
-        regime that HOTS already enjoys.
-
-        The crop is a no-op when the bbox already covers ≥95% of the
-        image's width AND height (the HOTS case).  Both branches return a
-        plain PIL.Image — downstream `_SupportAugment` handles resizing,
-        random-resized-crop jitter, and colour augmentation.
-        """
-        img = self._load(entry["path"])
-        bbox = entry.get("bbox")
-        if not bbox or len(bbox) != 4:
-            return img
-        x1, y1, x2, y2 = (float(v) for v in bbox)
-        if x2 <= x1 or y2 <= y1:
-            return img
-        w, h = img.size
-        # Skip cropping when bbox already spans the full image (HOTS case).
-        if (x2 - x1) >= 0.95 * w and (y2 - y1) >= 0.95 * h:
-            return img
-        # Pad outward by pad_frac of the bbox side length, clamped to image.
-        bw = x2 - x1
-        bh = y2 - y1
-        px = pad_frac * bw
-        py = pad_frac * bh
-        cx1 = max(0.0, x1 - px)
-        cy1 = max(0.0, y1 - py)
-        cx2 = min(float(w), x2 + px)
-        cy2 = min(float(h), y2 + py)
-        # PIL.crop wants ints in (left, upper, right, lower).
-        return img.crop((int(cx1), int(cy1), int(cx2), int(cy2)))
-
     def _sample_supports(
         self, instance: dict[str, Any], rng: random.Random
     ) -> list[dict]:
@@ -320,11 +275,9 @@ class EpisodeDataset(Dataset):
     def _episode(
         self, instance: dict[str, Any], rng: random.Random
     ) -> dict[str, Any]:
-        # Supports.  Use the bbox-aware loader so InsDet supports are
-        # tight-cropped to the object region; HOTS supports (whose bbox
-        # already spans the full image) are returned unchanged.
+        # Supports.
         supports = self._sample_supports(instance, rng)
-        s_imgs = [self._support_aug(self._load_support(s), rng) for s in supports]
+        s_imgs = [self._support_aug(self._load(s["path"]), rng) for s in supports]
         support_t = torch.stack(s_imgs, dim=0)                       # (4, 3, S, S)
 
         # Query: positive or negative.  ``neg_prob`` applies at both train

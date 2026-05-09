@@ -53,22 +53,7 @@
   "early_stop_patience_s2": 5,
   "early_stop_patience_s3": 4,
   "tile_cfg": {
-    "mode": "pyramid_a",
-    "levels": [
-      1,
-      2
-    ],
-    "overlap": 0.3,
-    "for_sources": [
-      "insdet"
-    ],
-    "nms_iou": 0.5,
-    "top_k": 100,
-    "score_combo": "existence_x_score",
-    "edge_score_penalty": 0.5,
-    "edge_px": 4,
-    "merge_partial_boxes": true,
-    "merge_min_score": 0.2
+    "mode": "off"
   },
   "in_loop_val_tile_cfg": {
     "mode": "off"

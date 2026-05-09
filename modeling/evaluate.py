@@ -616,13 +616,14 @@ def evaluate_phase0(
               flush=True)
 
     def _embed_supports_to_q_embs(supports_v: torch.Tensor) -> torch.Tensor | None:
-        """Embed each of the V support views into a single query embedding.
+        """Per-view query embeddings via OWLv2's ``embed_image_query``.
 
         ``supports_v`` shape: ``(B, V, 3, S, S)``.
-        Returns ``(B, V, D_q)`` or ``None`` if no support produced an embedding.
+        Returns ``(B, V_kept, D_q)`` or ``None`` if no view produced an
+        embedding.
         """
         b_s, v, _, _, _ = supports_v.shape
-        per_view: list[torch.Tensor] = []                            # each: (B, D_q)
+        per_view: list[torch.Tensor] = []
         for vi in range(v):
             sup_v = supports_v[:, vi]
             sup_feature_map, _ = owlv2_model.image_embedder(
@@ -636,11 +637,11 @@ def evaluate_phase0(
             if q_emb is None:
                 continue
             if q_emb.dim() == 3:
-                q_emb = q_emb.squeeze(1)                              # (B, D_q)
+                q_emb = q_emb.squeeze(1)
             per_view.append(q_emb)
         if not per_view:
             return None
-        return torch.stack(per_view, dim=1)                           # (B, V_kept, D_q)
+        return torch.stack(per_view, dim=1)                          # (B, V_kept, D_q)
 
     def _logits_and_boxes_for_query(
         query_tensor: torch.Tensor, q_embs: torch.Tensor

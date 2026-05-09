@@ -503,61 +503,65 @@ class OWLv2FewShotLocalizer(nn.Module):
         image_feats = feature_map.reshape(b, gh * gw, d)
         return image_feats, feature_map
 
-    @torch.no_grad()
     def compute_baseline_prototype(
         self, support_imgs: torch.Tensor
     ) -> torch.Tensor:
-        """L2-normalised mean of class-head patch embeddings, averaged
-        over all V support views.  Returns ``(B, D_q)``, detached.
+        """Mean over views of OWLv2's ``embed_image_query`` output.
 
-        Why this and not OWLv2's ``embed_image_query``:
+        This is the per-support query embedding that OWLv2's native
+        image-guided detection would derive — the same path Phase 0 uses.
+        We average across the V support views to get a single (B, D_q)
+        prototype baseline that is stable from epoch 0 (zero-shot quality).
 
-            ``embed_image_query`` is a "find the most distinctive object
-            in the scene" heuristic — it picks the predicted box whose
-            class embedding is most *different* from the image's mean
-            class embedding.  Well-tuned for natural scenes containing
-            several objects, but degenerate for our use case where the
-            support is a (cropped) single-object image:
+        Gradient policy
+        ---------------
+        ``embed_image_query`` is a non-parametric heuristic, but its
+        output flows through OWLv2's ``class_predictor`` (whose
+        ``dense0`` / ``logit_shift`` / ``logit_scale`` ARE trainable in
+        Stages 1.2 / 2.3) and ``box_predictor``.
 
-              * HOTS supports are pre-cropped object cutouts.
-              * InsDet supports (after the ``_load_support`` bbox crop)
-                also fill the frame.
+        We therefore enable gradient flow through the support path
+        whenever any of those upstream parameters are trainable — i.e.
+        Stage 1.2 onward.  In Stage 1.1 (heads frozen) we short-circuit
+        with ``torch.no_grad`` to avoid retaining a useless support-pass
+        graph in memory.
 
-            In both cases every predicted box overlaps the whole image
-            roughly equally, so the heuristic falls back to picking
-            "atypical patches *within* one object" — i.e. noise.  Result:
-            ``proto_score_gap`` on InsDet is essentially zero
-            (mean(score_pos) ≈ mean(score_neg) ≈ 0.94, both saturated).
-
-            Mean-pooling the class-head patch embeddings — the canonical
-            prototypical-network prototype — is robust to this.  On a
-            cropped support, the average direction is dominated by the
-            object's class identity rather than noisy "distinctive" picks.
-
-        Detached: the baseline is a frozen-OWLv2 signal; gradient enters
-        the prototype path only via the learned aggregator correction in
-        ``forward``.
+        Effect: in Stage 1.2 / 2.3 the class_head + box_head receive
+        gradient signal from BOTH the query path (existing) AND the
+        support-prototype path (new), helping them adapt to *our*
+        support distribution rather than just our query distribution.
         """
-        b, v, c, h, w = support_imgs.shape
-        flat = support_imgs.view(b * v, c, h, w)
-        sup_fm, _ = self.owlv2.image_embedder(
-            pixel_values=flat, interpolate_pos_encoding=True
-        )                                                            # (B*V, gh, gw, D_v)
-        sup_h, sup_w, sd = sup_fm.shape[1:]
-        feats = sup_fm.reshape(b * v, sup_h * sup_w, sd)             # (B*V, P, D_v)
-        # ``class_predictor`` with ``query_embeds=None`` returns
-        # ``(zero_logits, image_class_embeds)`` where the second is
-        # the per-patch class-head pre-projection ``dense0(feats)``.
-        _, patch_class_embeds = self.owlv2.class_predictor(
-            feats, None, None
-        )                                                            # (B*V, P, D_q)
-        # Per-patch L2-normalise so the mean is over directions on the
-        # unit sphere (otherwise patches with bigger magnitude dominate).
-        patch_class_embeds = F.normalize(patch_class_embeds, dim=-1)
-        pooled = patch_class_embeds.mean(dim=1)                      # (B*V, D_q)
-        pooled = pooled.view(b, v, -1).mean(dim=1)                   # (B, D_q)
-        pooled = F.normalize(pooled, dim=-1)
-        return pooled.detach()
+        # Decide whether to retain the support-pass graph.  We probe the
+        # parameters of ``class_head`` since ``unfreeze_owlv2_heads``
+        # toggles them in lockstep with ``box_head``.
+        any_trainable = any(
+            p.requires_grad
+            for p in self.owlv2.class_head.parameters()
+        )
+        ctx = torch.enable_grad() if any_trainable else torch.no_grad()
+        with ctx:
+            b, v, c, h, w = support_imgs.shape
+            baselines: list[torch.Tensor] = []
+            for vi in range(v):
+                sup_v = support_imgs[:, vi]                          # (B, 3, S, S)
+                sup_fm, _ = self.owlv2.image_embedder(
+                    pixel_values=sup_v, interpolate_pos_encoding=True
+                )                                                    # (B, gh, gw, D_v)
+                sup_h, sup_w, sd = sup_fm.shape[1:]
+                sup_feats = sup_fm.reshape(b, sup_h * sup_w, sd)
+                q_emb, _, _ = self.owlv2.embed_image_query(
+                    sup_feats, sup_fm, interpolate_pos_encoding=True
+                )
+                if q_emb is None:
+                    continue
+                if q_emb.dim() == 3:
+                    q_emb = q_emb.squeeze(1)                          # (B, D_q)
+                baselines.append(q_emb)
+            if not baselines:
+                return torch.zeros(b, self.query_dim, device=support_imgs.device)
+            proto = torch.stack(baselines, dim=0).mean(dim=0)        # (B, D_q)
+        # Detach only when the heads are frozen (no gradient to preserve).
+        return proto if any_trainable else proto.detach()
 
     def forward(
         self,
@@ -566,7 +570,9 @@ class OWLv2FewShotLocalizer(nn.Module):
     ) -> dict[str, torch.Tensor]:
         # Support → prototype.
         # Baseline: mean of OWLv2's per-support image-guided query embed.
-        # Detached so gradient never reaches OWLv2 through the baseline path.
+        # Gradient flows back into class_head / box_head when they are
+        # trainable (Stage 1.2 / 2.3); detached when they are frozen
+        # (Stage 1.1) to save memory.  See compute_baseline_prototype.
         baseline_proto = self.compute_baseline_prototype(support_imgs)  # (B, D_q)
         support_tokens = self.encode_support(support_imgs)           # (B, V, P, D_v)
         correction = self.aggregator(support_tokens)                 # (B, D_q)
