@@ -89,6 +89,16 @@ class MultiShotLocalizer(nn.Module):
         self.fusion = nn.TransformerEncoder(layer, num_layers=fusion_layers)
         self.fusion_norm = nn.LayerNorm(D_q)
 
+        # Residual identity path. The prototype is computed as
+        #   prototype = mean(per_support_q_emb) + alpha * fusion_correction
+        # with `alpha` initialised at a small positive value so the model
+        # starts NEAR zero-shot quality (~99% baseline + 1% fusion) and
+        # the fusion still receives gradient from the first batch. With
+        # alpha exactly 0, the gradient w.r.t. fusion params is also
+        # exactly 0 (chain rule through the multiplication), creating a
+        # "alpha-first warmup" that delays fusion learning by O(epochs).
+        self.alpha = nn.Parameter(torch.full((), 0.01))
+
         # Default: backbone fully frozen.
         self.freeze_backbone()
         self._lora_attached = False
@@ -125,7 +135,11 @@ class MultiShotLocalizer(nn.Module):
         return list(self.owlv2.box_head.parameters())
 
     def fusion_params(self) -> list[nn.Parameter]:
-        return list(self.fusion.parameters()) + [self.cls_token] + list(self.fusion_norm.parameters())
+        return (
+            list(self.fusion.parameters())
+            + [self.cls_token, self.alpha]
+            + list(self.fusion_norm.parameters())
+        )
 
     # ------------------------------------------------------------------
     # LoRA (Stage L3)
@@ -206,10 +220,28 @@ class MultiShotLocalizer(nn.Module):
         q_emb = q_emb.view(B, K, -1)
         return q_emb if any_grad else q_emb.detach()
 
+    @staticmethod
+    def _baseline_prototype(
+        q_emb: torch.Tensor, support_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mean of per-support OWLv2 image-guided embeddings over valid slots.
+
+        This is exactly what ``phase0_forward`` uses, and is the zero-shot
+        quality baseline. The full prototype is built as
+        ``baseline + alpha * fusion_correction``.
+        """
+        mask_f = support_mask.float().unsqueeze(-1)             # (B, K, 1)
+        return (q_emb * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
+
     def _fuse(
         self, q_emb: torch.Tensor, support_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Fuse K per-support embeddings into one prototype via [CLS] attention."""
+        """Fuse K per-support embeddings into a CORRECTION via [CLS] attention.
+
+        Returns (B, D_q) — added to the baseline mean prototype with weight
+        alpha (init 0). At alpha=0 the prototype equals the baseline, so L1
+        starts at zero-shot quality.
+        """
         B, K, _ = q_emb.shape
         if support_mask.shape != (B, K):
             raise ValueError(
@@ -241,15 +273,19 @@ class MultiShotLocalizer(nn.Module):
             support_mask = support_mask.to(torch.bool)
         if support_mask.device != support_imgs.device:
             support_mask = support_mask.to(support_imgs.device)
+
         # 1) Per-support OWLv2 query-embedding.
         q_emb = self._embed_supports(support_imgs, support_mask)         # (B, K, D_q)
 
-        # 2) Fusion → prototype.
-        prototype = self._fuse(q_emb, support_mask)                      # (B, D_q)
+        # 2) Fusion → prototype = baseline + alpha * fusion_correction.
+        baseline = self._baseline_prototype(q_emb, support_mask)         # (B, D_q)
+        correction = self._fuse(q_emb, support_mask)                     # (B, D_q)
+        prototype = baseline + self.alpha * correction                    # (B, D_q)
 
         # 3) Query path.
         q_norm = _normalize_owlv2(query_img)
         fm_q, _ = self.owlv2.image_embedder(pixel_values=q_norm, interpolate_pos_encoding=True)
+        gh, gw = fm_q.shape[1], fm_q.shape[2]
         feats_q = fm_q.reshape(fm_q.shape[0], -1, fm_q.shape[-1])
         pred_logits, _ = self.owlv2.class_predictor(feats_q, prototype.unsqueeze(1))
         pred_logits = pred_logits.squeeze(-1)                            # (B, P)
@@ -262,21 +298,18 @@ class MultiShotLocalizer(nn.Module):
         best_box = pred_boxes[ar, best_idx]
         best_score = torch.sigmoid(pred_logits[ar, best_idx])
 
-        # Soft box: softmax over patches (using pred_logits) to pick boxes.
-        # This is differentiable through the prototype path even when the
-        # box_head is frozen (Stage L1) — the soft weights depend on the
-        # prototype, so the box loss can still drive the fusion.
-        soft_w = torch.softmax(pred_logits, dim=-1)                          # (B, P)
-        soft_box = (soft_w.unsqueeze(-1) * pred_boxes).sum(dim=1)            # (B, 4)
-
         return {
             "best_box": best_box,
-            "soft_box": soft_box,
             "best_score": best_score,
             "best_logit": pred_logits[ar, best_idx],
             "pred_logits": pred_logits,
             "pred_boxes": pred_boxes,
             "prototype": prototype,
+            "baseline_prototype": baseline,
+            # Detached scalar — the trainable alpha is the parameter on the
+            # model itself; this is just a metric snapshot.
+            "alpha": self.alpha.detach(),
+            "patch_grid": (gh, gw),
         }
 
     @torch.no_grad()

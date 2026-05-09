@@ -278,11 +278,22 @@ def _save_stage_ckpt(
 
 
 _TRAIN_PRIORITY = ("loss", "focal", "variance", "decorrelation", "grad_norm", "n_steps")
-_VAL_PRIORITY = ("n", "n_pos", "n_neg", "auroc", "pr_auc", "accuracy",
-                 "fpr", "fnr", "acc_pos", "acc_neg",
-                 "mean_score_pos", "mean_score_neg", "brier")
-_PER_SOURCE_KEYS = ("n", "n_pos", "auroc", "fpr", "accuracy",
-                    "mean_score_pos", "mean_score_neg")
+_VAL_PRIORITY = ("n", "n_pos", "n_neg",
+                 "auroc", "pr_auc", "avg_precision",
+                 "accuracy", "f1", "best_f1", "best_f1_threshold",
+                 "precision", "recall",
+                 "fpr", "fnr", "tpr", "tnr",
+                 "youden_j", "mcc",
+                 "acc_pos", "acc_neg",
+                 "fpr_at_recall_95", "recall_at_fpr_05", "recall_at_fpr_10",
+                 "mean_score_pos", "mean_score_neg", "score_gap",
+                 "std_score_pos", "std_score_neg",
+                 "frac_high_score", "frac_low_score", "frac_uncertain",
+                 "brier",
+                 "tp", "fp", "fn", "tn")
+_PER_SOURCE_KEYS = ("n", "n_pos", "auroc", "pr_auc", "f1", "best_f1",
+                    "fpr", "fnr", "accuracy", "mcc",
+                    "mean_score_pos", "mean_score_neg", "score_gap")
 
 
 def train_phase0(**user_kwargs) -> dict:
@@ -317,8 +328,17 @@ def _train_phase0_inner(user_kwargs: dict) -> dict:
     metrics["wall_clock_seconds"] = round(time.time() - t0, 2)
     write_json(out_dir / "results.json", metrics)
     write_json(analysis_dir / "results.json", metrics)
-    print(f"[siamese phase0] AUROC = {metrics['overall'].get('auroc', 0.0):.4f}  "
-          f"FPR = {metrics['overall'].get('fpr', 0.0):.4f}")
+    o = metrics["overall"]
+    print(
+        f"[siamese phase0]  "
+        f"AUROC={o.get('auroc', 0.0):.4f}  "
+        f"PR-AUC={o.get('pr_auc', 0.0):.4f}  "
+        f"AP={o.get('avg_precision', 0.0):.4f}  "
+        f"acc={o.get('accuracy', 0.0):.4f}  "
+        f"best_f1={o.get('best_f1', 0.0):.4f}@thr={o.get('best_f1_threshold', 0.0):.2f}  "
+        f"FPR={o.get('fpr', 0.0):.4f}  FNR={o.get('fnr', 0.0):.4f}  "
+        f"MCC={o.get('mcc', 0.0):.4f}"
+    )
     return metrics
 
 
@@ -538,15 +558,26 @@ def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
         aggregate = aggregate_folds(fold_jsons)
         write_json(analysis_dir / f"epoch_{epoch:03d}" / "aggregate.json", aggregate)
         print_aggregate(stage, epoch, aggregate, keys=(
-            ("val.overall.auroc", "auroc"),
-            ("val.overall.fpr", "fpr"),
-            ("val.overall.fnr", "fnr"),
-            ("val.overall.accuracy", "accuracy"),
-            ("val.overall.mean_score_pos", "score_pos"),
-            ("val.overall.mean_score_neg", "score_neg"),
-            ("train.loss", "train_loss"),
-            ("train.focal", "train_focal"),
-            ("train.variance", "train_var"),
+            ("val.overall.auroc",             "auroc"),
+            ("val.overall.pr_auc",            "pr_auc"),
+            ("val.overall.avg_precision",     "avg_precision"),
+            ("val.overall.f1",                "f1"),
+            ("val.overall.best_f1",           "best_f1"),
+            ("val.overall.best_f1_threshold", "best_f1_thr"),
+            ("val.overall.fpr",               "fpr"),
+            ("val.overall.fnr",               "fnr"),
+            ("val.overall.fpr_at_recall_95",  "fpr@r95"),
+            ("val.overall.recall_at_fpr_05",  "r@fpr05"),
+            ("val.overall.recall_at_fpr_10",  "r@fpr10"),
+            ("val.overall.mcc",               "mcc"),
+            ("val.overall.youden_j",          "youden_j"),
+            ("val.overall.accuracy",          "accuracy"),
+            ("val.overall.score_gap",         "score_gap"),
+            ("val.overall.mean_score_pos",    "score_pos"),
+            ("val.overall.mean_score_neg",    "score_neg"),
+            ("train.loss",                    "train_loss"),
+            ("train.focal",                   "train_focal"),
+            ("train.variance",                "train_var"),
         ))
         # Pick the headline metric: AUROC by default, fpr_inv (=1-fpr) optional.
         headline_key = cfg.get("early_stop_metric", "auroc")
@@ -670,8 +701,17 @@ def _evaluate_run_inner(checkpoint: str, user_kwargs: dict) -> dict:
     }
     write_json(out_dir / "test_eval.json", payload)
     write_json(analysis_dir / f"test_eval_{ts}.json", payload)
-    print(f"[siamese {stage}] test AUROC = {metrics['overall'].get('auroc', 0.0):.4f}  "
-          f"FPR = {metrics['overall'].get('fpr', 0.0):.4f}  "
-          f"acc = {metrics['overall'].get('accuracy', 0.0):.4f}  "
-          f"({metrics['wall_clock_seconds']:.1f}s)")
+    o = metrics["overall"]
+    print(
+        f"[siamese {stage}] test  "
+        f"AUROC={o.get('auroc', 0.0):.4f}  "
+        f"PR-AUC={o.get('pr_auc', 0.0):.4f}  "
+        f"AP={o.get('avg_precision', 0.0):.4f}  "
+        f"acc={o.get('accuracy', 0.0):.4f}  "
+        f"f1={o.get('f1', 0.0):.4f}  "
+        f"best_f1={o.get('best_f1', 0.0):.4f}@thr={o.get('best_f1_threshold', 0.0):.2f}  "
+        f"FPR={o.get('fpr', 0.0):.4f}  FNR={o.get('fnr', 0.0):.4f}  "
+        f"MCC={o.get('mcc', 0.0):.4f}  "
+        f"({metrics['wall_clock_seconds']:.1f}s)"
+    )
     return metrics

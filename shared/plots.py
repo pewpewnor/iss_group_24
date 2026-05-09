@@ -183,7 +183,18 @@ def plot_all_from_jsons(analysis_root: str | Path) -> None:
             if not fjs:
                 continue
             out_dir = plots_root / "localizer" / stage
-            # mAP@50 vs epoch (overall, hots, insdet).
+            # mAP family (50, 75, 50:95) vs epoch — overall.
+            series_map = {
+                "mAP@50":   _series_per_epoch(fjs, ("overall", "map_50")),
+                "mAP@75":   _series_per_epoch(fjs, ("overall", "map_75")),
+                "mAP@50:95": _series_per_epoch(fjs, ("overall", "map_5095")),
+            }
+            _plot_metric_curve(
+                out_dir / "map_family_vs_epoch.png",
+                title=f"Localizer {stage} — mAP@50 / 75 / 50:95 vs epoch (overall)",
+                ylabel="mAP", series=series_map,
+            )
+            # mAP@50 by source.
             series = {
                 "overall": _series_per_epoch(fjs, ("overall", "map_50")),
                 "hots":    _series_per_epoch(fjs, ("per_source", "hots", "map_50")),
@@ -191,8 +202,19 @@ def plot_all_from_jsons(analysis_root: str | Path) -> None:
             }
             _plot_metric_curve(
                 out_dir / "map50_vs_epoch.png",
-                title=f"Localizer {stage} — mAP@50 vs epoch",
+                title=f"Localizer {stage} — mAP@50 vs epoch (per source)",
                 ylabel="mAP@50", series=series,
+            )
+            # mAP@50:95 by source.
+            series = {
+                "overall": _series_per_epoch(fjs, ("overall", "map_5095")),
+                "hots":    _series_per_epoch(fjs, ("per_source", "hots", "map_5095")),
+                "insdet":  _series_per_epoch(fjs, ("per_source", "insdet", "map_5095")),
+            }
+            _plot_metric_curve(
+                out_dir / "map5095_vs_epoch.png",
+                title=f"Localizer {stage} — mAP@50:95 vs epoch (per source)",
+                ylabel="mAP@50:95", series=series,
             )
             # IoU mean vs epoch.
             series_iou = {
@@ -208,6 +230,8 @@ def plot_all_from_jsons(analysis_root: str | Path) -> None:
             # Containment metrics vs epoch.
             series_contain = {
                 "containment_mean":      _series_per_epoch(fjs, ("overall", "containment_mean")),
+                "frac_containment_50":   _series_per_epoch(fjs, ("overall", "frac_containment_50")),
+                "frac_containment_75":   _series_per_epoch(fjs, ("overall", "frac_containment_75")),
                 "frac_containment_90":   _series_per_epoch(fjs, ("overall", "frac_containment_90")),
                 "frac_containment_full": _series_per_epoch(fjs, ("overall", "frac_containment_full")),
             }
@@ -216,11 +240,21 @@ def plot_all_from_jsons(analysis_root: str | Path) -> None:
                 title=f"Localizer {stage} — containment metrics vs epoch",
                 ylabel="containment", series=series_contain,
             )
-            # Per-K bar chart.
+            # Per-K bar charts for the headline metrics.
             _plot_per_k_bar(
                 out_dir / "map50_by_k.png",
                 title=f"Localizer {stage} — mAP@50 by K (final epoch)",
                 ylabel="mAP@50", fold_jsons=fjs, metric_key="map_50",
+            )
+            _plot_per_k_bar(
+                out_dir / "map5095_by_k.png",
+                title=f"Localizer {stage} — mAP@50:95 by K (final epoch)",
+                ylabel="mAP@50:95", fold_jsons=fjs, metric_key="map_5095",
+            )
+            _plot_per_k_bar(
+                out_dir / "iou_by_k.png",
+                title=f"Localizer {stage} — IoU mean by K (final epoch)",
+                ylabel="IoU mean", fold_jsons=fjs, metric_key="iou_mean",
             )
             _plot_per_k_bar(
                 out_dir / "containment_by_k.png",
@@ -243,6 +277,7 @@ def plot_all_from_jsons(analysis_root: str | Path) -> None:
             if not fjs:
                 continue
             out_dir = plots_root / "siamese" / stage
+            # AUROC and PR-AUC per source.
             series_auroc = {
                 "overall": _series_per_epoch(fjs, ("overall", "auroc")),
                 "hots":    _series_per_epoch(fjs, ("per_source", "hots", "auroc")),
@@ -253,6 +288,39 @@ def plot_all_from_jsons(analysis_root: str | Path) -> None:
                 title=f"Siamese {stage} — AUROC vs epoch",
                 ylabel="AUROC", series=series_auroc,
             )
+            series_pr_auc = {
+                "overall": _series_per_epoch(fjs, ("overall", "pr_auc")),
+                "hots":    _series_per_epoch(fjs, ("per_source", "hots", "pr_auc")),
+                "insdet":  _series_per_epoch(fjs, ("per_source", "insdet", "pr_auc")),
+            }
+            _plot_metric_curve(
+                out_dir / "pr_auc_vs_epoch.png",
+                title=f"Siamese {stage} — PR-AUC vs epoch",
+                ylabel="PR-AUC", series=series_pr_auc,
+            )
+            # F1 family.
+            series_f1 = {
+                "f1@thr=0.5": _series_per_epoch(fjs, ("overall", "f1")),
+                "best_f1":    _series_per_epoch(fjs, ("overall", "best_f1")),
+            }
+            _plot_metric_curve(
+                out_dir / "f1_vs_epoch.png",
+                title=f"Siamese {stage} — F1 vs epoch (overall)",
+                ylabel="F1", series=series_f1,
+            )
+            # Operating-point sensitivity.
+            series_op = {
+                "fpr@thr=0.5":      _series_per_epoch(fjs, ("overall", "fpr")),
+                "fpr@recall=0.95":  _series_per_epoch(fjs, ("overall", "fpr_at_recall_95")),
+                "recall@fpr=0.05":  _series_per_epoch(fjs, ("overall", "recall_at_fpr_05")),
+                "recall@fpr=0.10":  _series_per_epoch(fjs, ("overall", "recall_at_fpr_10")),
+            }
+            _plot_metric_curve(
+                out_dir / "operating_point_vs_epoch.png",
+                title=f"Siamese {stage} — operating-point metrics vs epoch (overall)",
+                ylabel="value", series=series_op,
+            )
+            # FPR by source.
             series_fpr = {
                 "overall": _series_per_epoch(fjs, ("overall", "fpr")),
                 "hots":    _series_per_epoch(fjs, ("per_source", "hots", "fpr")),
@@ -263,10 +331,43 @@ def plot_all_from_jsons(analysis_root: str | Path) -> None:
                 title=f"Siamese {stage} — FPR@0.5 vs epoch",
                 ylabel="FPR", series=series_fpr,
             )
+            # MCC vs epoch.
+            series_mcc = {
+                "overall": _series_per_epoch(fjs, ("overall", "mcc")),
+                "hots":    _series_per_epoch(fjs, ("per_source", "hots", "mcc")),
+                "insdet":  _series_per_epoch(fjs, ("per_source", "insdet", "mcc")),
+            }
+            _plot_metric_curve(
+                out_dir / "mcc_vs_epoch.png",
+                title=f"Siamese {stage} — MCC vs epoch",
+                ylabel="MCC", series=series_mcc,
+            )
+            # Score-gap and means.
+            series_scores = {
+                "mean_score_pos": _series_per_epoch(fjs, ("overall", "mean_score_pos")),
+                "mean_score_neg": _series_per_epoch(fjs, ("overall", "mean_score_neg")),
+                "score_gap":      _series_per_epoch(fjs, ("overall", "score_gap")),
+            }
+            _plot_metric_curve(
+                out_dir / "score_distribution_vs_epoch.png",
+                title=f"Siamese {stage} — score distribution vs epoch",
+                ylabel="score", series=series_scores,
+            )
+            # Per-K bar charts.
             _plot_per_k_bar(
                 out_dir / "auroc_by_k.png",
                 title=f"Siamese {stage} — AUROC by K (final epoch)",
                 ylabel="AUROC", fold_jsons=fjs, metric_key="auroc",
+            )
+            _plot_per_k_bar(
+                out_dir / "best_f1_by_k.png",
+                title=f"Siamese {stage} — best_f1 by K (final epoch)",
+                ylabel="best_f1", fold_jsons=fjs, metric_key="best_f1",
+            )
+            _plot_per_k_bar(
+                out_dir / "fpr_by_k.png",
+                title=f"Siamese {stage} — FPR@0.5 by K (final epoch)",
+                ylabel="FPR", fold_jsons=fjs, metric_key="fpr",
             )
             _plot_loss_curves(
                 out_dir / "loss_curves.png", fold_jsons=fjs,

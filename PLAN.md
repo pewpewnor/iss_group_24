@@ -20,20 +20,41 @@ job.
   `image_embedder` + `embed_image_query` to get a 512-D query embedding.
 - **Fusion (trainable, ~2.5M params)**: stack K embeddings with a learnable
   `[CLS]` token; pass through a 2-layer pre-LN transformer encoder with
-  `key_padding_mask` over the K_max slots; the CLS output is the prototype.
+  `key_padding_mask` over the K_max slots; the CLS output is a *correction*.
   Permutation-invariant by construction (no positional embedding).
+- **Residual identity path** (key fix): the prototype is built as
+  ``prototype = mean(per_support_q_emb) + alpha * fusion_correction`` with
+  `alpha` initialised at **0.01** (not 0). This means epoch-0 quality
+  ≈ zero-shot OWLv2 (the mean is exactly what `phase0_forward` uses), and
+  the fusion learns a small correction on top. `alpha` is trainable; if the
+  fusion is harmful the optimiser will drive `alpha → 0`.
 - **Detection**: query image → `image_embedder` → `class_predictor(prototype)`
-  → top-1 patch → `box_predictor`. Output `best_box` in `(cx, cy, w, h)`.
+  → argmax patch → `box_predictor[argmax]`. Output `best_box` in `(cx, cy, w, h)`.
+
+Loss:
+| Component                    | Definition                                         | Weight |
+| ---------------------------- | -------------------------------------------------- | ------ |
+| `L_patch_ce`                 | cross-entropy on the patch nearest GT centre       | 1.0    |
+| `L_l1`  (L2 / L3 only)       | L1 on `pred_boxes[argmax]` vs GT (cxcywh)          | 5.0    |
+| `L_giou` (L2 / L3 only)      | GIoU on `pred_boxes[argmax]` vs GT (xyxy)          | 2.0    |
+
+The patch-CE term replaces the previous "soft-box" trick. It directly demands
+prototype DISCRIMINATION across patches (the prototype must produce a high
+logit on the patch nearest the GT centre), so there's no fixed-point
+"predict everywhere" solution. At L1 the box L1+GIoU terms produce zero
+gradient (frozen box_head) and are skipped to avoid wasted compute.
 
 Stages:
-| Stage | Trainable                             | Loss          | Epochs | Eps/fold |
-| ----- | ------------------------------------- | ------------- | ------ | -------- |
-| L1    | fusion + CLS                          | L1 + GIoU     | 6      | 200      |
-| L2    | + `class_head` + `box_head` + `layer_norm` | L1 + GIoU | 12     | 250      |
-| L3    | + LoRA r=8 on `q_proj/v_proj` of last 4 ViT blocks | L1 + GIoU | 8 | 250 |
+| Stage | Trainable                             | Loss                          | Epochs | Eps/fold |
+| ----- | ------------------------------------- | ----------------------------- | ------ | -------- |
+| L1    | fusion + CLS + alpha                  | patch_ce only                 | 3      | 400      |
+| L2    | + `class_head` + `box_head` + `layer_norm` | patch_ce + L1 + GIoU     | 12     | 250      |
+| L3    | + LoRA r=8 on `q_proj/v_proj` of last 4 ViT blocks | patch_ce + L1 + GIoU | 8     | 250      |
 
 Headline metric: **mAP@50** (over positive episodes only). Per-K and per-source
-breakdowns (K∈{1, 4, 10}; sources hots/insdet) reported every epoch.
+breakdowns (K∈{1, 4, 10}; sources hots/insdet) reported every epoch. Plus a
+full mAP@50:95 + per-IoU AP curve, IoU stats, containment family, geometry
+diagnostics, and `alpha` snapshot.
 
 ### 1.2 Multi-Shot Siamese (`siamese/`)
 

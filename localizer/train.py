@@ -67,17 +67,23 @@ DEFAULT_CFG: dict[str, Any] = {
     # K range
     "k_min": 1,
     "k_max": 10,
-    # Stage durations
-    "L1_epochs": 6,
+    # Stage durations.
+    # L1 is short: only the fusion (~3M params on top of mean-of-q_emb baseline)
+    # is being learned, with patch-CE alone. The residual gate alpha starts at 0
+    # so we begin AT zero-shot quality and the fusion learns a small correction.
+    # 3 epochs × 3 folds × 400 episodes ≈ 3.6k episodes is plenty for ~3M params.
+    "L1_epochs": 3,
     "L2_epochs": 12,
     "L3_epochs": 8,
-    "L1_eps_per_fold": 200,
+    "L1_eps_per_fold": 400,
     "L2_eps_per_fold": 250,
     "L3_eps_per_fold": 250,
     "val_episodes": 100,
     "test_episodes": 400,
-    # LRs
-    "lr_fusion_L1": 5e-4,
+    # LRs.
+    # L1: lower LR than before (1e-4 vs 5e-4) — the fusion has very little to
+    # do at first (alpha=0) so a high LR pushes it into noisy territory.
+    "lr_fusion_L1": 1e-4,
     "lr_fusion_L2": 1e-4,
     "lr_class_L2": 5e-5,
     "lr_box_L2":   5e-5,
@@ -90,14 +96,18 @@ DEFAULT_CFG: dict[str, Any] = {
     "grad_clip": 1.0,
     "warmup_frac": 0.05,
     # Loss
+    "lambda_patch_ce": 1.0,
     "lambda_l1": 5.0,
     "lambda_giou": 2.0,
+    "patch_ce_label_smoothing": 0.0,
     "L2_box_warmup_epochs": 2,
-    # Architecture
+    # Architecture.
+    # fusion_dropout=0.0 at default — with only ~3M trainable fusion params and
+    # a tiny dataset, dropout adds noise without preventing overfit.
     "fusion_layers": 2,
     "fusion_heads": 8,
     "fusion_mlp_ratio": 2,
-    "fusion_dropout": 0.1,
+    "fusion_dropout": 0.0,
     "owlv2_model_name": "google/owlv2-base-patch16-ensemble",
     # LoRA
     "lora_r": 8,
@@ -298,18 +308,26 @@ def _save_stage_ckpt(
 # ---------------------------------------------------------------------------
 
 
-_TRAIN_PRIORITY = ("loss", "l1", "giou", "grad_norm", "n_steps")
+_TRAIN_PRIORITY = ("loss", "patch_ce", "l1", "giou", "grad_norm", "alpha", "n_steps")
 _VAL_PRIORITY = ("n", "n_pos",
-                 "map_50", "map_50_containment",
-                 "iou_mean", "iou_median",
-                 "containment_mean", "containment_median",
+                 "map_50", "map_75", "map_5095",
+                 "map_50_containment", "map_90_containment",
+                 "iou_mean", "iou_median", "iou_std",
+                 "frac_iou_50", "frac_iou_75", "frac_iou_90",
+                 "containment_mean", "containment_median", "containment_std",
                  "frac_containment_50", "frac_containment_75",
                  "frac_containment_90", "frac_containment_full",
                  "contain_at_iou_50", "contain_at_iou_75",
                  "high_contain_high_iou",
-                 "mean_pred_box_area", "frac_pred_box_too_big")
-_PER_SOURCE_KEYS = ("n", "n_pos", "map_50", "map_50_containment",
-                    "iou_mean", "containment_mean", "frac_containment_90")
+                 "mean_pred_box_area", "std_pred_box_area",
+                 "frac_pred_box_too_big", "frac_pred_box_too_small",
+                 "mean_gt_box_area",
+                 "pred_to_gt_area_ratio_median", "log_area_ratio_mean",
+                 "center_distance_mean",
+                 "score_mean", "score_iou_correlation")
+_PER_SOURCE_KEYS = ("n", "n_pos", "map_50", "map_5095", "map_50_containment",
+                    "iou_mean", "containment_mean", "frac_containment_90",
+                    "center_distance_mean")
 
 
 def train_phase0(**user_kwargs) -> dict:
@@ -404,7 +422,11 @@ def _evaluate_phase0_inner(user_kwargs: dict) -> dict:
     write_json(analysis_dir / f"test_eval_{ts}.json", metrics)
     o = metrics["overall"]
     print(
-        f"[localizer phase0] test  mAP@50={o.get('map_50', 0.0):.4f}  "
+        f"[localizer phase0] test  "
+        f"mAP@50={o.get('map_50', 0.0):.4f}  "
+        f"mAP@75={o.get('map_75', 0.0):.4f}  "
+        f"mAP@50:95={o.get('map_5095', 0.0):.4f}  "
+        f"IoU={o.get('iou_mean', 0.0):.4f}  "
         f"contain={o.get('containment_mean', 0.0):.4f}  "
         f"contain>=.9={o.get('frac_containment_90', 0.0):.4f}"
     )
@@ -572,10 +594,18 @@ def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
             )
             val_ds.set_fold(val_ids=set(fold["val_ids"]))
 
+            # L1: box_head is frozen, so the box L1+GIoU terms cannot
+            # produce gradient. Skip them — patch-CE alone drives the
+            # fusion. L2 with box_head still in warmup also has it frozen
+            # for the first N epochs, but we still keep the box loss term
+            # active because the class_head IS trainable and benefits from
+            # seeing the joint signal as soon as possible.
+            stage_uses_box_loss = stage in ("L2", "L3")
             train_metrics = train_one_pass(
                 model=model, optimizer=optimizer, scheduler=scheduler,
                 loader=train_loader, device=device, cfg=cfg,
                 scaler=scaler, use_amp=bool(cfg["use_amp"]),
+                use_box_loss=stage_uses_box_loss,
             )
             val_metrics = evaluate(model, val_loader, device, progress_every=20)
 
@@ -617,15 +647,22 @@ def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
         write_json(analysis_dir / f"epoch_{epoch:03d}" / "aggregate.json", aggregate)
         print_aggregate(stage, epoch, aggregate, keys=(
             ("val.overall.map_50",                 "map_50"),
-            ("val.overall.map_50_containment",     "map_50_containment"),
+            ("val.overall.map_75",                 "map_75"),
+            ("val.overall.map_5095",               "map_50:95"),
+            ("val.overall.map_50_containment",     "map_50_contain"),
+            ("val.overall.map_90_containment",     "map_90_contain"),
             ("val.overall.iou_mean",               "iou_mean"),
-            ("val.overall.containment_mean",       "containment_mean"),
+            ("val.overall.containment_mean",       "contain_mean"),
             ("val.overall.frac_containment_90",    "contain>=0.90"),
             ("val.overall.frac_containment_full",  "contain==full"),
             ("val.overall.high_contain_high_iou",  "iou>=.5 & con>=.9"),
+            ("val.overall.center_distance_mean",   "center_dist"),
+            ("val.overall.score_iou_correlation",  "score↔iou_corr"),
             ("train.loss",                         "train_loss"),
+            ("train.patch_ce",                     "train_patch_ce"),
             ("train.l1",                           "train_l1"),
             ("train.giou",                         "train_giou"),
+            ("train.alpha",                        "alpha"),
         ))
         map50 = aggregate["metrics"].get("val.overall.map_50", {}).get("mean", 0.0)
         if map50 > best_metric["value"]:
@@ -761,7 +798,10 @@ def _evaluate_run_inner(checkpoint: str, user_kwargs: dict) -> dict:
 
     o = metrics["overall"]
     print(
-        f"[localizer {stage}] test  mAP@50={o.get('map_50', 0.0):.4f}  "
+        f"[localizer {stage}] test  "
+        f"mAP@50={o.get('map_50', 0.0):.4f}  "
+        f"mAP@75={o.get('map_75', 0.0):.4f}  "
+        f"mAP@50:95={o.get('map_5095', 0.0):.4f}  "
         f"mAP@50_contain={o.get('map_50_containment', 0.0):.4f}  "
         f"IoU={o.get('iou_mean', 0.0):.4f}  "
         f"contain={o.get('containment_mean', 0.0):.4f}  "
