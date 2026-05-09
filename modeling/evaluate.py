@@ -368,6 +368,8 @@ def evaluate(
     score_thr: float = 0.5,
     img_size: int = 768,
     tile_cfg: dict | None = None,
+    progress: bool = True,
+    progress_every: int = 10,
 ) -> dict[str, Any]:
     """Run evaluation and return the kitchen-sink metric dict.
 
@@ -376,6 +378,11 @@ def evaluate(
             Set ``mode="off"`` to disable tiling entirely (single-pass eval).
             Episodes whose ``source`` is not in ``tile_cfg["for_sources"]``
             also use single-pass eval, regardless of mode.
+        progress: if True, print a one-line update every ``progress_every``
+            batches.  Without this the eval loop is silent for the entire
+            run, which on a 400-episode test split looks indistinguishable
+            from a hang.
+        progress_every: batches between progress lines.
 
     Returns:
         {
@@ -383,6 +390,8 @@ def evaluate(
           "per_source": {"hots": {...}, "insdet": {...}, "vizwiz_novel": {...}}
         }
     """
+    import sys
+    import time as _time
     model.eval()
     overall = _empty_bucket()
     per_source: dict[str, dict[str, list]] = defaultdict(_empty_bucket)
@@ -393,6 +402,13 @@ def evaluate(
     # When tiling is requested for any source, the loader must have been
     # built with ``return_native=True`` so each batch carries the native PIL.
     needs_native = tile_mode != "off"
+
+    n_batches_total = len(loader) if hasattr(loader, "__len__") else None
+    n_batches_seen = 0
+    t_start = _time.time()
+    if progress:
+        msg = f"  evaluating: {n_batches_total or '?'} batches, tile_mode={tile_mode}"
+        print(msg, flush=True)
 
     for batch in loader:
         support_imgs = batch["support_imgs"].to(device)
@@ -509,6 +525,25 @@ def evaluate(
                 bucket["existence_prob"].append(ex)
                 bucket["prototype_norm"].append(pnorm)
 
+        n_batches_seen += 1
+        if progress and (n_batches_seen % progress_every == 0
+                         or n_batches_seen == n_batches_total):
+            elapsed = _time.time() - t_start
+            rate = n_batches_seen / max(elapsed, 1e-6)
+            if n_batches_total:
+                remaining = (n_batches_total - n_batches_seen) / max(rate, 1e-6)
+                pct = 100.0 * n_batches_seen / n_batches_total
+                msg = (f"  [{n_batches_seen}/{n_batches_total} "
+                       f"= {pct:5.1f}%]  "
+                       f"elapsed={elapsed:6.1f}s  "
+                       f"eta={remaining:6.1f}s  "
+                       f"rate={rate:.2f} batch/s")
+            else:
+                msg = (f"  [{n_batches_seen} batches]  "
+                       f"elapsed={elapsed:6.1f}s  "
+                       f"rate={rate:.2f} batch/s")
+            print(msg, flush=True)
+
     return {
         "overall": _bucket_metrics(overall, score_thr),
         "per_source": {k: _bucket_metrics(v, score_thr) for k, v in per_source.items()},
@@ -529,6 +564,8 @@ def evaluate_phase0(
     score_thr: float = 0.5,
     img_size: int = 768,
     tile_cfg: dict | None = None,
+    progress: bool = True,
+    progress_every: int = 5,
 ) -> dict[str, Any]:
     """Zero-shot OWLv2 image-guided detection.
 
@@ -550,12 +587,20 @@ def evaluate_phase0(
     )
     from torchvision.ops import batched_nms
 
+    import time as _time
     owlv2_model.eval()
     overall = _empty_bucket()
     per_source: dict[str, dict[str, list]] = defaultdict(_empty_bucket)
     cfg = resolve_tile_cfg(tile_cfg)
     tile_mode = cfg["mode"]
     tile_for_sources = set(cfg["for_sources"])
+
+    n_batches_total = len(loader) if hasattr(loader, "__len__") else None
+    n_batches_seen = 0
+    t_start = _time.time()
+    if progress:
+        print(f"  phase0: {n_batches_total or '?'} batches, tile_mode={tile_mode}",
+              flush=True)
 
     def _embed_supports_to_q_embs(supports_v: torch.Tensor) -> torch.Tensor | None:
         """Embed each of the V support views into a single query embedding.
@@ -760,6 +805,25 @@ def evaluate_phase0(
             for bucket in (overall, per_source[src]):
                 for k, v_ in entry.items():
                     bucket[k].append(v_)
+
+        n_batches_seen += 1
+        if progress and (n_batches_seen % progress_every == 0
+                         or n_batches_seen == n_batches_total):
+            elapsed = _time.time() - t_start
+            rate = n_batches_seen / max(elapsed, 1e-6)
+            if n_batches_total:
+                remaining = (n_batches_total - n_batches_seen) / max(rate, 1e-6)
+                pct = 100.0 * n_batches_seen / n_batches_total
+                msg = (f"  [{n_batches_seen}/{n_batches_total} "
+                       f"= {pct:5.1f}%]  "
+                       f"elapsed={elapsed:6.1f}s  "
+                       f"eta={remaining:6.1f}s  "
+                       f"rate={rate:.2f} batch/s")
+            else:
+                msg = (f"  [{n_batches_seen} batches]  "
+                       f"elapsed={elapsed:6.1f}s  "
+                       f"rate={rate:.2f} batch/s")
+            print(msg, flush=True)
 
     return {
         "overall": _bucket_metrics(overall, score_thr),
