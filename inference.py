@@ -4,12 +4,18 @@ Public function:
 
     run_inference(
         checkpoint        : str | Path,            # *.pt produced by train.py
-        support_paths     : list[str | Path],      # exactly 4 image paths
+        support_paths     : list[str | Path],      # K image paths (K must
+                                                   # match the model's
+                                                   # trained n_support; 4 for
+                                                   # the shipped checkpoints)
         query_path        : str | Path,
         *,
         out_root          = "inference",           # directory under which to write
         img_size          = 768,
         device            = None,                  # auto cuda/cpu
+        n_support         = 4,                     # K — must match the
+                                                   # model's aggregator
+                                                   # view_embed.num_embeddings
         existence_thr     = 0.5,                   # gate the bbox draw on this
         tile_cfg          = None,                  # see modeling.evaluate.DEFAULT_TILE_CFG
         bbox_color        = (0, 255, 0),
@@ -20,13 +26,30 @@ Public function:
 
 The function:
   1. Loads the checkpoint (auto-detecting LoRA from the stage tag).
-  2. Loads the 4 supports + 1 query as PIL images.
-  3. Runs detection — single-pass (`tile_cfg["mode"] == "off"`)
+  2. Validates that ``n_support`` matches the model's trained K (read from
+     the aggregator's ``view_embed.num_embeddings``).  Hard-fails otherwise:
+     the aggregator's per-view positional embedding is shape-tied to the
+     trained K and silently padding/subsampling would yield meaningless
+     prototypes.
+  3. Loads the K supports + 1 query as PIL images.
+  4. Runs detection — single-pass (`tile_cfg["mode"] == "off"`)
      or tiled (`pyramid_a` / `hybrid_d`).
-  4. Saves *all 5 input images* unchanged + the query annotated with the
+  5. Saves *all K+1 input images* unchanged + the query annotated with the
      predicted bbox and an "EXISTS"/"NOT EXISTS" caption to
      ``inference/<NNNN>/`` where NNNN is the next free incrementing index.
-  5. Writes a ``result.json`` with all the numerics.
+  6. Writes a ``result.json`` with all the numerics, including the
+     ``existence_threshold`` used and the ``n_support`` it ran with.
+
+Adjustable knobs:
+  - ``n_support`` / ``--n-support``  : K (number of supports).  Defaults
+        to 4 because every shipped checkpoint was trained with K=4.
+        Pass a different K only when running against a model trained
+        with that K — mismatches are rejected at load time.
+  - ``existence_thr`` / ``--existence-thr`` : confidence threshold above
+        which the existence head's probability is treated as a positive
+        detection.  The bbox is drawn iff ``existence_prob >= existence_thr``.
+        Default 0.5; raise it to suppress weakly-confident draws, lower
+        it to surface borderline detections for inspection.
 
 Use as a CLI:
 
@@ -34,7 +57,8 @@ Use as a CLI:
         --checkpoint checkpoints/stage_2_3/best.pt \\
         --supports s1.jpg s2.jpg s3.jpg s4.jpg \\
         --query    scene.jpg \\
-        --tile-mode pyramid_a
+        --tile-mode pyramid_a \\
+        --existence-thr 0.5
 
     python inference.py --checkpoint checkpoints/stage_1_1/last.pt --supports dataset/aggregated/test/support/hots_banana/001.png dataset/aggregated/test/support/hots_banana/002.png dataset/aggregated/test/support/hots_banana/003.png dataset/aggregated/test/support/hots_banana/004.png --query dataset/aggregated/test/query/hots_banana/001.png
 """
@@ -244,6 +268,7 @@ def run_inference(
     out_root: str | Path = "inference",
     img_size: int = 768,
     device: str | None = None,
+    n_support: int = 4,
     existence_thr: float = 0.5,
     tile_cfg: dict | None = None,
     bbox_color: tuple[int, int, int] = (0, 255, 0),
@@ -254,18 +279,40 @@ def run_inference(
     lora_dropout: float = 0.1,
     lora_layers: int = 4,
 ) -> dict[str, Any]:
-    """Run inference on (4 supports, 1 query) and write annotated outputs.
+    """Run inference on (K supports, 1 query) and write annotated outputs.
 
     Outputs land in ``out_root/<NNNN>/``:
-        support_1.jpg .. support_4.jpg     (originals copied)
+        support_1.jpg .. support_K.jpg     (originals copied)
         query.jpg                          (original copied)
         result.jpg                         (query with bbox + caption drawn)
         result.json                        (numeric outputs + config)
 
+    Args:
+        n_support: K — number of support views.  Must equal the K the
+            model was trained with (the aggregator's per-view embedding
+            is shape-tied to it; see modeling.model.MultiViewAggregator).
+            All shipped checkpoints were trained with K=4.  A mismatch
+            between ``n_support`` and either ``len(support_paths)`` or
+            the loaded model's ``view_embed.num_embeddings`` raises a
+            clear error before any forward pass.
+        existence_thr: gate threshold for the bbox draw and the
+            EXISTS/NOT EXISTS caption.  ``existence_prob`` is *always*
+            recorded raw in ``result.json`` regardless of this value;
+            the threshold only affects whether the bbox is drawn.
+
     Returns the result dict (also written to result.json).
     """
-    if len(support_paths) != 4:
-        raise ValueError(f"expected exactly 4 support paths, got {len(support_paths)}")
+    if int(n_support) <= 0:
+        raise ValueError(f"n_support must be a positive integer, got {n_support}")
+    if len(support_paths) != int(n_support):
+        raise ValueError(
+            f"expected exactly n_support={int(n_support)} support paths, "
+            f"got {len(support_paths)}"
+        )
+    if not 0.0 <= float(existence_thr) <= 1.0:
+        raise ValueError(
+            f"existence_thr must be in [0.0, 1.0], got {existence_thr}"
+        )
     checkpoint = Path(checkpoint)
     if not checkpoint.exists():
         raise FileNotFoundError(f"checkpoint not found: {checkpoint}")
@@ -295,6 +342,20 @@ def run_inference(
     ok, err = try_load_model_state(model, ckpt.get("model", {}))
     if not ok:
         raise RuntimeError(f"failed to load checkpoint: {err}")
+
+    # Validate that the requested K matches the model's trained K.
+    # The aggregator's view_embed is shape-tied to n_views; mismatched K
+    # would silently produce meaningless prototypes (or index errors).
+    model_k = int(model.aggregator.view_embed.num_embeddings)
+    if int(n_support) != model_k:
+        raise ValueError(
+            f"n_support mismatch: requested K={int(n_support)} but the "
+            f"loaded checkpoint's aggregator was trained with K={model_k}. "
+            f"All shipped checkpoints use K=4. Either pass --n-support "
+            f"{model_k} (and supply that many supports) or load a "
+            f"checkpoint trained with K={int(n_support)}."
+        )
+
     model = model.to(device_t).eval()
 
     # Load images.
@@ -355,12 +416,13 @@ def run_inference(
     result = {
         "checkpoint": str(checkpoint),
         "stage": stage,
+        "n_support": int(n_support),
         "supports": [str(p) for p in support_paths_p],
         "query": str(query_path_p),
         "img_size": img_size,
         "existence_prob": det["existence_prob"],
         "exists": bool(exists),
-        "existence_threshold": existence_thr,
+        "existence_threshold": float(existence_thr),
         "best_score": det["best_score"],
         "best_score_logit": det["best_score_logit"],
         "bbox_xyxy_native": list(det["bbox_xyxy_native"]),
@@ -389,15 +451,26 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Run OWLv2 few-shot inference.")
     p.add_argument("--checkpoint", required=True,
                    help="Path to a *.pt checkpoint produced by train.py.")
-    p.add_argument("--supports", nargs=4, required=True,
-                   help="Exactly 4 support image paths.")
+    p.add_argument("--supports", nargs="+", required=True,
+                   help="K support image paths (K must match --n-support; "
+                        "the model's trained K is also enforced at load).")
     p.add_argument("--query", required=True,
                    help="Query (scene) image path.")
     p.add_argument("--out-root", default="inference",
                    help="Output directory under which to create <NNNN>/ runs.")
     p.add_argument("--img-size", type=int, default=768)
     p.add_argument("--device", default=None)
-    p.add_argument("--existence-thr", type=float, default=0.5)
+    p.add_argument("--n-support", type=int, default=4,
+                   help="K — number of support views.  Must equal both "
+                        "len(--supports) and the model's trained K (4 for "
+                        "all shipped checkpoints).  Default: 4.")
+    p.add_argument("--existence-thr", type=float, default=0.5,
+                   help="Confidence threshold above which the existence "
+                        "head's probability is treated as a positive "
+                        "detection.  The bbox is drawn iff "
+                        "existence_prob >= threshold.  Range [0.0, 1.0]; "
+                        "default 0.5.  result.json always records the "
+                        "raw existence_prob alongside this threshold.")
     p.add_argument("--tile-mode", default="pyramid_a",
                    choices=["off", "pyramid_a", "hybrid_d"],
                    help="Tile inference mode (default: pyramid_a).")
@@ -412,6 +485,12 @@ def main() -> None:
                    help="R,G,B for the predicted bbox.")
     p.add_argument("--bbox-thickness", type=int, default=4)
     args = p.parse_args()
+
+    if len(args.supports) != int(args.n_support):
+        p.error(
+            f"--supports has {len(args.supports)} paths but "
+            f"--n-support={args.n_support}; they must match."
+        )
 
     tile_cfg = {
         "mode": args.tile_mode,
@@ -431,6 +510,7 @@ def main() -> None:
         out_root=args.out_root,
         img_size=args.img_size,
         device=args.device,
+        n_support=args.n_support,
         existence_thr=args.existence_thr,
         tile_cfg=tile_cfg,
         bbox_color=bbox_color,                                     # type: ignore[arg-type]

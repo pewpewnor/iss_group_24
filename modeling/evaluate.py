@@ -22,6 +22,30 @@ Returns the kitchen-sink metric set:
     prototype_norm_mean / std
 
   per_source: same metrics bucketed by inst.source.
+
+Three "overall" views are reported side-by-side so callers can pick the
+aggregation that matches their question:
+
+  overall            : pooled-holistic over every per-image record from
+                       every source. mAP / AUROC are computed once on
+                       the joint ranking. This is the historical default
+                       and is unchanged from the previous behaviour.
+  overall_holistic   : explicit alias of ``overall``. Bit-for-bit
+                       identical; provided so the JSON is self-documenting
+                       for readers wondering whether ``overall`` is a
+                       per-source macro mean (it isn't).
+  overall_macro      : macro-mean across per-source metric dicts,
+                       weighting each source equally regardless of how
+                       many episodes it contributed. Numeric scalars are
+                       averaged; non-scalar fields (``ap_per_iou``,
+                       ``n*``) are dropped. Use this when HOTS having
+                       3x fewer episodes than InsDet should NOT pull the
+                       overall down toward InsDet's performance.
+
+Holistic vs macro can disagree by a wide margin when the per-source
+sample sizes are unequal — see the difference between
+``overall.map_50`` (pooled) and ``overall_macro.map_50`` (mean of
+per-source map_50) on any test_eval JSON.
 """
 
 from __future__ import annotations
@@ -369,6 +393,67 @@ def _bucket_metrics(b: dict[str, list], score_thr: float = 0.5) -> dict[str, flo
 
 
 # ---------------------------------------------------------------------------
+# Macro mean across per-source metric dicts
+# ---------------------------------------------------------------------------
+
+
+# Keys that are not meaningful to macro-average across sources.
+#   - count fields would be summed, not averaged
+#   - ap_per_iou is a nested dict (averaged separately below)
+_MACRO_SKIP_KEYS: frozenset[str] = frozenset({"n", "n_pos", "n_neg", "ap_per_iou"})
+
+
+def _macro_average(per_source_buckets: dict[str, dict]) -> dict:
+    """Mean of every numeric scalar across the supplied per-source metric dicts.
+
+    Each source contributes equally regardless of episode count. Non-numeric
+    or count-shaped keys are propagated as a sum (``n``, ``n_pos``, ``n_neg``)
+    or dropped (``ap_per_iou`` is averaged threshold-by-threshold).
+
+    Empty input returns ``{}``. Single-source input returns a copy of that
+    source's metrics — equivalent to holistic when only one source is
+    present (e.g. Phase 0 vizwiz_novel).
+    """
+    if not per_source_buckets:
+        return {}
+    sources = sorted(per_source_buckets.keys())
+    out: dict = {"sources": sources}
+    # Sum the count-shaped fields so callers can sanity-check totals.
+    for k in ("n", "n_pos", "n_neg"):
+        out[k] = sum(int(per_source_buckets[s].get(k, 0)) for s in sources)
+    # Macro-average every numeric scalar.
+    scalar_keys: set[str] = set()
+    for s in sources:
+        for k, v in per_source_buckets[s].items():
+            if k in _MACRO_SKIP_KEYS:
+                continue
+            if isinstance(v, (int, float)):
+                scalar_keys.add(k)
+    for k in scalar_keys:
+        vals = [
+            float(per_source_buckets[s][k])
+            for s in sources
+            if k in per_source_buckets[s]
+            and isinstance(per_source_buckets[s][k], (int, float))
+        ]
+        out[k] = _safe_mean(vals)
+    # Macro-average ap_per_iou threshold-by-threshold, if present everywhere.
+    iou_dicts = [per_source_buckets[s].get("ap_per_iou") for s in sources]
+    if all(isinstance(d, dict) for d in iou_dicts) and iou_dicts:
+        thresholds = sorted(set().union(*(d.keys() for d in iou_dicts)))
+        ap_macro: dict[str, float] = {}
+        for thr in thresholds:
+            vals = [
+                float(d[thr])
+                for d in iou_dicts
+                if thr in d and isinstance(d[thr], (int, float))
+            ]
+            ap_macro[thr] = _safe_mean(vals)
+        out["ap_per_iou"] = ap_macro
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main evaluator
 # ---------------------------------------------------------------------------
 
@@ -399,8 +484,10 @@ def evaluate(
 
     Returns:
         {
-          "overall": {...},
-          "per_source": {"hots": {...}, "insdet": {...}, "vizwiz_novel": {...}}
+          "overall": {...},           # pooled over all sources
+          "overall_holistic": {...},  # alias of overall (self-documenting)
+          "overall_macro": {...},     # mean of per-source metrics
+          "per_source": {"hots": {...}, "insdet": {...}, ...}
         }
     """
     import sys
@@ -557,9 +644,18 @@ def evaluate(
                        f"rate={rate:.2f} batch/s")
             print(msg, flush=True)
 
+    overall_metrics = _bucket_metrics(overall, score_thr)
+    per_source_metrics = {
+        k: _bucket_metrics(v, score_thr) for k, v in per_source.items()
+    }
+    # ``overall_holistic`` is intentionally the same object as ``overall``;
+    # it exists purely to make the JSON self-documenting. Downstream code
+    # treats both as read-only.
     return {
-        "overall": _bucket_metrics(overall, score_thr),
-        "per_source": {k: _bucket_metrics(v, score_thr) for k, v in per_source.items()},
+        "overall": overall_metrics,
+        "overall_holistic": overall_metrics,
+        "overall_macro": _macro_average(per_source_metrics),
+        "per_source": per_source_metrics,
         "tile_cfg": cfg,
     }
 
@@ -839,8 +935,14 @@ def evaluate_phase0(
                        f"rate={rate:.2f} batch/s")
             print(msg, flush=True)
 
+    overall_metrics = _bucket_metrics(overall, score_thr)
+    per_source_metrics = {
+        k: _bucket_metrics(v, score_thr) for k, v in per_source.items()
+    }
     return {
-        "overall": _bucket_metrics(overall, score_thr),
-        "per_source": {k: _bucket_metrics(v, score_thr) for k, v in per_source.items()},
+        "overall": overall_metrics,
+        "overall_holistic": overall_metrics,
+        "overall_macro": _macro_average(per_source_metrics),
+        "per_source": per_source_metrics,
         "tile_cfg": cfg,
     }
