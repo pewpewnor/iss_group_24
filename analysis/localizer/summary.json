@@ -1,0 +1,20 @@
+{
+  "best_by": {
+    "L1.val.map_50_mean": {
+      "epoch": 3,
+      "value": 0.09018739558985277
+    },
+    "L1.val.iou_mean": {
+      "epoch": 3,
+      "value": 0.1752815191873621
+    },
+    "L2.val.map_50_mean": {
+      "epoch": 2,
+      "value": 0.1809709895678142
+    },
+    "L2.val.iou_mean": {
+      "epoch": 2,
+      "value": 0.2699597153890257
+    }
+  }
+}
