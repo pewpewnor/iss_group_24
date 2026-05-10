@@ -21,7 +21,7 @@ import torch
 
 from shared.analytics import aggregate_folds, update_summary, write_json
 from shared.checkpoint import (
-    atomic_save, capture_rng, get_trainable_state, hygiene,
+    atomic_save, atomic_save_multi, capture_rng, get_trainable_state, hygiene,
     load_trainable_state, resolve_resume_path, restore_rng,
 )
 from shared.folds import stratified_kfold
@@ -262,10 +262,16 @@ def _save_stage_ckpt(
     }
     if rolling:
         rolling_path = out_dir / f"ckpt_fold{fold}_epoch{epoch:03d}.pt"
-        atomic_save(payload, rolling_path, label=f"rolling fold{fold} epoch{epoch:03d}")
-        atomic_save(payload, out_dir / "last.pt", label="last")
+        targets: list[tuple[Path, str]] = [
+            (rolling_path, f"rolling fold{fold} epoch{epoch:03d}"),
+            (out_dir / "last.pt", "last"),
+        ]
         if extra_path is not None:
-            atomic_save(payload, extra_path, label=extra_path.stem)
+            targets.append((extra_path, extra_path.stem))
+        # Single torch.save → multi-mirror to all targets. On Drive this
+        # avoids the back-to-back os.replace pattern that has been observed
+        # to drop the earlier rolling file from Drive folders.
+        atomic_save_multi(payload, targets)
         return rolling_path
     if extra_path is not None:
         atomic_save(payload, extra_path, label=extra_path.stem)

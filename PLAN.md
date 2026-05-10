@@ -239,6 +239,32 @@ Files written per stage:
 `keep_last_n=0` ⇒ never delete rolling per-(epoch, fold) checkpoints
 (Drive-friendly).
 
+### Google Drive durability (Colab)
+
+When running on Colab the notebook pins ``OUT_ROOT`` and ``ANALYSIS_ROOT`` to
+the Drive-mounted project root, and the path-setup cell now calls
+``assert_checkpoint_root_on_drive(OUT_ROOT, on_colab=USE_GOOGLE_COLAB)`` —
+training refuses to start if those roots are NOT on Drive, so a misconfigured
+path can never silently lose checkpoints to the runtime SSD.
+
+``atomic_save`` (and ``write_json``) implement durable writes:
+
+  1. ``mkdir -p`` the parent directory.
+  2. Write payload to ``<path>.tmp`` via a regular file handle.
+  3. ``f.flush()`` then ``os.fsync(f.fileno())`` to force bytes through
+     Drive's FUSE cache. (Without fsync, ``torch.save`` returns long before
+     the bytes are durable; a runtime kill would lose the checkpoint.)
+  4. ``os.replace(tmp, path)`` for atomic rename.
+  5. ``os.fsync()`` the parent directory entry (best-effort).
+
+The whole sequence is retried up to 3 times with exponential back-off on
+transient ``OSError`` — Drive's FUSE intermittently throws EIO during long
+sessions, and a single retry usually clears it.
+
+Net effect: every per-(epoch, fold) checkpoint, every ``best.pt`` / ``last.pt``
+update, and every JSON analysis file is forced to disk before the call
+returns, and is visible from the Drive web UI within seconds.
+
 ---
 
 ## 6. Smoke Test (`shared/smoke.py`)
