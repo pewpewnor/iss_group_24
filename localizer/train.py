@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from localizer.dataset import (
-    build_phase0_loader, build_train_loader, build_val_loader,
+    build_train_loader, build_val_loader,
 )
 from localizer.evaluate import evaluate
 from localizer.model import MultiShotLocalizer
@@ -354,21 +354,7 @@ def _train_phase0_inner(user_kwargs: dict) -> dict:
     model = _build_model(cfg, lora_active=False).to(device)
     metrics: dict[str, Any] = {}
 
-    # vizwiz_novel via Phase0Dataset.
-    p0_ds, p0_loader = build_phase0_loader(
-        manifest=cfg["manifest"], data_root=cfg["data_root"],
-        split="phase0", batch_size=int(cfg["batch_size"]),
-        num_workers=int(cfg["num_workers"]),
-        img_size=int(cfg["img_size"]), k_max=int(cfg["k_max"]),
-    )
-    if len(p0_ds) > 0:
-        t0 = time.time()
-        metrics["vizwiz_novel"] = evaluate(
-            model, p0_loader, device, phase0=True, progress_every=5,
-        )
-        metrics["vizwiz_novel"]["wall_clock_seconds"] = round(time.time() - t0, 2)
-
-    # HOTS+InsDet test split.
+    # HOTS + InsDet test split.
     test_eps = int(cfg.get("test_episodes", 400))
     test_ds, test_loader = build_val_loader(
         manifest=cfg["manifest"], data_root=cfg["data_root"],

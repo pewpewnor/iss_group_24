@@ -1,15 +1,15 @@
 """Manifest loader / accessor.
 
-Manifest schema (v2) — see aggregator.py:
+Manifest schema (v4) — see aggregator.py:
 
     {
-      "schema_version": 2,
+      "schema_version": 4,
       "num_instances": int,
-      "splits": {"train": [...], "test": [...], "phase0": [...]},
+      "splits": {"train": [...], "test": [...]},
       "instances": [
         {
-          "instance_id": str, "source": "hots"|"insdet"|"vizwiz_novel",
-          "class_name": str, "split": "train"|"test"|"phase0",
+          "instance_id": str, "source": "hots"|"insdet",
+          "class_name": str, "split": "train"|"test",
           "support_images": [{"path": str, "bbox": [x1,y1,x2,y2]}],
           "query_images":   [{"path": str, "bbox": [x1,y1,x2,y2], "scene_type": str}]
         }
@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 def load_manifest(manifest_path: str | Path) -> dict[str, Any]:

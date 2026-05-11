@@ -2,16 +2,14 @@
 
 Output layout:
     dataset/aggregated/
-    ├── manifest.json              (schema_version=2)
+    ├── manifest.json              (schema_version=4)
     ├── stats.json
     ├── train/{support,query}/<inst_id>/<NNN>.{png,jpg}
-    ├── test/{support,query}/<inst_id>/<NNN>.{png,jpg}
-    └── phase0/{support,query}/<inst_id>/<NNN>.{png,jpg}
+    └── test/{support,query}/<inst_id>/<NNN>.{png,jpg}
 
-Sources:
-    HOTS          → train + test (80/20 instance split, stratified)
-    InsDet        → train + test (80/20 instance split, stratified)
-    vizwiz_novel  → phase0 only (16 instances, untouched)
+Sources (all rolled into the same 80/20 stratified-by-source split):
+    HOTS          → train + test
+    InsDet        → train + test
 
 Bbox storage policy:
     - Support bboxes are computed from masks (InsDet) / largest non-white
@@ -41,7 +39,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 SEED = 42
 TRAIN_RATIO = 0.80
 N_SUPPORT_MIN = 4   # minimum supports per instance to keep
@@ -55,7 +53,6 @@ OUT_DIR = Path("dataset/aggregated")
 HOTS_OBJECT_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "object"
 HOTS_SCENE_DIR = BASE_DIR / "HOTS" / "HOTS_v1" / "scene"
 INSDET_DIR = BASE_DIR / "InsDet"
-VIZWIZ_DIR = BASE_DIR / "VizWiz"
 
 
 # ---------------------------------------------------------------------------
@@ -270,50 +267,6 @@ def collect_insdet_scene_queries() -> list[dict]:
     return out
 
 
-def collect_vizwiz_novel_instances() -> list[dict]:
-    """16 categories × 1 image; used only for Phase 0 zero-shot baseline."""
-    annot_path = VIZWIZ_DIR / "support_set.json"
-    if not annot_path.exists():
-        print(f"  [skip] vizwiz_novel: {annot_path} missing")
-        return []
-    with open(annot_path) as f:
-        coco = json.load(f)
-    cat_name = {c["id"]: c["name"] for c in coco["categories"]}
-    image_meta = {im["id"]: im for im in coco["images"]}
-    out: list[dict] = []
-    skipped = 0
-    for ann in coco["annotations"]:
-        cat_id = ann["category_id"]
-        meta = image_meta.get(ann["image_id"])
-        if meta is None:
-            skipped += 1
-            continue
-        img_path = VIZWIZ_DIR / "support_images" / meta["file_name"]
-        if not img_path.exists():
-            skipped += 1
-            continue
-        iw, ih = int(meta["width"]), int(meta["height"])
-        x, y, w_b, h_b = ann["bbox"]
-        if w_b <= 0 or h_b <= 0:
-            skipped += 1
-            continue
-        bbox = _pad_bbox([int(x), int(y), int(x + w_b), int(y + h_b)], (iw, ih))
-        if not _bbox_valid(bbox, (iw, ih)):
-            skipped += 1
-            continue
-        name = cat_name[cat_id]
-        out.append({
-            "instance_id": f"vizwiz_novel_{_normalize_name(name)}",
-            "source": "vizwiz_novel",
-            "class_name": name,
-            "support_images": [{"path": str(img_path), "bbox": bbox}],
-            "query_images":   [{"path": str(img_path), "bbox": bbox,
-                                "scene_type": "vizwiz_novel"}],
-        })
-    print(f"vizwiz_novel: {len(out)} instances ({skipped} skipped)")
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Attach scene queries / split / stage / write
 # ---------------------------------------------------------------------------
@@ -405,9 +358,8 @@ def write_stats(splits: dict[str, list[dict]]) -> None:
     for name, insts in splits.items():
         stats[name] = {
             "instances": len(insts),
-            "hots":         sum(1 for i in insts if i["source"] == "hots"),
-            "insdet":       sum(1 for i in insts if i["source"] == "insdet"),
-            "vizwiz_novel": sum(1 for i in insts if i["source"] == "vizwiz_novel"),
+            "hots":   sum(1 for i in insts if i["source"] == "hots"),
+            "insdet": sum(1 for i in insts if i["source"] == "insdet"),
             "support_images": sum(len(i["support_images"]) for i in insts),
             "query_images":   sum(len(i["query_images"])   for i in insts),
         }
@@ -419,6 +371,9 @@ def write_stats(splits: dict[str, list[dict]]) -> None:
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+_VALID_SPLITS: tuple[str, ...] = ("train", "test")
 
 
 def validate(strict: bool = True) -> bool:
@@ -435,7 +390,7 @@ def validate(strict: bool = True) -> bool:
     n_checked = 0
     n_bad = 0
     for inst in m["instances"]:
-        if inst.get("split") not in ("train", "test", "phase0"):
+        if inst.get("split") not in _VALID_SPLITS:
             print(f"validate: bad split for {inst.get('instance_id')}")
             n_bad += 1
             continue
@@ -480,11 +435,10 @@ def main(force: bool = False) -> None:
     main_instances = attach_scene_queries(main_instances, scene_queries)
     main_instances = filter_empty_query_instances(main_instances)
 
-    print("collecting vizwiz_novel instances (phase0)")
-    phase0_instances = collect_vizwiz_novel_instances()
-
+    # Stratified 80/20 split keyed by ``source`` so HOTS and InsDet each keep
+    # the same ratio in both splits independently.
     train, test = split_train_test(main_instances)
-    splits = {"train": train, "test": test, "phase0": phase0_instances}
+    splits = {"train": train, "test": test}
 
     print("staging images")
     stage_images(splits)

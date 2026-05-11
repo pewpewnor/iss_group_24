@@ -1,7 +1,8 @@
 """Siamese training orchestrator.
 
 Public entry points:
-    train_phase0(...)
+    train_phase0(...)              # alias for evaluate_phase0 (no training at phase 0)
+    evaluate_phase0(...)           # zero-shot DINOv2-cosine baseline on test split
     train_stage_S1(...)
     train_stage_S2(...)
     evaluate_run(checkpoint=..., ...)
@@ -303,18 +304,30 @@ _PER_SOURCE_KEYS = ("n", "n_pos", "auroc", "pr_auc", "f1", "best_f1",
 
 
 def train_phase0(**user_kwargs) -> dict:
+    """Phase 0 (zero-shot DINOv2 cosine) — no training happens.
+
+    Kept under the ``train_phase0`` name for naming symmetry with the
+    L1/L2/L3 entry points, but it's purely evaluative: the DINOv2 backbone
+    is frozen and the cross-attention head is bypassed via
+    ``model.phase0_forward``. Internally delegates to ``evaluate_phase0``.
+    """
+    return evaluate_phase0(**user_kwargs)
+
+
+def evaluate_phase0(**user_kwargs) -> dict:
+    """Evaluate the zero-shot DINOv2-cosine baseline on the held-out test split."""
     try:
         with gpu_cleanup_on_exit():
-            return _train_phase0_inner(user_kwargs)
+            return _evaluate_phase0_inner(user_kwargs)
     finally:
         release_gpu_memory(verbose=False)
 
 
-def _train_phase0_inner(user_kwargs: dict) -> dict:
+def _evaluate_phase0_inner(user_kwargs: dict) -> dict:
     cfg = _merge_cfg(user_kwargs)
     device = _resolve_device(cfg)
     out_dir, analysis_dir = _stage_dirs(cfg, "phase0")
-    print(f"=== [siamese] Phase 0 (zero-shot DINOv2 cosine) on {device} ===")
+    print(f"=== [siamese] Phase 0 evaluation (zero-shot DINOv2 cosine) on {device} ===")
     _set_seed(int(cfg["seed"]))
     model = _build_model(cfg).to(device)
     test_eps = int(cfg.get("test_episodes", 400))
@@ -332,28 +345,24 @@ def _train_phase0_inner(user_kwargs: dict) -> dict:
         phase0=True,
     )
     metrics["wall_clock_seconds"] = round(time.time() - t0, 2)
+    ts = time.strftime("%Y%m%d_%H%M%S")
     write_json(out_dir / "results.json", metrics)
     write_json(analysis_dir / "results.json", metrics)
+    write_json(analysis_dir / f"results_{ts}.json", metrics)
     o = metrics["overall"]
     print(
-        f"[siamese phase0]  "
+        f"[siamese phase0] test  "
         f"AUROC={o.get('auroc', 0.0):.4f}  "
         f"PR-AUC={o.get('pr_auc', 0.0):.4f}  "
         f"AP={o.get('avg_precision', 0.0):.4f}  "
         f"acc={o.get('accuracy', 0.0):.4f}  "
         f"best_f1={o.get('best_f1', 0.0):.4f}@thr={o.get('best_f1_threshold', 0.0):.2f}  "
         f"FPR={o.get('fpr', 0.0):.4f}  FNR={o.get('fnr', 0.0):.4f}  "
-        f"MCC={o.get('mcc', 0.0):.4f}"
+        f"MCC={o.get('mcc', 0.0):.4f}  "
+        f"({metrics['wall_clock_seconds']:.1f}s)"
     )
+    print(f"[siamese] Phase 0 complete. Results: {out_dir / 'results.json'}")
     return metrics
-
-
-def evaluate_phase0(**user_kwargs) -> dict:
-    try:
-        with gpu_cleanup_on_exit():
-            return _train_phase0_inner(user_kwargs)
-    finally:
-        release_gpu_memory(verbose=False)
 
 
 # ---------------------------------------------------------------------------

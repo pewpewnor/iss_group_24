@@ -223,7 +223,7 @@ class EpisodeDataset(Dataset):
 
     Args:
         manifest_path : path to dataset/aggregated/manifest.json
-        split         : "train" | "test" | "phase0" | None
+        split         : "train" | "test" | None
         sources       : optional list of source filters (e.g. ["hots"])
         episodes_per_epoch : number of episodes the dataset reports (train mode)
         k_min, k_max  : inclusive range of supports per episode
@@ -447,109 +447,6 @@ class EpisodeDataset(Dataset):
             force_k = k_choices[idx % len(k_choices)]
             force_k = max(1, min(force_k, len(instance["support_images"]), self.k_max))
         return self._build_episode(instance, rng, force_k=force_k)
-
-
-# ---------------------------------------------------------------------------
-# Phase 0 dataset (vizwiz_novel, rotation-synthesized supports)
-# ---------------------------------------------------------------------------
-
-
-class Phase0Dataset(Dataset):
-    """One episode per vizwiz_novel instance. Always positive.
-
-    Supports: 4 rotated crops (0, 90, 180, 270) of the bbox region (with 10% pad).
-    Query: original image + bbox.
-
-    K is fixed at 4 for this dataset (single image per category).
-    """
-
-    _ROTATIONS = (0, 90, 180, 270)
-    _CROP_PAD = 0.10
-
-    def __init__(
-        self,
-        manifest_path: str | Path,
-        *,
-        data_root: str | Path | None = None,
-        img_size: int = DEFAULT_IMG_SIZE,
-        split: str = "phase0",
-        k_max: int = DEFAULT_K_MAX,
-        return_native: bool = False,
-    ) -> None:
-        self.manifest_path = Path(manifest_path)
-        self.data_root = Path(data_root) if data_root is not None else self.manifest_path.parent
-        manifest = load_manifest(self.manifest_path)
-        self.instances = filter_instances(manifest, split=split)
-        self.img_size = int(img_size)
-        self.k_max = int(k_max)
-        self._support_aug = _SupportAugment(self.img_size, train=False)
-        self._query_tf = _QueryTransform(self.img_size, train=False)
-        self.return_native = bool(return_native)
-
-    def _resolve(self, p: str) -> Path:
-        path = Path(p)
-        return path if path.is_absolute() else self.data_root / path
-
-    def _load(self, p: str) -> Image.Image:
-        return Image.open(self._resolve(p)).convert("RGB")
-
-    def _rotated_supports(self, img: Image.Image, bbox_xyxy: list[float]) -> list[Image.Image]:
-        x1, y1, x2, y2 = bbox_xyxy
-        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-        side = max(x2 - x1, y2 - y1) * (1.0 + 2 * self._CROP_PAD)
-        half = side * 0.5
-        w_img, h_img = img.size
-        cx1, cy1 = max(0, int(cx - half)), max(0, int(cy - half))
-        cx2, cy2 = min(w_img, int(cx + half)), min(h_img, int(cy + half))
-        if cx2 <= cx1 or cy2 <= cy1:
-            cx1, cy1, cx2, cy2 = 0, 0, w_img, h_img
-        base = img.crop((cx1, cy1, cx2, cy2))
-        return [base if a == 0 else base.rotate(a, expand=True) for a in self._ROTATIONS]
-
-    def __len__(self) -> int:
-        return len(self.instances)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        instance = self.instances[idx]
-        s_entry = instance["support_images"][0]
-        q_entry = instance["query_images"][0]
-        s_img = self._load(s_entry["path"])
-        s_bbox = list(s_entry["bbox"])
-        rotated = self._rotated_supports(s_img, s_bbox)
-        # Truncate to k_max if model is configured for fewer than 4 supports
-        # (e.g. smoke tests use k_max=2).
-        rotated = rotated[: self.k_max]
-        rng = random.Random(idx)
-        sup_imgs = [self._support_aug(r, rng) for r in rotated]
-        # Pad to k_max.
-        k = len(sup_imgs)
-        if k < self.k_max:
-            pad = torch.zeros(3, self.img_size, self.img_size)
-            sup_imgs = sup_imgs + [pad] * (self.k_max - k)
-        sup_t = torch.stack(sup_imgs, dim=0)
-        mask = torch.zeros(self.k_max, dtype=torch.bool)
-        mask[:k] = True
-
-        q_img = self._load(q_entry["path"])
-        native_w, native_h = q_img.size
-        q_t, bbox_lb, _, _, _ = self._query_tf(q_img, list(q_entry["bbox"]), None)
-        assert bbox_lb is not None
-        bbox_norm = _xyxy_to_cxcywh_norm(bbox_lb, self.img_size, self.img_size)
-        episode = {
-            "support_imgs": sup_t,
-            "support_mask": mask,
-            "k": k,
-            "query_img": q_t,
-            "query_bbox": torch.tensor(bbox_norm, dtype=torch.float32),
-            "is_present": torch.tensor(True, dtype=torch.bool),
-            "instance_id": instance["instance_id"],
-            "source": instance.get("source", ""),
-            "native_size": torch.tensor([native_w, native_h], dtype=torch.int32),
-            "native_bbox": torch.tensor(list(q_entry["bbox"]), dtype=torch.float32),
-        }
-        if self.return_native:
-            episode["query_native"] = q_img
-        return episode
 
 
 # ---------------------------------------------------------------------------

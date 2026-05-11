@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from shared.dataset import EpisodeDataset, Phase0Dataset, build_dataloader
+from shared.dataset import EpisodeDataset, build_dataloader
 
 
 def build_train_loader(
@@ -67,28 +67,6 @@ def build_val_loader(
         force_positive=True,                      # localizer = positives only
         train=False,
         img_size=img_size, seed=seed,
-        return_native=return_native,
-    )
-    loader = build_dataloader(
-        ds, batch_size=batch_size, num_workers=num_workers, shuffle=False,
-    )
-    return ds, loader
-
-
-def build_phase0_loader(
-    *,
-    manifest: str,
-    data_root: str | None,
-    split: str,
-    batch_size: int,
-    num_workers: int,
-    img_size: int,
-    k_max: int,
-    return_native: bool = False,
-) -> tuple[Phase0Dataset, "torch.utils.data.DataLoader"]:                   # type: ignore[name-defined]
-    ds = Phase0Dataset(
-        manifest_path=manifest, data_root=data_root,
-        split=split, img_size=img_size, k_max=k_max,
         return_native=return_native,
     )
     loader = build_dataloader(
