@@ -1,6 +1,0 @@
-{
-  "stage_completed": true,
-  "epochs_run": 3,
-  "best_val_map_50_mean": 0.09018739558985277,
-  "best_epoch": 3
-}

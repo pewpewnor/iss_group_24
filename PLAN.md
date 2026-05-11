@@ -186,9 +186,6 @@ already exists and validates. Sources used:
 | ------------ | ---------------- |
 | HOTS         | train + test (80/20 stratified) |
 | InsDet       | train + test (80/20 stratified) |
-| vizwiz_novel | phase0 only      |
-
-VizWiz base / FSOD / HOPE are **unused** in this rewrite.
 
 CLI:
 ```
