@@ -1,40 +1,12 @@
 """Localizer evaluation.
 
-Reports a comprehensive metric set over POSITIVE episodes only (the localizer
-trainer guarantees positive-only episodes; the evaluator filters defensively).
+Reports a comprehensive metric set. When the input loader provides MIXED
+positive + negative episodes (the new default for L2/L3 eval) we add
+abstain-related metrics:
 
-Categories:
-
-  Localization quality (IoU-based):
-    iou_mean / median / p25 / p75 / std
-    frac_iou_at_X for X in {0.25, 0.50, 0.75, 0.90}
-    map_50   (101-pt AP at IoU=0.50)
-    map_75   (101-pt AP at IoU=0.75)
-    map_5095 (mean over 10 thresholds 0.50:0.05:0.95, COCO-style)
-    ap_per_iou: {"0.50": float, ..., "0.95": float}
-
-  Containment (how much of GT is inside the predicted box):
-    containment_mean / median / p25 / p75 / std
-    frac_containment_X for X in {0.50, 0.75, 0.90, 0.99}
-    map_50_containment   (101-pt AP using containment >= 0.5 as TP definition)
-    map_90_containment   (101-pt AP using containment >= 0.9 as TP definition)
-
-  Joint quality:
-    contain_at_iou_50 / contain_at_iou_75
-    high_contain_high_iou  (containment >= 0.9 AND IoU >= 0.5)
-
-  Box-geometry diagnostics:
-    mean_pred_box_area, std_pred_box_area
-    frac_pred_box_too_big      (pred area > 0.4 of image)
-    frac_pred_box_too_small    (pred area < 0.005 of image)
-    mean_gt_box_area
-    pred_to_gt_area_ratio_mean / median   (pred_area / gt_area)
-    log_area_ratio_mean / std             (log(pred_area / gt_area))
-    center_distance_mean       (||pred_center - gt_center|| in normalised coords)
-
-  Score diagnostics:
-    score_mean, score_std, score_p25, score_p75
-    score_iou_correlation       (Pearson correlation between best_score and IoU)
+  Positives: standard IoU / containment / mAP family / geometry diagnostics.
+  Negatives: ``bg_prob`` distribution + abstain rate.
+  Both:     ``score_iou_correlation`` (positives only — bg episodes don't have IoU).
 
 Buckets: overall, per_source (hots/insdet, …), per_k (k1, k4, k_max).
 """
@@ -58,7 +30,7 @@ IOU_THRESHOLDS: tuple[float, ...] = tuple(round(0.50 + 0.05 * i, 2) for i in ran
 
 
 # ---------------------------------------------------------------------------
-# Box geometry helpers
+# Box helpers
 # ---------------------------------------------------------------------------
 
 
@@ -86,12 +58,11 @@ def _containment_ratio(pred_xyxy: torch.Tensor, gt_xyxy: torch.Tensor) -> torch.
 
 
 # ---------------------------------------------------------------------------
-# Metric helpers
+# Stat helpers
 # ---------------------------------------------------------------------------
 
 
 def _ap_101(detections: list[tuple[float, bool]], n_gt: int) -> float:
-    """COCO-style 101-point AP at a single threshold (already gated)."""
     if n_gt == 0 or not detections:
         return 0.0
     order = sorted(range(len(detections)), key=lambda i: -detections[i][0])
@@ -107,7 +78,6 @@ def _ap_101(detections: list[tuple[float, bool]], n_gt: int) -> float:
             fp += 1
         precs.append(tp / (tp + fp))
         recs.append(tp / n_gt)
-    # Monotone-decreasing precision envelope.
     for k in range(len(precs) - 2, -1, -1):
         if precs[k] < precs[k + 1]:
             precs[k] = precs[k + 1]
@@ -168,96 +138,116 @@ def _pearson(xs: list[float], ys: list[float]) -> float:
 
 def _empty_bucket() -> dict[str, list]:
     return {
+        # positives
         "iou": [],
         "contain": [],
         "score": [],
+        "bg_prob_pos": [],
         "pred_box_area": [],
         "gt_box_area": [],
         "center_distance": [],
+        # negatives
+        "bg_prob_neg": [],
+        "score_neg": [],
     }
 
 
-def _bucket_metrics(b: dict[str, list]) -> dict[str, Any]:
-    n = len(b["iou"])
-    if n == 0:
-        return {"n": 0, "n_pos": 0}
-    out: dict[str, Any] = {"n": n, "n_pos": n}
+def _bucket_metrics(b: dict[str, list], *, abstain_threshold: float = 0.5) -> dict[str, Any]:
+    n_pos = len(b["iou"])
+    n_neg = len(b["bg_prob_neg"])
+    n = n_pos + n_neg
+    out: dict[str, Any] = {"n": n, "n_pos": n_pos, "n_neg": n_neg}
+    if n_pos == 0 and n_neg == 0:
+        return out
 
-    # ── IoU (localization tightness) ──────────────────────────────────────
-    out["iou_mean"]   = _safe_mean(b["iou"])
-    out["iou_median"] = _quantile(b["iou"], 0.5)
-    out["iou_p25"]    = _quantile(b["iou"], 0.25)
-    out["iou_p75"]    = _quantile(b["iou"], 0.75)
-    out["iou_std"]    = _safe_std(b["iou"])
-    out["frac_iou_25"] = sum(1 for v in b["iou"] if v >= 0.25) / n
-    out["frac_iou_50"] = sum(1 for v in b["iou"] if v >= 0.50) / n
-    out["frac_iou_75"] = sum(1 for v in b["iou"] if v >= 0.75) / n
-    out["frac_iou_90"] = sum(1 for v in b["iou"] if v >= 0.90) / n
+    # ── Positives metrics ───────────────────────────────────────────────
+    if n_pos > 0:
+        out["iou_mean"]   = _safe_mean(b["iou"])
+        out["iou_median"] = _quantile(b["iou"], 0.5)
+        out["iou_p25"]    = _quantile(b["iou"], 0.25)
+        out["iou_p75"]    = _quantile(b["iou"], 0.75)
+        out["iou_std"]    = _safe_std(b["iou"])
+        out["frac_iou_25"] = sum(1 for v in b["iou"] if v >= 0.25) / n_pos
+        out["frac_iou_50"] = sum(1 for v in b["iou"] if v >= 0.50) / n_pos
+        out["frac_iou_75"] = sum(1 for v in b["iou"] if v >= 0.75) / n_pos
+        out["frac_iou_90"] = sum(1 for v in b["iou"] if v >= 0.90) / n_pos
 
-    # ── Containment (how much of GT is inside the predicted box) ─────────
-    out["containment_mean"]   = _safe_mean(b["contain"])
-    out["containment_median"] = _quantile(b["contain"], 0.5)
-    out["containment_p25"]    = _quantile(b["contain"], 0.25)
-    out["containment_p75"]    = _quantile(b["contain"], 0.75)
-    out["containment_std"]    = _safe_std(b["contain"])
-    out["frac_containment_50"]   = sum(1 for c in b["contain"] if c >= 0.50) / n
-    out["frac_containment_75"]   = sum(1 for c in b["contain"] if c >= 0.75) / n
-    out["frac_containment_90"]   = sum(1 for c in b["contain"] if c >= 0.90) / n
-    out["frac_containment_full"] = sum(1 for c in b["contain"] if c >= 0.99) / n
+        out["containment_mean"]   = _safe_mean(b["contain"])
+        out["containment_median"] = _quantile(b["contain"], 0.5)
+        out["containment_p25"]    = _quantile(b["contain"], 0.25)
+        out["containment_p75"]    = _quantile(b["contain"], 0.75)
+        out["containment_std"]    = _safe_std(b["contain"])
+        out["frac_containment_50"]   = sum(1 for c in b["contain"] if c >= 0.50) / n_pos
+        out["frac_containment_75"]   = sum(1 for c in b["contain"] if c >= 0.75) / n_pos
+        out["frac_containment_90"]   = sum(1 for c in b["contain"] if c >= 0.90) / n_pos
+        out["frac_containment_full"] = sum(1 for c in b["contain"] if c >= 0.99) / n_pos
 
-    # ── Joint quality ────────────────────────────────────────────────────
-    out["contain_at_iou_50"]     = out["frac_iou_50"]
-    out["contain_at_iou_75"]     = out["frac_iou_75"]
-    out["high_contain_high_iou"] = sum(
-        1 for iou, c in zip(b["iou"], b["contain"]) if iou >= 0.5 and c >= 0.9
-    ) / n
+        out["contain_at_iou_50"]     = out["frac_iou_50"]
+        out["contain_at_iou_75"]     = out["frac_iou_75"]
+        out["high_contain_high_iou"] = sum(
+            1 for iou, c in zip(b["iou"], b["contain"]) if iou >= 0.5 and c >= 0.9
+        ) / n_pos
 
-    # ── mAP family (one detection per positive episode) ──────────────────
-    # Each positive episode contributes one detection scored by best_score
-    # (sigmoid of top-1 patch logit). TP definition varies by threshold.
-    ap_per_iou: dict[str, float] = {}
-    for thr in IOU_THRESHOLDS:
-        detections = [(s, iou >= thr) for s, iou in zip(b["score"], b["iou"])]
-        ap_per_iou[f"{thr:.2f}"] = _ap_101(detections, n_gt=n)
-    out["ap_per_iou"] = ap_per_iou
-    out["map_50"]   = ap_per_iou["0.50"]
-    out["map_75"]   = ap_per_iou["0.75"]
-    out["map_5095"] = _safe_mean(list(ap_per_iou.values()))
+        # mAP family — TPs gated by IoU per threshold.
+        ap_per_iou: dict[str, float] = {}
+        for thr in IOU_THRESHOLDS:
+            detections = [(s, iou >= thr) for s, iou in zip(b["score"], b["iou"])]
+            ap_per_iou[f"{thr:.2f}"] = _ap_101(detections, n_gt=n_pos)
+        out["ap_per_iou"] = ap_per_iou
+        out["map_50"]   = ap_per_iou["0.50"]
+        out["map_75"]   = ap_per_iou["0.75"]
+        out["map_5095"] = _safe_mean(list(ap_per_iou.values()))
 
-    # Containment-mAP (TP iff containment >= 0.5 / 0.9).
-    det_c50 = [(s, c >= 0.5) for s, c in zip(b["score"], b["contain"])]
-    det_c90 = [(s, c >= 0.9) for s, c in zip(b["score"], b["contain"])]
-    out["map_50_containment"] = _ap_101(det_c50, n_gt=n)
-    out["map_90_containment"] = _ap_101(det_c90, n_gt=n)
+        det_c50 = [(s, c >= 0.5) for s, c in zip(b["score"], b["contain"])]
+        det_c90 = [(s, c >= 0.9) for s, c in zip(b["score"], b["contain"])]
+        out["map_50_containment"] = _ap_101(det_c50, n_gt=n_pos)
+        out["map_90_containment"] = _ap_101(det_c90, n_gt=n_pos)
 
-    # ── Box-geometry diagnostics ────────────────────────────────────────
-    out["mean_pred_box_area"]    = _safe_mean(b["pred_box_area"])
-    out["std_pred_box_area"]     = _safe_std(b["pred_box_area"])
-    out["frac_pred_box_too_big"] = sum(1 for a in b["pred_box_area"] if a > 0.4) / n
-    out["frac_pred_box_too_small"] = sum(1 for a in b["pred_box_area"] if a < 0.005) / n
-    out["mean_gt_box_area"]      = _safe_mean(b["gt_box_area"])
-    # pred / gt area ratio.
-    ratios: list[float] = []
-    log_ratios: list[float] = []
-    for pa, ga in zip(b["pred_box_area"], b["gt_box_area"]):
-        if ga > 1e-9:
-            r = pa / ga
-            ratios.append(r)
-            if r > 1e-9:
-                log_ratios.append(math.log(r))
-    out["pred_to_gt_area_ratio_mean"]   = _safe_mean(ratios)
-    out["pred_to_gt_area_ratio_median"] = _quantile(ratios, 0.5) if ratios else 0.0
-    out["log_area_ratio_mean"]          = _safe_mean(log_ratios)
-    out["log_area_ratio_std"]           = _safe_std(log_ratios)
-    out["center_distance_mean"]         = _safe_mean(b["center_distance"])
-    out["center_distance_median"]       = _quantile(b["center_distance"], 0.5)
+        # Box geometry.
+        out["mean_pred_box_area"]    = _safe_mean(b["pred_box_area"])
+        out["std_pred_box_area"]     = _safe_std(b["pred_box_area"])
+        out["frac_pred_box_too_big"] = sum(1 for a in b["pred_box_area"] if a > 0.4) / n_pos
+        out["frac_pred_box_too_small"] = sum(1 for a in b["pred_box_area"] if a < 0.005) / n_pos
+        out["mean_gt_box_area"]      = _safe_mean(b["gt_box_area"])
+        ratios: list[float] = []
+        log_ratios: list[float] = []
+        for pa, ga in zip(b["pred_box_area"], b["gt_box_area"]):
+            if ga > 1e-9:
+                r = pa / ga
+                ratios.append(r)
+                if r > 1e-9:
+                    log_ratios.append(math.log(r))
+        out["pred_to_gt_area_ratio_mean"]   = _safe_mean(ratios)
+        out["pred_to_gt_area_ratio_median"] = _quantile(ratios, 0.5) if ratios else 0.0
+        out["log_area_ratio_mean"]          = _safe_mean(log_ratios)
+        out["log_area_ratio_std"]           = _safe_std(log_ratios)
+        out["center_distance_mean"]         = _safe_mean(b["center_distance"])
+        out["center_distance_median"]       = _quantile(b["center_distance"], 0.5)
 
-    # ── Score diagnostics ───────────────────────────────────────────────
-    out["score_mean"]            = _safe_mean(b["score"])
-    out["score_std"]             = _safe_std(b["score"])
-    out["score_p25"]             = _quantile(b["score"], 0.25)
-    out["score_p75"]             = _quantile(b["score"], 0.75)
-    out["score_iou_correlation"] = _pearson(b["score"], b["iou"])
+        out["score_mean"]            = _safe_mean(b["score"])
+        out["score_std"]             = _safe_std(b["score"])
+        out["score_p25"]             = _quantile(b["score"], 0.25)
+        out["score_p75"]             = _quantile(b["score"], 0.75)
+        out["score_iou_correlation"] = _pearson(b["score"], b["iou"])
+
+        # Abstain stats on positives.
+        out["bg_prob_pos_mean"]   = _safe_mean(b["bg_prob_pos"])
+        out["bg_prob_pos_median"] = _quantile(b["bg_prob_pos"], 0.5)
+        out["abstain_rate_pos"]   = sum(1 for v in b["bg_prob_pos"] if v >= abstain_threshold) / n_pos
+
+    # ── Negatives metrics ───────────────────────────────────────────────
+    if n_neg > 0:
+        out["bg_prob_neg_mean"]   = _safe_mean(b["bg_prob_neg"])
+        out["bg_prob_neg_median"] = _quantile(b["bg_prob_neg"], 0.5)
+        out["abstain_rate_neg"]   = sum(1 for v in b["bg_prob_neg"] if v >= abstain_threshold) / n_neg
+        out["score_neg_mean"]     = _safe_mean(b["score_neg"])
+        out["score_neg_p75"]      = _quantile(b["score_neg"], 0.75)
+        # True abstain = correctly classify negative as "no object".
+        out["tn_rate"] = out["abstain_rate_neg"]
+        out["fp_rate"] = 1.0 - out["abstain_rate_neg"]
+
+    if n_pos > 0 and n_neg > 0:
+        out["abstain_gap"] = out["bg_prob_neg_mean"] - out["bg_prob_pos_mean"]
 
     return out
 
@@ -276,19 +266,12 @@ def evaluate(
     progress: bool = True,
     progress_every: int = 5,
     phase0: bool = False,
+    abstain_threshold: float = 0.5,
 ) -> dict[str, Any]:
-    """Run evaluation. Skips negative episodes (localizer is positive-only).
+    """Run evaluation. Supports mixed positive + negative episodes.
 
-    If ``phase0=True`` uses ``model.phase0_forward`` (zero-shot OWLv2 baseline).
-
-    Returned dict structure::
-
-        {
-          "overall":    {<metrics>},
-          "per_source": {"hots": {<metrics>}, "insdet": {<metrics>}, ...},
-          "per_k":      {"k1": {<metrics>}, "k4": {<metrics>}, "k10": {<metrics>}},
-          "iou_thresholds": [0.50, 0.55, ..., 0.95],
-        }
+    Positive episodes contribute to all geometry / mAP metrics.
+    Negative episodes contribute abstain-rate / bg-prob metrics.
     """
     model.eval()
     overall = _empty_bucket()
@@ -321,33 +304,40 @@ def evaluate(
         ious = _iou_xyxy(pred_xyxy, gt_xyxy)
         contains = _containment_ratio(pred_xyxy, gt_xyxy)
         scores = out["best_score"]
+        bg_probs = out.get("bg_prob", torch.zeros(B, device=pred_box.device))
 
         for i in range(B):
-            if not bool(is_present[i].item()):
-                continue
             src = sources[i]
             k_label = f"k{int(ks[i].item())}"
-            iou_v = float(ious[i].item())
-            cont_v = float(contains[i].item())
             sc_v = float(scores[i].item())
-            pred_w = float(pred_box[i, 2].clamp(min=0).item())
-            pred_h = float(pred_box[i, 3].clamp(min=0).item())
-            pred_area = pred_w * pred_h
-            gt_w = float(gt_bbox[i, 2].clamp(min=0).item())
-            gt_h = float(gt_bbox[i, 3].clamp(min=0).item())
-            gt_area = gt_w * gt_h
-            pred_cx = float(pred_box[i, 0].item())
-            pred_cy = float(pred_box[i, 1].item())
-            gt_cx = float(gt_bbox[i, 0].item())
-            gt_cy = float(gt_bbox[i, 1].item())
-            cdist = math.sqrt((pred_cx - gt_cx) ** 2 + (pred_cy - gt_cy) ** 2)
-            for bucket in (overall, per_source[src], per_k[k_label]):
-                bucket["iou"].append(iou_v)
-                bucket["contain"].append(cont_v)
-                bucket["score"].append(sc_v)
-                bucket["pred_box_area"].append(pred_area)
-                bucket["gt_box_area"].append(gt_area)
-                bucket["center_distance"].append(cdist)
+            bg_v = float(bg_probs[i].item())
+            buckets = (overall, per_source[src], per_k[k_label])
+            if bool(is_present[i].item()):
+                iou_v = float(ious[i].item())
+                cont_v = float(contains[i].item())
+                pred_w = float(pred_box[i, 2].clamp(min=0).item())
+                pred_h = float(pred_box[i, 3].clamp(min=0).item())
+                pred_area = pred_w * pred_h
+                gt_w = float(gt_bbox[i, 2].clamp(min=0).item())
+                gt_h = float(gt_bbox[i, 3].clamp(min=0).item())
+                gt_area = gt_w * gt_h
+                pred_cx = float(pred_box[i, 0].item())
+                pred_cy = float(pred_box[i, 1].item())
+                gt_cx = float(gt_bbox[i, 0].item())
+                gt_cy = float(gt_bbox[i, 1].item())
+                cdist = math.sqrt((pred_cx - gt_cx) ** 2 + (pred_cy - gt_cy) ** 2)
+                for bucket in buckets:
+                    bucket["iou"].append(iou_v)
+                    bucket["contain"].append(cont_v)
+                    bucket["score"].append(sc_v)
+                    bucket["bg_prob_pos"].append(bg_v)
+                    bucket["pred_box_area"].append(pred_area)
+                    bucket["gt_box_area"].append(gt_area)
+                    bucket["center_distance"].append(cdist)
+            else:
+                for bucket in buckets:
+                    bucket["bg_prob_neg"].append(bg_v)
+                    bucket["score_neg"].append(sc_v)
 
         n_seen += 1
         if progress and (n_seen % progress_every == 0 or n_seen == n_batches_total):
@@ -357,8 +347,9 @@ def evaluate(
                   f"elapsed={elapsed:5.1f}s  rate={rate:.2f}b/s", flush=True)
 
     return {
-        "overall":    _bucket_metrics(overall),
-        "per_source": {s: _bucket_metrics(b) for s, b in per_source.items()},
-        "per_k":      {k: _bucket_metrics(b) for k, b in per_k.items()},
+        "overall":    _bucket_metrics(overall, abstain_threshold=abstain_threshold),
+        "per_source": {s: _bucket_metrics(b, abstain_threshold=abstain_threshold) for s, b in per_source.items()},
+        "per_k":      {k: _bucket_metrics(b, abstain_threshold=abstain_threshold) for k, b in per_k.items()},
         "iou_thresholds": list(IOU_THRESHOLDS),
+        "abstain_threshold": float(abstain_threshold),
     }

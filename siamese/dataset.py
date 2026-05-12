@@ -68,6 +68,11 @@ def build_val_loader(
     k_min: int,
     k_max: int,
 ) -> tuple[EpisodeDataset, "torch.utils.data.DataLoader"]:                  # type: ignore[name-defined]
+    """Validation / test loader.
+
+    Note (manifest v5): every support image on disk is already object-only,
+    so this loader does NO runtime bbox-crop augmentation.
+    """
     ds = EpisodeDataset(
         manifest_path=manifest, data_root=data_root,
         split=split, sources=sources,

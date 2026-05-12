@@ -1,15 +1,26 @@
 """Localizer training orchestrator.
 
 Public entry points:
-    train_phase0(...)
     train_stage_L1(...)
     train_stage_L2(...)
     train_stage_L3(...)
     evaluate_phase0(...)
     evaluate_run(checkpoint=..., ...)
 
-Every kwarg in DEFAULT_CFG is overridable through user_kwargs.
-Pass ``smoke=True`` to dial down to a tiny config for the smoke test.
+Stage curriculum (NEW):
+    Each stage can run in 1..N sub-phases, each with its own source filter and
+    epoch count. Configure via cfg keys like:
+        "L2_curriculum": ["insdet", "hots", "mixed"]
+        "L2_epochs_insdet": 4
+        "L2_epochs_hots":   3
+        "L2_epochs_mixed":  5
+
+    Backwards-compat: if ``L2_curriculum`` is absent (or empty), we fall back
+    to a single ``mixed`` phase with ``L2_epochs`` epochs (the old behaviour).
+
+L1 trains positives only (fusion warm-up). L2/L3 mix in negatives so the
+abstain channel learns. Set ``L<N>_neg_prob`` in cfg to override the default
+per-stage neg rate.
 """
 
 from __future__ import annotations
@@ -45,7 +56,7 @@ MODEL_KIND = "localizer"
 
 
 # ---------------------------------------------------------------------------
-# Default config — every knob is overridable via user_kwargs.
+# Default config
 # ---------------------------------------------------------------------------
 
 DEFAULT_CFG: dict[str, Any] = {
@@ -67,43 +78,85 @@ DEFAULT_CFG: dict[str, Any] = {
     # K range
     "k_min": 1,
     "k_max": 10,
-    # Stage durations.
-    # L1 is short: only the fusion (~3M params on top of mean-of-q_emb baseline)
-    # is being learned, with patch-CE alone. The residual gate alpha starts at 0
-    # so we begin AT zero-shot quality and the fusion learns a small correction.
-    # 3 epochs × 3 folds × 400 episodes ≈ 3.6k episodes is plenty for ~3M params.
-    "L1_epochs": 3,
-    "L2_epochs": 12,
-    "L3_epochs": 8,
+    # ──────────────────────────────────────────────────────────────────
+    # Stage role + sizing (REBALANCED).
+    #
+    #   L1  fusion-only warm-up. Frozen OWLv2, no LoRA. The fusion +
+    #       support-attn-pool learns to "do no harm" via patch-CE.
+    #       Positive-only — abstain channel has nothing to learn yet.
+    #
+    #   L2  Short WARM-UP for L3. Unfreezes OWLv2 class_head + box_head +
+    #       layer_norm. Bigger LRs than L3 so the heads + log-box wrapper
+    #       can snap into the fused prototype. NO LoRA yet (backbone
+    #       still frozen). Mixed pos+neg so the abstain channel begins.
+    #
+    #   L3  MAIN fine-tune. Attaches LoRA on last 4 ViT blocks. Drops
+    #       fusion/head LRs ~5× from L2 (they're already converged from
+    #       the L2 warm-up); LoRA gets a fresh-init LR. This is where
+    #       real mAP gains come from. Longest stage.
+    # ──────────────────────────────────────────────────────────────────
+    "L1_epochs": 4,
+    "L2_epochs": 4,
+    "L3_epochs": 12,
     "L1_eps_per_fold": 400,
-    "L2_eps_per_fold": 250,
-    "L3_eps_per_fold": 250,
+    "L2_eps_per_fold": 300,
+    "L3_eps_per_fold": 300,
     "val_episodes": 100,
     "test_episodes": 400,
-    # LRs.
-    # L1: lower LR than before (1e-4 vs 5e-4) — the fusion has very little to
-    # do at first (alpha=0) so a high LR pushes it into noisy territory.
-    "lr_fusion_L1": 1e-4,
-    "lr_fusion_L2": 1e-4,
-    "lr_class_L2": 5e-5,
-    "lr_box_L2":   5e-5,
+    # Curriculum (per-stage). Empty list ⇒ single "mixed" phase.
+    # Order matters; phases run sequentially with their own epoch budgets.
+    "L1_curriculum": ["insdet", "hots", "mixed"],
+    "L2_curriculum": ["insdet", "hots", "mixed"],
+    "L3_curriculum": ["insdet", "hots", "mixed"],
+    # L1: short, evenly across phases.
+    "L1_epochs_insdet": 1,
+    "L1_epochs_hots":   1,
+    "L1_epochs_mixed":  2,
+    # L2: short warm-up. Bias toward "mixed" so the heads see the full
+    # distribution before L3 starts touching the backbone.
+    "L2_epochs_insdet": 1,
+    "L2_epochs_hots":   1,
+    "L2_epochs_mixed":  2,
+    # L3: the workhorse. Most epochs on mixed; per-source phases give the
+    # LoRA adapters time to specialise before mixing.
+    "L3_epochs_insdet": 3,
+    "L3_epochs_hots":   3,
+    "L3_epochs_mixed":  6,
+    # Per-stage negative-episode ratios. L1 stays positive-only.
+    "L1_neg_prob": 0.0,
+    "L2_neg_prob": 0.25,
+    "L3_neg_prob": 0.30,
+    # LRs (REBALANCED).
+    #
+    # L1 fusion gets a moderately-high LR (only ~3M params + frozen backbone).
+    # L2 heads + fusion get the *biggest* LRs in the schedule — this is a
+    # short warm-up so we want fast convergence of the new heads against the
+    # fused prototype before L3 starts moving the backbone.
+    # L3 drops everything 4-5× and adds LoRA at its own fresh-init LR.
+    "lr_fusion_L1": 2e-4,
+    "lr_fusion_L2": 3e-4,
+    "lr_class_L2":  1e-4,
+    "lr_box_L2":    1e-4,
     "lr_fusion_L3": 5e-5,
-    "lr_class_L3": 2e-5,
-    "lr_box_L3":   2e-5,
-    "lr_lora_L3":  1e-4,
+    "lr_class_L3":  2e-5,
+    "lr_box_L3":    2e-5,
+    "lr_lora_L3":   2e-4,
     # Optim
     "weight_decay": 1e-4,
     "grad_clip": 1.0,
     "warmup_frac": 0.05,
     # Loss
     "lambda_patch_ce": 1.0,
-    "lambda_l1": 5.0,
-    "lambda_giou": 2.0,
-    "patch_ce_label_smoothing": 0.0,
-    "L2_box_warmup_epochs": 2,
-    # Architecture.
-    # fusion_dropout=0.0 at default — with only ~3M trainable fusion params and
-    # a tiny dataset, dropout adds noise without preventing overfit.
+    "lambda_l1": 2.0,
+    "lambda_giou": 4.0,
+    "lambda_log_area": 0.3,
+    "patch_ce_label_smoothing": 0.05,
+    "patch_ce_neighbour_radius": 1,
+    "patch_ce_neighbour_weight": 0.30,
+    # L2 is itself a warm-up, so we no longer freeze the box head for the
+    # first N epochs of it. Set to 0 to disable; >0 to re-enable.
+    "L2_box_warmup_epochs": 0,
+    # Architecture
     "fusion_layers": 2,
     "fusion_heads": 8,
     "fusion_mlp_ratio": 2,
@@ -126,14 +179,15 @@ DEFAULT_CFG: dict[str, Any] = {
     "aug_rrc_scale": (0.5, 1.0),
     "aug_hflip_prob": 0.5,
     "aug_query_color_jitter": 0.2,
-    # Early stopping (L1/L2/L3 share same patience by default; per-stage overrides accepted)
+    # Early stopping
     "L1_early_stop_patience": 4,
     "L2_early_stop_patience": 4,
     "L3_early_stop_patience": 4,
+    # Eval
+    "abstain_threshold": 0.5,
     # Misc
     "seed": 42,
     "keep_last_n": 0,
-    # Smoke override
     "smoke": False,
 }
 
@@ -160,6 +214,13 @@ SMOKE_OVERRIDES: dict[str, Any] = {
     "lora_r": 4,
     "lora_alpha": 8,
     "use_amp": False,
+    # Smoke runs one phase only to keep wall-clock small.
+    "L1_curriculum": ["mixed"],
+    "L2_curriculum": ["mixed"],
+    "L3_curriculum": ["mixed"],
+    "L1_epochs_mixed": 1,
+    "L2_epochs_mixed": 1,
+    "L3_epochs_mixed": 1,
 }
 
 
@@ -188,13 +249,13 @@ def _merge_cfg(user_kwargs: dict) -> dict:
     cfg.update(user_kwargs or {})
     if cfg.get("smoke"):
         cfg.update(SMOKE_OVERRIDES)
-        cfg.update(user_kwargs or {})  # explicit user kwargs trump smoke
+        cfg.update(user_kwargs or {})
     return cfg
 
 
 def _stage_lrs(stage: str, cfg: dict) -> dict:
     out = dict(cfg)
-    suf = stage  # "L1" / "L2" / "L3"
+    suf = stage
     for k in ("fusion", "class", "box", "lora"):
         full = f"lr_{k}_{suf}"
         if full in cfg:
@@ -270,11 +331,13 @@ def _save_stage_ckpt(
     metrics_history: list,
     rolling: bool,
     extra_path: Path | None = None,
+    phase: str | None = None,
 ) -> Path:
     state = get_trainable_state(model)
     payload = {
         "model_kind": MODEL_KIND,
         "stage": stage,
+        "phase": phase,
         "epoch": epoch,
         "fold": fold,
         "stage_completed": stage_completed,
@@ -299,9 +362,6 @@ def _save_stage_ckpt(
         ]
         if extra_path is not None:
             targets.append((extra_path, extra_path.stem))
-        # Single torch.save → multi-mirror to all targets. On Drive this
-        # avoids the back-to-back os.replace pattern that has been observed
-        # to drop the earlier rolling file from Drive folders.
         atomic_save_multi(payload, targets)
         return rolling_path
     if extra_path is not None:
@@ -314,68 +374,29 @@ def _save_stage_ckpt(
 # ---------------------------------------------------------------------------
 
 
-_TRAIN_PRIORITY = ("loss", "patch_ce", "l1", "giou", "grad_norm", "alpha", "n_steps")
-_VAL_PRIORITY = ("n", "n_pos",
-                 "map_50", "map_75", "map_5095",
-                 "map_50_containment", "map_90_containment",
-                 "iou_mean", "iou_median", "iou_std",
-                 "frac_iou_50", "frac_iou_75", "frac_iou_90",
-                 "containment_mean", "containment_median", "containment_std",
-                 "frac_containment_50", "frac_containment_75",
-                 "frac_containment_90", "frac_containment_full",
-                 "contain_at_iou_50", "contain_at_iou_75",
-                 "high_contain_high_iou",
-                 "mean_pred_box_area", "std_pred_box_area",
-                 "frac_pred_box_too_big", "frac_pred_box_too_small",
-                 "mean_gt_box_area",
-                 "pred_to_gt_area_ratio_median", "log_area_ratio_mean",
-                 "center_distance_mean",
-                 "score_mean", "score_iou_correlation")
-_PER_SOURCE_KEYS = ("n", "n_pos", "map_50", "map_5095", "map_50_containment",
-                    "iou_mean", "containment_mean", "frac_containment_90",
-                    "center_distance_mean")
-
-
-def train_phase0(**user_kwargs) -> dict:
-    try:
-        with gpu_cleanup_on_exit():
-            return _train_phase0_inner(user_kwargs)
-    finally:
-        release_gpu_memory(verbose=False)
-
-
-def _train_phase0_inner(user_kwargs: dict) -> dict:
-    cfg = _merge_cfg(user_kwargs)
-    device = _resolve_device(cfg)
-    out_dir, analysis_dir = _stage_dirs(cfg, "phase0")
-    print(f"=== [localizer] Phase 0 (zero-shot OWLv2) on {device} ===")
-
-    _set_seed(int(cfg["seed"]))
-    model = _build_model(cfg, lora_active=False).to(device)
-    metrics: dict[str, Any] = {}
-
-    # HOTS + InsDet test split.
-    test_eps = int(cfg.get("test_episodes", 400))
-    test_ds, test_loader = build_val_loader(
-        manifest=cfg["manifest"], data_root=cfg["data_root"],
-        split="test", sources=None, val_episodes=test_eps,
-        batch_size=int(cfg["batch_size"]),
-        num_workers=int(cfg["num_workers"]),
-        img_size=int(cfg["img_size"]),
-        seed=int(cfg["seed"]),
-        k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
-    )
-    if len(test_ds.instances) > 0:
-        t0 = time.time()
-        metrics["test"] = evaluate(
-            model, test_loader, device, phase0=True, progress_every=5,
-        )
-        metrics["test"]["wall_clock_seconds"] = round(time.time() - t0, 2)
-
-    write_json(out_dir / "results.json", metrics)
-    write_json(analysis_dir / "results.json", metrics)
-    print(f"[localizer] Phase 0 complete. Results: {out_dir / 'results.json'}")
-    return metrics
+_TRAIN_PRIORITY = ("loss", "patch_ce", "l1", "giou", "log_area", "grad_norm",
+                   "alpha", "bg_bias", "n_steps")
+_VAL_PRIORITY = (
+    "n", "n_pos", "n_neg",
+    "map_50", "map_75", "map_5095",
+    "map_50_containment", "map_90_containment",
+    "iou_mean", "iou_median", "iou_std",
+    "frac_iou_50", "frac_iou_75", "frac_iou_90",
+    "containment_mean", "containment_median",
+    "frac_containment_90", "frac_containment_full",
+    "contain_at_iou_50", "high_contain_high_iou",
+    "frac_pred_box_too_big", "frac_pred_box_too_small",
+    "pred_to_gt_area_ratio_median", "log_area_ratio_mean", "log_area_ratio_std",
+    "center_distance_mean",
+    "score_mean", "score_iou_correlation",
+    "bg_prob_pos_mean", "bg_prob_neg_mean", "abstain_gap",
+    "abstain_rate_pos", "abstain_rate_neg", "fp_rate", "tn_rate",
+)
+_PER_SOURCE_KEYS = (
+    "n", "n_pos", "n_neg",
+    "map_50", "map_5095", "iou_mean", "frac_containment_90",
+    "abstain_rate_pos", "abstain_rate_neg", "score_iou_correlation",
+)
 
 
 def evaluate_phase0(**user_kwargs) -> dict:
@@ -386,32 +407,46 @@ def evaluate_phase0(**user_kwargs) -> dict:
         release_gpu_memory(verbose=False)
 
 
+def train_phase0(**user_kwargs) -> dict:
+    """Alias for evaluate_phase0 — no training happens at Phase 0."""
+    return evaluate_phase0(**user_kwargs)
+
+
 def _evaluate_phase0_inner(user_kwargs: dict) -> dict:
-    """Evaluate zero-shot OWLv2 on the held-out test split only."""
+    """Phase 0 = ONE-SHOT vanilla OWLv2 baseline (no fusion, no fine-tuning).
+
+    Uses the first valid support per episode and runs the bare OWLv2
+    image-guided detection path. This is the numerical floor the trained
+    L1/L2/L3 stages must beat.
+    """
     cfg = _merge_cfg(user_kwargs)
     device = _resolve_device(cfg)
-    print(f"=== [localizer] Phase 0 evaluation on test split ({device}) ===")
+    out_dir, analysis_dir = _stage_dirs(cfg, "phase0")
+    print(f"=== [localizer] Phase 0 evaluation: one-shot vanilla OWLv2 ({device}) ===")
     _set_seed(int(cfg["seed"]))
     model = _build_model(cfg, lora_active=False).to(device)
     test_eps = int(cfg.get("test_episodes", 400))
+    # Force K=1 supports per episode so the phase0_forward path that picks
+    # the first valid slot sees exactly one support. This matches the
+    # "one-shot vanilla OWLv2 baseline" naming.
     test_ds, test_loader = build_val_loader(
         manifest=cfg["manifest"], data_root=cfg["data_root"],
         split="test", sources=None, val_episodes=test_eps,
         batch_size=int(cfg["batch_size"]),
         num_workers=int(cfg["num_workers"]),
         img_size=int(cfg["img_size"]), seed=int(cfg["seed"]),
-        k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
+        k_min=1, k_max=1,
+        force_positive=True,
     )
     t0 = time.time()
     metrics = evaluate(model, test_loader, device, phase0=True)
     metrics["wall_clock_seconds"] = round(time.time() - t0, 2)
-    out_dir = Path(cfg["out_root"]) / MODEL_KIND / "phase0"
-    analysis_dir = Path(cfg["analysis_root"]) / MODEL_KIND / "phase0"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    analysis_dir.mkdir(parents=True, exist_ok=True)
+    metrics["baseline_kind"] = "one_shot_vanilla_owlv2"
     ts = time.strftime("%Y%m%d_%H%M%S")
     write_json(out_dir / "test_eval.json", metrics)
     write_json(analysis_dir / f"test_eval_{ts}.json", metrics)
+    write_json(out_dir / "results.json", metrics)
+    write_json(analysis_dir / "results.json", metrics)
     o = metrics["overall"]
     print(
         f"[localizer phase0] test  "
@@ -419,15 +454,44 @@ def _evaluate_phase0_inner(user_kwargs: dict) -> dict:
         f"mAP@75={o.get('map_75', 0.0):.4f}  "
         f"mAP@50:95={o.get('map_5095', 0.0):.4f}  "
         f"IoU={o.get('iou_mean', 0.0):.4f}  "
-        f"contain={o.get('containment_mean', 0.0):.4f}  "
         f"contain>=.9={o.get('frac_containment_90', 0.0):.4f}"
     )
     return metrics
 
 
 # ---------------------------------------------------------------------------
-# Stage runner (L1 / L2 / L3)
+# Stage runner (L1 / L2 / L3) with curriculum
 # ---------------------------------------------------------------------------
+
+
+_PHASE_TO_SOURCES: dict[str, list[str] | None] = {
+    "insdet": ["insdet"],
+    "hots":   ["hots"],
+    "mixed":  None,
+}
+
+
+def _resolve_curriculum(stage: str, cfg: dict) -> list[tuple[str, int]]:
+    """Return [(phase_name, n_epochs), ...] for ``stage``.
+
+    Backwards-compat: if cfg[stage_curriculum] is empty / missing, we run a
+    single ``mixed`` phase with cfg[stage_epochs] epochs.
+    """
+    curr = list(cfg.get(f"{stage}_curriculum", []) or [])
+    if not curr:
+        n = int(cfg.get(f"{stage}_epochs", 1))
+        return [("mixed", n)]
+    out: list[tuple[str, int]] = []
+    for ph in curr:
+        n = int(cfg.get(f"{stage}_epochs_{ph}", 0))
+        if n <= 0:
+            continue
+        out.append((ph, n))
+    if not out:
+        # Fall through to legacy single-phase if every sub-phase budget was 0.
+        n = int(cfg.get(f"{stage}_epochs", 1))
+        return [("mixed", n)]
+    return out
 
 
 def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
@@ -440,18 +504,15 @@ def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
     _set_seed(int(cfg["seed"]))
 
-    # --- model ----------------------------------------------------------
     lora_active = (stage == "L3")
     model = _build_model(cfg, lora_active=lora_active).to(device)
 
-    # --- resume / warm-start -------------------------------------------
+    # --- resume / warm-start --------------------------------------------
     resume = user_kwargs.get("resume", True)
     resume_path = resolve_resume_path(resume, out_dir)
     if resume_path is None:
-        # Cross-stage warm start.
         prev_map = {"L1": None, "L2": "L1", "L3": "L2"}
         prev = prev_map.get(stage)
         if prev:
@@ -465,27 +526,26 @@ def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
         ckpt = torch.load(str(resume_path), map_location="cpu", weights_only=False)
         load_trainable_state(model, ckpt.get("state_dict", {}))
 
-    # --- optimiser / scheduler -----------------------------------------
-    optimizer, lora_params = build_optimizer_for_stage(stage, model, cfg)
-    n_epochs = int(cfg[f"{stage}_epochs"])
+    optimizer, _lora_params = build_optimizer_for_stage(stage, model, cfg)
+    curriculum = _resolve_curriculum(stage, cfg)
     K = int(cfg["folds"])
     eps_per_fold = int(cfg[f"{stage}_eps_per_fold"])
     steps_per_fold_per_epoch = max(
         1,
         eps_per_fold // max(1, int(cfg["batch_size"]) * int(cfg["grad_accum_steps"])),
     )
-    total_steps = steps_per_fold_per_epoch * K * n_epochs
+    total_steps = steps_per_fold_per_epoch * K * sum(n for _, n in curriculum)
     scheduler = build_scheduler(
         optimizer, total_steps=total_steps, warmup_frac=float(cfg["warmup_frac"]),
     )
     scaler = _make_scaler(bool(cfg["use_amp"]), device)
 
-    # --- restore optimizer state if mid-stage --------------------------
-    resume_epoch = 1
-    resume_fold = 0
-    best_metric: dict[str, Any] = {"value": -1.0, "epoch": 0, "fold": 0}
+    # --- restore optimiser if mid-stage ---------------------------------
+    resume_global_epoch = 1   # epoch index running across all phases (1-based)
+    best_metric: dict[str, Any] = {"value": -1.0, "epoch": 0, "fold": 0, "phase": ""}
     early_stop_counter = 0
     metrics_history: list[dict] = []
+    resume_fold = 0
 
     if resume_path is not None:
         ckpt_full = torch.load(str(resume_path), map_location="cpu", weights_only=False)
@@ -501,20 +561,20 @@ def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
                 saved_epoch = int(ckpt_full["epoch"])
                 saved_fold = int(ckpt_full["fold"])
                 if saved_fold >= K - 1:
-                    resume_epoch = saved_epoch + 1
+                    resume_global_epoch = saved_epoch + 1
                     resume_fold = 0
                 else:
-                    resume_epoch = saved_epoch
+                    resume_global_epoch = saved_epoch
                     resume_fold = saved_fold + 1
                 best_metric = dict(ckpt_full.get("best_metric") or best_metric)
                 early_stop_counter = int(ckpt_full.get("early_stop_counter", 0))
                 metrics_history = list(ckpt_full.get("metrics_history") or [])
                 print(f"  restored optim+sched at epoch={saved_epoch} fold={saved_fold}; "
-                      f"continuing from epoch={resume_epoch} fold={resume_fold}")
+                      f"continuing from epoch={resume_global_epoch} fold={resume_fold}")
             except Exception as e:                                                 # noqa: BLE001
                 print(f"  warning: failed to restore optimizer/scheduler ({e}); fresh start within stage")
 
-    # --- fold plan -----------------------------------------------------
+    # --- fold plan ------------------------------------------------------
     with open(cfg["manifest"]) as f:
         manifest_obj = json.load(f)
     train_instances = [i for i in manifest_obj["instances"] if i.get("split") == "train"]
@@ -537,152 +597,195 @@ def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
         write_json(fold_plan_path, {"k": K, "seed": int(cfg["fold_seed"]), "folds": fold_plan})
 
     write_json(analysis_dir / "config.json", cfg)
+    write_json(analysis_dir / "curriculum.json", {"phases": curriculum})
 
+    # Walk the curriculum. ``global_epoch`` is the trainer-wide epoch counter
+    # (visible in checkpoints and per-epoch logs); ``phase_idx`` indexes the
+    # current curriculum entry.
+    total_planned = sum(n for _, n in curriculum)
     box_warmup_epochs = int(cfg.get("L2_box_warmup_epochs", 2)) if stage == "L2" else 0
+    global_epoch = 0
+    epoch = 0  # for the final stage_complete ckpt
 
-    epoch = resume_epoch
-    for epoch in range(resume_epoch, n_epochs + 1):
-        # L2 box-head warmup.
-        if stage == "L2":
-            if epoch <= box_warmup_epochs:
-                model.freeze_box_head()
-            else:
-                model.unfreeze_box_head()
+    for phase_idx, (phase_name, phase_epochs) in enumerate(curriculum):
+        phase_neg_prob = (
+            0.0 if phase_name == "insdet" and stage == "L1" else
+            float(cfg.get(f"{stage}_neg_prob", 0.0))
+        )
+        force_positive = (phase_neg_prob <= 0.0)
+        sources = _PHASE_TO_SOURCES[phase_name]
+        print(f"\n── [localizer] {stage} curriculum phase {phase_idx + 1}/{len(curriculum)}: "
+              f"name={phase_name} sources={sources} neg_prob={phase_neg_prob:.2f} "
+              f"epochs={phase_epochs}", flush=True)
 
-        fold_jsons: list[dict] = [
-            m for m in metrics_history
-            if m.get("epoch") == epoch and m.get("fold", -1) < resume_fold
-        ] if epoch == resume_epoch else []
-
-        for fold_idx in range(K):
-            if epoch == resume_epoch and fold_idx < resume_fold:
+        for local_epoch in range(1, phase_epochs + 1):
+            global_epoch += 1
+            epoch = global_epoch
+            if global_epoch < resume_global_epoch:
+                # We already finished this whole epoch on the previous run.
                 continue
-            t0 = time.time()
-            fold = fold_plan[fold_idx]
-            print(f"▶ [localizer] {stage} epoch {epoch}/{n_epochs} fold {fold_idx}/{K - 1}",
-                  flush=True)
 
-            train_ds, train_loader = build_train_loader(
-                manifest=cfg["manifest"], data_root=cfg["data_root"],
-                split="train", sources=None,
-                episodes_per_epoch=eps_per_fold,
-                batch_size=int(cfg["batch_size"]),
-                num_workers=int(cfg["num_workers"]),
-                img_size=int(cfg["img_size"]),
-                seed=int(cfg["seed"]) + 1000 * epoch + fold_idx,
-                k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
-                aug_kwargs=_augmentation_kwargs(cfg),
-            )
-            train_ds.set_fold(train_ids=set(fold["train_ids"]))
-            val_ds, val_loader = build_val_loader(
-                manifest=cfg["manifest"], data_root=cfg["data_root"],
-                split="train", sources=None,
-                val_episodes=int(cfg["val_episodes"]),
-                batch_size=int(cfg["batch_size"]),
-                num_workers=int(cfg["num_workers"]),
-                img_size=int(cfg["img_size"]),
-                seed=int(cfg["seed"]) + 7000 * epoch + fold_idx,
-                k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
-            )
-            val_ds.set_fold(val_ids=set(fold["val_ids"]))
+            # L2 box-head warmup is measured in GLOBAL epochs to keep the
+            # warm-up duration deterministic regardless of phase boundaries.
+            if stage == "L2":
+                if global_epoch <= box_warmup_epochs:
+                    model.freeze_box_head()
+                else:
+                    model.unfreeze_box_head()
 
-            # L1: box_head is frozen, so the box L1+GIoU terms cannot
-            # produce gradient. Skip them — patch-CE alone drives the
-            # fusion. L2 with box_head still in warmup also has it frozen
-            # for the first N epochs, but we still keep the box loss term
-            # active because the class_head IS trainable and benefits from
-            # seeing the joint signal as soon as possible.
-            stage_uses_box_loss = stage in ("L2", "L3")
-            train_metrics = train_one_pass(
-                model=model, optimizer=optimizer, scheduler=scheduler,
-                loader=train_loader, device=device, cfg=cfg,
-                scaler=scaler, use_amp=bool(cfg["use_amp"]),
-                use_box_loss=stage_uses_box_loss,
-            )
-            val_metrics = evaluate(model, val_loader, device, progress_every=20)
+            fold_jsons: list[dict] = [
+                m for m in metrics_history
+                if m.get("epoch") == global_epoch and m.get("fold", -1) < resume_fold
+            ] if global_epoch == resume_global_epoch else []
 
-            payload = {
-                "stage": stage, "epoch": epoch, "fold": fold_idx,
-                "wall_clock_seconds": round(time.time() - t0, 2),
-                "lr": {g.get("name", str(i)): g["lr"]
-                       for i, g in enumerate(optimizer.param_groups)},
-                "train": train_metrics,
-                "val": val_metrics,
-            }
-            write_json(analysis_dir / f"epoch_{epoch:03d}" / f"fold_{fold_idx}.json", payload)
-            fold_jsons.append(payload)
-            metrics_history.append(payload)
+            for fold_idx in range(K):
+                if global_epoch == resume_global_epoch and fold_idx < resume_fold:
+                    continue
+                t0 = time.time()
+                fold = fold_plan[fold_idx]
+                print(f"▶ [localizer] {stage}/{phase_name} epoch {global_epoch}/{total_planned} "
+                      f"fold {fold_idx}/{K - 1}", flush=True)
 
-            _save_stage_ckpt(
-                out_dir=out_dir, stage=stage, epoch=epoch, fold=fold_idx,
-                stage_completed=False, model=model, optimizer=optimizer,
-                scheduler=scheduler, scaler=scaler, cfg=cfg,
-                fold_plan=fold_plan, best_metric=best_metric,
-                early_stop_counter=early_stop_counter,
-                metrics_history=metrics_history, rolling=True,
-            )
-            hygiene(out_dir, int(cfg["keep_last_n"]))
+                train_ds, train_loader = build_train_loader(
+                    manifest=cfg["manifest"], data_root=cfg["data_root"],
+                    split="train", sources=sources,
+                    episodes_per_epoch=eps_per_fold,
+                    batch_size=int(cfg["batch_size"]),
+                    num_workers=int(cfg["num_workers"]),
+                    img_size=int(cfg["img_size"]),
+                    seed=int(cfg["seed"]) + 1000 * global_epoch + fold_idx,
+                    k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
+                    force_positive=force_positive,
+                    neg_prob=phase_neg_prob,
+                    aug_kwargs=_augmentation_kwargs(cfg),
+                )
+                train_ds.set_fold(train_ids=set(fold["train_ids"]))
+                val_ds, val_loader = build_val_loader(
+                    manifest=cfg["manifest"], data_root=cfg["data_root"],
+                    split="train", sources=sources,
+                    val_episodes=int(cfg["val_episodes"]),
+                    batch_size=int(cfg["batch_size"]),
+                    num_workers=int(cfg["num_workers"]),
+                    img_size=int(cfg["img_size"]),
+                    seed=int(cfg["seed"]) + 7000 * global_epoch + fold_idx,
+                    k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
+                    force_positive=force_positive,
+                    neg_prob=phase_neg_prob,
+                )
+                val_ds.set_fold(val_ids=set(fold["val_ids"]))
 
-            print_epoch_log(
-                header=f"localizer {stage} epoch {epoch}/{n_epochs} fold {fold_idx}/{K - 1}",
-                train_metrics=train_metrics, val_metrics=val_metrics,
-                lr_groups={g.get("name", str(i)): g["lr"]
+                # Box loss off at L1 (box_head frozen).
+                stage_uses_box_loss = stage in ("L2", "L3")
+                train_metrics = train_one_pass(
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    loader=train_loader, device=device, cfg=cfg,
+                    scaler=scaler, use_amp=bool(cfg["use_amp"]),
+                    use_box_loss=stage_uses_box_loss,
+                )
+                val_metrics = evaluate(
+                    model, val_loader, device, progress_every=20,
+                    abstain_threshold=float(cfg.get("abstain_threshold", 0.5)),
+                )
+
+                payload = {
+                    "stage": stage, "phase": phase_name,
+                    "epoch": global_epoch, "fold": fold_idx,
+                    "wall_clock_seconds": round(time.time() - t0, 2),
+                    "lr": {g.get("name", str(i)): g["lr"]
                            for i, g in enumerate(optimizer.param_groups)},
-                wall_clock=payload["wall_clock_seconds"],
-                train_priority=_TRAIN_PRIORITY, val_priority=_VAL_PRIORITY,
-                per_source_keys=_PER_SOURCE_KEYS,
-            )
-            del train_loader, val_loader, train_ds, val_ds
+                    "train": train_metrics,
+                    "val": val_metrics,
+                }
+                write_json(analysis_dir / f"epoch_{global_epoch:03d}" / f"fold_{fold_idx}.json", payload)
+                fold_jsons.append(payload)
+                metrics_history.append(payload)
 
-        # End of epoch.
-        aggregate = aggregate_folds(fold_jsons)
-        write_json(analysis_dir / f"epoch_{epoch:03d}" / "aggregate.json", aggregate)
-        print_aggregate(stage, epoch, aggregate, keys=(
-            ("val.overall.map_50",                 "map_50"),
-            ("val.overall.map_75",                 "map_75"),
-            ("val.overall.map_5095",               "map_50:95"),
-            ("val.overall.map_50_containment",     "map_50_contain"),
-            ("val.overall.map_90_containment",     "map_90_contain"),
-            ("val.overall.iou_mean",               "iou_mean"),
-            ("val.overall.containment_mean",       "contain_mean"),
-            ("val.overall.frac_containment_90",    "contain>=0.90"),
-            ("val.overall.frac_containment_full",  "contain==full"),
-            ("val.overall.high_contain_high_iou",  "iou>=.5 & con>=.9"),
-            ("val.overall.center_distance_mean",   "center_dist"),
-            ("val.overall.score_iou_correlation",  "score↔iou_corr"),
-            ("train.loss",                         "train_loss"),
-            ("train.patch_ce",                     "train_patch_ce"),
-            ("train.l1",                           "train_l1"),
-            ("train.giou",                         "train_giou"),
-            ("train.alpha",                        "alpha"),
-        ))
-        map50 = aggregate["metrics"].get("val.overall.map_50", {}).get("mean", 0.0)
-        if map50 > best_metric["value"]:
-            best_metric = {"value": map50, "epoch": epoch, "fold": K - 1}
-            _save_stage_ckpt(
-                out_dir=out_dir, stage=stage, epoch=epoch, fold=K - 1,
-                stage_completed=False, model=model, optimizer=optimizer,
-                scheduler=scheduler, scaler=scaler, cfg=cfg,
-                fold_plan=fold_plan, best_metric=best_metric,
-                early_stop_counter=0, metrics_history=metrics_history,
-                rolling=False, extra_path=out_dir / "best.pt",
-            )
-            early_stop_counter = 0
-            print(f"    ↳ best metric so far: map_50_mean={map50:.4f} at epoch {epoch}")
+                _save_stage_ckpt(
+                    out_dir=out_dir, stage=stage, epoch=global_epoch, fold=fold_idx,
+                    stage_completed=False, model=model, optimizer=optimizer,
+                    scheduler=scheduler, scaler=scaler, cfg=cfg,
+                    fold_plan=fold_plan, best_metric=best_metric,
+                    early_stop_counter=early_stop_counter,
+                    metrics_history=metrics_history, rolling=True,
+                    phase=phase_name,
+                )
+                hygiene(out_dir, int(cfg["keep_last_n"]))
+
+                print_epoch_log(
+                    header=f"localizer {stage}/{phase_name} "
+                           f"epoch {global_epoch}/{total_planned} fold {fold_idx}/{K - 1}",
+                    train_metrics=train_metrics, val_metrics=val_metrics,
+                    lr_groups={g.get("name", str(i)): g["lr"]
+                               for i, g in enumerate(optimizer.param_groups)},
+                    wall_clock=payload["wall_clock_seconds"],
+                    train_priority=_TRAIN_PRIORITY, val_priority=_VAL_PRIORITY,
+                    per_source_keys=_PER_SOURCE_KEYS,
+                )
+                del train_loader, val_loader, train_ds, val_ds
+
+            # End of epoch.
+            aggregate = aggregate_folds(fold_jsons)
+            write_json(analysis_dir / f"epoch_{global_epoch:03d}" / "aggregate.json", aggregate)
+            print_aggregate(stage, global_epoch, aggregate, keys=(
+                ("val.overall.map_50",                 "map_50"),
+                ("val.overall.map_5095",               "map_50:95"),
+                ("val.overall.iou_mean",               "iou_mean"),
+                ("val.overall.frac_iou_50",            "frac_iou_50"),
+                ("val.overall.frac_containment_90",    "contain>=.9"),
+                ("val.overall.score_iou_correlation",  "score↔iou_corr"),
+                ("val.overall.bg_prob_pos_mean",       "bg_p_pos"),
+                ("val.overall.bg_prob_neg_mean",       "bg_p_neg"),
+                ("val.overall.abstain_rate_pos",       "abstain_pos"),
+                ("val.overall.abstain_rate_neg",       "abstain_neg"),
+                ("val.overall.frac_pred_box_too_small", "frac_too_small"),
+                ("val.overall.log_area_ratio_mean",     "log_area"),
+                ("val.overall.center_distance_mean",    "center_dist"),
+                ("train.loss",                         "train_loss"),
+                ("train.patch_ce",                     "patch_ce"),
+                ("train.l1",                           "l1"),
+                ("train.giou",                         "giou"),
+                ("train.log_area",                     "log_area_loss"),
+                ("train.alpha",                        "alpha"),
+                ("train.bg_bias",                      "bg_bias"),
+            ))
+            map50 = aggregate["metrics"].get("val.overall.map_50", {}).get("mean", 0.0)
+            if map50 > best_metric["value"]:
+                best_metric = {"value": map50, "epoch": global_epoch,
+                               "fold": K - 1, "phase": phase_name}
+                _save_stage_ckpt(
+                    out_dir=out_dir, stage=stage, epoch=global_epoch, fold=K - 1,
+                    stage_completed=False, model=model, optimizer=optimizer,
+                    scheduler=scheduler, scaler=scaler, cfg=cfg,
+                    fold_plan=fold_plan, best_metric=best_metric,
+                    early_stop_counter=0, metrics_history=metrics_history,
+                    rolling=False, extra_path=out_dir / "best.pt",
+                    phase=phase_name,
+                )
+                early_stop_counter = 0
+                print(f"    ↳ best metric so far: map_50_mean={map50:.4f} at epoch {global_epoch} "
+                      f"(phase={phase_name})")
+            else:
+                early_stop_counter += 1
+            update_summary(Path(cfg["analysis_root"]) / MODEL_KIND, {
+                f"{stage}.val.map_50_mean": (global_epoch, map50),
+                f"{stage}.val.iou_mean":    (global_epoch,
+                    aggregate["metrics"].get("val.overall.iou_mean", {}).get("mean", 0.0)),
+            })
+            resume_fold = 0
+
+            patience = int(cfg.get(f"{stage}_early_stop_patience", 4))
+            if early_stop_counter >= patience:
+                print(f"  early stop: {patience} epochs without map_50 improvement "
+                      f"(in phase {phase_name})")
+                # Break both inner and outer loops cleanly.
+                # We use a sentinel to escape the curriculum walk.
+                _early_stop_outer = True
+                break
         else:
-            early_stop_counter += 1
-        update_summary(Path(cfg["analysis_root"]) / MODEL_KIND, {
-            f"{stage}.val.map_50_mean": (epoch, map50),
-            f"{stage}.val.iou_mean":    (epoch,
-                aggregate["metrics"].get("val.overall.iou_mean", {}).get("mean", 0.0)),
-        })
-        # reset within-epoch fold pointer
-        resume_fold = 0
-
-        # Early stopping.
-        patience = int(cfg.get(f"{stage}_early_stop_patience", 4))
-        if early_stop_counter >= patience:
-            print(f"  early stop: {patience} epochs without map_50 improvement")
+            _early_stop_outer = False
+            continue
+        # Break-out from the epoch loop happened ⇒ break the phase loop too.
+        if _early_stop_outer:
             break
 
     # Stage-completion ckpt.
@@ -694,16 +797,19 @@ def _run_stage(stage: str, *, user_kwargs: dict) -> dict:
         early_stop_counter=early_stop_counter,
         metrics_history=metrics_history, rolling=False,
         extra_path=out_dir / "stage_complete.pt",
+        phase=best_metric.get("phase"),
     )
     write_json(analysis_dir / "complete.json", {
         "stage_completed": True,
         "epochs_run": epoch,
         "best_val_map_50_mean": best_metric["value"],
         "best_epoch": best_metric["epoch"],
+        "best_phase": best_metric.get("phase"),
+        "curriculum": curriculum,
     })
     print(f"[localizer] {stage} complete. Best val map_50_mean = {best_metric['value']:.4f} "
-          f"at epoch {best_metric['epoch']}")
-    return {"best_metric": best_metric, "config": cfg}
+          f"at epoch {best_metric['epoch']} (phase={best_metric.get('phase')})")
+    return {"best_metric": best_metric, "config": cfg, "curriculum": curriculum}
 
 
 def train_stage_L1(**user_kwargs) -> dict:
@@ -744,7 +850,7 @@ def evaluate_run(checkpoint: str, **user_kwargs) -> dict:
 
 
 def _evaluate_run_inner(checkpoint: str, user_kwargs: dict) -> dict:
-    """Load ``checkpoint`` and evaluate on the held-out test split."""
+    """Load ``checkpoint`` and evaluate on test (mixed pos+neg)."""
     cfg = _merge_cfg(user_kwargs)
     device = _resolve_device(cfg)
     print(f"=== [localizer] Evaluating {checkpoint} on test split ({device}) ===")
@@ -761,17 +867,24 @@ def _evaluate_run_inner(checkpoint: str, user_kwargs: dict) -> dict:
     model = model.to(device)
 
     test_eps = int(cfg.get("test_episodes", 400))
+    # Eval on mixed pos+neg by default at L2/L3 (so abstain metrics are meaningful).
+    # L1 stays positive-only.
+    neg_prob = 0.0 if stage == "L1" else float(cfg.get(f"{stage}_neg_prob", 0.25))
+    force_positive = (neg_prob <= 0.0)
     _, test_loader = build_val_loader(
         manifest=cfg["manifest"], data_root=cfg["data_root"],
         split="test", sources=None, val_episodes=test_eps,
         batch_size=int(cfg["batch_size"]),
         num_workers=int(cfg["num_workers"]),
-        img_size=int(cfg["img_size"]),
-        seed=int(cfg["seed"]),
+        img_size=int(cfg["img_size"]), seed=int(cfg["seed"]),
         k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
+        force_positive=force_positive, neg_prob=neg_prob,
     )
     t0 = time.time()
-    metrics = evaluate(model, test_loader, device)
+    metrics = evaluate(
+        model, test_loader, device,
+        abstain_threshold=float(cfg.get("abstain_threshold", 0.5)),
+    )
     metrics["wall_clock_seconds"] = round(time.time() - t0, 2)
 
     out_dir = Path(cfg["out_root"]) / MODEL_KIND / stage
@@ -782,6 +895,7 @@ def _evaluate_run_inner(checkpoint: str, user_kwargs: dict) -> dict:
     payload = {
         "stage": stage, "checkpoint": str(ckpt_path),
         "split": "test", "test_episodes": test_eps,
+        "neg_prob": neg_prob,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "config": cfg, "metrics": metrics,
     }
@@ -792,13 +906,11 @@ def _evaluate_run_inner(checkpoint: str, user_kwargs: dict) -> dict:
     print(
         f"[localizer {stage}] test  "
         f"mAP@50={o.get('map_50', 0.0):.4f}  "
-        f"mAP@75={o.get('map_75', 0.0):.4f}  "
-        f"mAP@50:95={o.get('map_5095', 0.0):.4f}  "
-        f"mAP@50_contain={o.get('map_50_containment', 0.0):.4f}  "
+        f"mAP@5095={o.get('map_5095', 0.0):.4f}  "
         f"IoU={o.get('iou_mean', 0.0):.4f}  "
-        f"contain={o.get('containment_mean', 0.0):.4f}  "
-        f"contain>=.9={o.get('frac_containment_90', 0.0):.4f}  "
-        f"contain==full={o.get('frac_containment_full', 0.0):.4f}  "
+        f"abstain_pos={o.get('abstain_rate_pos', 0.0):.3f}  "
+        f"abstain_neg={o.get('abstain_rate_neg', 0.0):.3f}  "
+        f"sc↔iou={o.get('score_iou_correlation', 0.0):.3f}  "
         f"({metrics['wall_clock_seconds']:.1f}s)"
     )
     return metrics

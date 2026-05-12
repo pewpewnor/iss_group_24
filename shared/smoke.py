@@ -88,7 +88,7 @@ def smoke_test(
     cfg = _smoke_cfg(manifest=manifest, data_root=data_root)
 
     # 1. Localizer pipeline.
-    _t("localizer_phase0", lambda: loc_train.train_phase0(**cfg))
+    _t("localizer_phase0", lambda: loc_train.evaluate_phase0(**cfg))
     l1 = _t("localizer_L1", lambda: loc_train.train_stage_L1(**cfg, resume=False))
     _t("localizer_eval_L1", lambda: loc_train.evaluate_run(
         checkpoint=str(Path(SMOKE_OUT_ROOT) / "localizer" / "L1" / "stage_complete.pt"),
@@ -106,7 +106,7 @@ def smoke_test(
     ))
 
     # 2. Siamese pipeline.
-    _t("siamese_phase0", lambda: sia_train.train_phase0(**cfg))
+    _t("siamese_phase0", lambda: sia_train.evaluate_phase0(**cfg))
     s1 = _t("siamese_S1", lambda: sia_train.train_stage_S1(**cfg, resume=False))
     _t("siamese_eval_S1", lambda: sia_train.evaluate_run(
         checkpoint=str(Path(SMOKE_OUT_ROOT) / "siamese" / "S1" / "stage_complete.pt"),
@@ -136,7 +136,7 @@ def smoke_test(
         support_paths=sup_paths,
         query_path=qry_path,
         out_root=str(Path(SMOKE_OUT_ROOT) / "inference"),
-        existence_threshold=0.5,
+        # existence_threshold=None ⇒ read learned_threshold from siamese ckpt.
         existence_threshold_mode="hard",
         smoke=True,
     ))

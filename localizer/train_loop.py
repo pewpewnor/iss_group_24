@@ -11,7 +11,7 @@ from localizer.loss import total_loss
 from localizer.model import MultiShotLocalizer
 
 
-_RUNNING_KEYS = ("loss", "patch_ce", "l1", "giou", "grad_norm")
+_RUNNING_KEYS = ("loss", "patch_ce", "l1", "giou", "log_area", "grad_norm")
 
 
 def train_one_pass(
@@ -30,22 +30,17 @@ def train_one_pass(
 ) -> dict[str, float]:
     """Run one training pass.
 
-    use_box_loss : suppress L1+GIoU. At L1 the box_head is frozen so those
-                   terms produce zero gradient and are pure overhead; at
-                   L2/L3 they're informative.
+    use_box_loss : suppress L1+GIoU+log_area. At L1 the box_head is frozen so
+                   those terms produce zero gradient and are pure overhead.
     """
     model.train()
     if not any(p.requires_grad for p in model.owlv2.parameters()):
-        # Vision model frozen: keep eval-mode for stability.
         try:
             model.owlv2.eval()
         except AttributeError:
             pass
 
     running = {k: 0.0 for k in _RUNNING_KEYS}
-    # ``grad_norm`` is averaged over OPTIMIZER STEPS, not raw batches. Skip
-    # the contribution of AMP-overflow steps (where ``clip_grad_norm_``
-    # returns nan/inf and the GradScaler will skip ``optimizer.step``).
     grad_steps = 0
     grad_nan_steps = 0
     n_batches = 0
@@ -67,16 +62,20 @@ def train_one_pass(
         sup_mask = batch["support_mask"].to(device, non_blocking=True)
         qry = batch["query_img"].to(device, non_blocking=True)
         gt_bbox = batch["query_bbox"].to(device, non_blocking=True)
+        is_present = batch["is_present"].to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
             out = model(sup, sup_mask, qry)
             losses = total_loss(
-                out, gt_bbox,
+                out, gt_bbox, is_present,
                 lambda_patch_ce=float(cfg.get("lambda_patch_ce", 1.0)),
-                lambda_l1=float(cfg.get("lambda_l1", 5.0)),
-                lambda_giou=float(cfg.get("lambda_giou", 2.0)),
+                lambda_l1=float(cfg.get("lambda_l1", 2.0)),
+                lambda_giou=float(cfg.get("lambda_giou", 4.0)),
+                lambda_log_area=float(cfg.get("lambda_log_area", 0.5)),
                 use_box_loss=use_box_loss,
-                label_smoothing=float(cfg.get("patch_ce_label_smoothing", 0.0)),
+                label_smoothing=float(cfg.get("patch_ce_label_smoothing", 0.05)),
+                neighbour_radius=int(cfg.get("patch_ce_neighbour_radius", 1)),
+                neighbour_weight=float(cfg.get("patch_ce_neighbour_weight", 0.30)),
             )
             loss = losses["loss"] / accum_steps
 
@@ -115,6 +114,7 @@ def train_one_pass(
         running["patch_ce"] += float(losses["patch_ce"].detach().item())
         running["l1"]       += float(losses["l1"].detach().item())
         running["giou"]     += float(losses["giou"].detach().item())
+        running["log_area"] += float(losses["log_area"].detach().item())
         n_batches += 1
 
         if progress and (n_batches % progress_every == 0
@@ -147,10 +147,13 @@ def train_one_pass(
     running["n_steps"] = n_batches
     running["grad_steps"] = grad_steps
     running["grad_nan_steps"] = grad_nan_steps
-    # Snapshot the residual gate scalar at end-of-pass. alpha=0 ⇒ prototype
-    # is the zero-shot baseline; alpha>0 ⇒ fusion is contributing.
+    # Snapshot trainable scalars.
     try:
         running["alpha"] = float(model.alpha.detach().item())
     except AttributeError:
         running["alpha"] = 0.0
+    try:
+        running["bg_bias"] = float(model.bg_bias.detach().item())
+    except AttributeError:
+        running["bg_bias"] = 0.0
     return running

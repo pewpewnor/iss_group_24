@@ -77,6 +77,7 @@ class MultiShotSiamese(nn.Module):
         head_hidden_1: int = 256,
         head_hidden_2: int = 64,
         head_dropout: float = 0.2,
+        positive_prior: float = 0.5,
     ) -> None:
         super().__init__()
         self.dinov2 = AutoModel.from_pretrained(model_name)
@@ -98,6 +99,16 @@ class MultiShotSiamese(nn.Module):
             nn.Linear(head_hidden_1, head_hidden_2), nn.GELU(), nn.Dropout(head_dropout),
             nn.Linear(head_hidden_2, 1),
         )
+        # Logit-prior bias initialisation. With neg_prob=p_neg the positive
+        # prior is p_pos = 1 - p_neg; sigmoid(b₀) should equal p_pos so that
+        # the very first prediction matches the class prior. This single
+        # change moves the mean predicted score off ~0.3 (where the previous
+        # init parked it) onto p_pos directly — fixing the "scores never
+        # cross 0.5 → tp=0 at thr=0.5" pathology.
+        p = float(min(0.99, max(0.01, positive_prior)))
+        b0 = float(torch.tensor(p / (1.0 - p)).log())
+        with torch.no_grad():
+            self.head[-1].bias.fill_(b0)
         self.freeze_backbone()
         self._lora_attached = False
 

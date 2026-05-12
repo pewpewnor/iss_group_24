@@ -1,0 +1,25 @@
+{
+  "checkpoint": "checkpoints/localizer/L2/stage_complete.pt",
+  "stage": "L2",
+  "model_kind": "localizer",
+  "n_support": 4,
+  "k_max": 10,
+  "img_size": 768,
+  "best_box_cxcywh_norm": [
+    0.5488569140434265,
+    0.5052415728569031,
+    0.03453240171074867,
+    0.04255862906575203
+  ],
+  "best_box_xyxy_native": [
+    829.4450549036264,
+    987.2830069810152,
+    899.8911543935537,
+    1074.1026102751493
+  ],
+  "best_score": 0.13385312259197235,
+  "native_size": [
+    1530,
+    2040
+  ]
+}

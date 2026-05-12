@@ -1,0 +1,13 @@
+{
+  "siamese_ckpt": "checkpoints/siamese/S2/stage_complete.pt",
+  "localizer_ckpt": "checkpoints/localizer/L3/stage_complete.pt",
+  "n_support": 4,
+  "siamese_img_size": 518,
+  "localizer_img_size": 768,
+  "existence_prob": 0.23506322503089905,
+  "existence_threshold": 0.5,
+  "existence_threshold_mode": "hard",
+  "exists": false,
+  "bbox_xyxy_native": null,
+  "localizer_score": null
+}

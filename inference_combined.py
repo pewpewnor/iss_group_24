@@ -104,16 +104,29 @@ def run_combined(
     support_paths: list[str | Path],
     query_path: str | Path,
     *,
-    existence_threshold: float = 0.5,
+    existence_threshold: float | None = None,
     existence_threshold_mode: str = "hard",   # "hard" | "soft" | "always_localize"
     siamese_img_size: int = 518,
     localizer_img_size: int = 768,
+    abstain_threshold: float = 0.5,
     device: str | None = None,
     out_root: str | Path = "inference/combined",
     bbox_color: tuple[int, int, int] = (0, 255, 0),
     bbox_thickness: int = 4,
     smoke: bool = False,
 ) -> dict[str, Any]:
+    """Cascaded siamese → localizer inference.
+
+    Threshold defaulting:
+      - ``existence_threshold=None`` (default): read ``learned_threshold`` from
+        the siamese checkpoint (median val best_f1_threshold across training).
+        This is the calibrated operating point that fixes the previous
+        "tp=0 because 0.5 was never crossed" bug.
+      - Pass a float to override.
+
+    The localizer's own abstain channel (``bg_prob``) is ALSO surfaced and an
+    abstain decision is reported per query.
+    """
     with gpu_cleanup_on_exit(verbose=False), torch.no_grad():
         return _run_combined_inner(
             siamese_ckpt=siamese_ckpt, localizer_ckpt=localizer_ckpt,
@@ -122,6 +135,7 @@ def run_combined(
             existence_threshold_mode=existence_threshold_mode,
             siamese_img_size=siamese_img_size,
             localizer_img_size=localizer_img_size,
+            abstain_threshold=abstain_threshold,
             device=device, out_root=out_root,
             bbox_color=bbox_color, bbox_thickness=bbox_thickness,
             smoke=smoke,
@@ -133,6 +147,7 @@ def _run_combined_inner(
     siamese_ckpt, localizer_ckpt, support_paths, query_path,
     existence_threshold, existence_threshold_mode,
     siamese_img_size, localizer_img_size,
+    abstain_threshold,
     device, out_root, bbox_color, bbox_thickness, smoke,
 ) -> dict[str, Any]:
     if smoke:
@@ -154,12 +169,22 @@ def _run_combined_inner(
             f"existence_threshold_mode must be one of 'hard'|'soft'|'always_localize', "
             f"got {existence_threshold_mode!r}"
         )
-    if not (0.0 <= existence_threshold <= 1.0):
-        raise ValueError(f"existence_threshold must be in [0, 1], got {existence_threshold}")
     device_t = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     sia_ckpt = torch.load(str(siamese_ckpt), map_location="cpu", weights_only=False)
     loc_ckpt = torch.load(str(localizer_ckpt), map_location="cpu", weights_only=False)
+    # Default existence_threshold to the val-discovered ``learned_threshold``
+    # stored in the siamese checkpoint (median best_f1_threshold across
+    # epochs). Falling back to 0.5 only if the ckpt did not record one.
+    if existence_threshold is None:
+        learned = sia_ckpt.get("learned_threshold")
+        existence_threshold = float(learned) if learned is not None else 0.5
+        thr_source = "ckpt.learned_threshold" if learned is not None else "default(0.5)"
+    else:
+        existence_threshold = float(existence_threshold)
+        thr_source = "explicit"
+    if not (0.0 <= existence_threshold <= 1.0):
+        raise ValueError(f"existence_threshold must be in [0, 1], got {existence_threshold}")
     sia_k = int(sia_ckpt.get("config", {}).get("k_max", 10))
     loc_k = int(loc_ckpt.get("config", {}).get("k_max", 10))
     if smoke:
@@ -183,6 +208,8 @@ def _run_combined_inner(
 
     bbox_native: list[float] | None = None
     loc_score: float | None = None
+    bg_prob: float | None = None
+    loc_abstain: bool | None = None
     skip_localizer = (existence_threshold_mode == "hard" and not exists)
 
     if not skip_localizer:
@@ -193,6 +220,9 @@ def _run_combined_inner(
         loc_out = localizer(loc_sup, loc_mask, loc_qry)
         cx, cy, w, h = loc_out["best_box"][0].cpu().tolist()
         loc_score = float(loc_out["best_score"][0].cpu().item())
+        bg_prob = float(loc_out.get("bg_prob", torch.zeros(1))[0].cpu().item()) \
+            if "bg_prob" in loc_out else None
+        loc_abstain = (bg_prob is not None and bg_prob >= abstain_threshold)
         bbox_native = _bbox_to_native(
             cx, cy, w, h,
             img_size=localizer_img_size,
@@ -228,15 +258,21 @@ def _run_combined_inner(
         "localizer_img_size": localizer_img_size,
         "existence_prob": existence_prob,
         "existence_threshold": existence_threshold,
+        "existence_threshold_source": thr_source,
         "existence_threshold_mode": existence_threshold_mode,
         "exists": exists,
         "bbox_xyxy_native": bbox_native,
         "localizer_score": loc_score,
+        "localizer_bg_prob": bg_prob,
+        "localizer_abstain": loc_abstain,
+        "abstain_threshold": float(abstain_threshold),
     }
     with open(out_dir / "result.json", "w") as f:
         json.dump(payload, f, indent=2)
     print(f"[combined] existence_prob={existence_prob:.4f}  exists={exists}  "
-          f"mode={existence_threshold_mode}  →  {out_dir}")
+          f"(thr={existence_threshold:.3f} from {thr_source})  "
+          f"bg_prob={bg_prob if bg_prob is None else f'{bg_prob:.3f}'}  "
+          f"→  {out_dir}")
     return payload
 
 

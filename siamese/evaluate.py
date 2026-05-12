@@ -335,15 +335,33 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     *,
-    threshold: float = 0.5,
+    threshold: float | str = 0.5,
     progress: bool = True,
     progress_every: int = 5,
     phase0: bool = False,
+    save_scores: bool = True,
 ) -> dict[str, Any]:
+    """Evaluate the siamese on ``loader``.
+
+    threshold:
+      float — pin operating-point metrics (precision/recall/f1/fpr/fnr) at
+              this threshold.
+      "auto" — sweep all scores, pick the OVERALL ``best_f1_threshold`` and
+              re-bucket every per-source / per-k slice at that single value.
+              This is the operating-point metric the user wants reported for
+              the val-pinned F1 / precision / recall. ``best_f1_threshold``
+              is also returned as a field so the caller can persist it.
+
+    save_scores: when True, the per-bucket score + label arrays are returned
+                 under ``confusion_matrix`` so plots / audits can rebuild the
+                 ROC, PR curve, and confusion matrix at any threshold.
+    """
     model.eval()
     overall = _empty_bucket()
     per_source: dict[str, dict[str, list]] = defaultdict(_empty_bucket)
     per_k: dict[str, dict[str, list]] = defaultdict(_empty_bucket)
+    # Also keep per-instance score + label for confusion-matrix persistence.
+    cm_records: list[dict[str, Any]] = []
 
     n_batches_total = len(loader) if hasattr(loader, "__len__") else None
     t_start = time.time()
@@ -358,6 +376,7 @@ def evaluate(
         is_present = batch["is_present"].cpu()
         sources = batch["source"]
         ks = batch["k"]
+        instance_ids = batch.get("instance_id", [""] * sup.size(0))
         B = sup.size(0)
 
         if phase0:
@@ -370,10 +389,19 @@ def evaluate(
             sc = float(scores[i])
             pres = bool(is_present[i].item())
             src = sources[i]
-            k_label = f"k{int(ks[i].item())}"
+            k_v = int(ks[i].item())
+            k_label = f"k{k_v}"
             for bucket in (overall, per_source[src], per_k[k_label]):
                 bucket["score"].append(sc)
                 bucket["is_present"].append(pres)
+            if save_scores:
+                cm_records.append({
+                    "instance_id": instance_ids[i] if i < len(instance_ids) else "",
+                    "source": src,
+                    "k": k_v,
+                    "score": sc,
+                    "is_present": pres,
+                })
 
         n_seen += 1
         if progress and (n_seen % progress_every == 0 or n_seen == n_batches_total):
@@ -382,8 +410,35 @@ def evaluate(
             print(f"  [{n_seen}/{n_batches_total or '?'}]  "
                   f"elapsed={elapsed:5.1f}s  rate={rate:.2f}b/s", flush=True)
 
-    return {
-        "overall":    _bucket_metrics(overall, thr=threshold),
-        "per_source": {s: _bucket_metrics(b, thr=threshold) for s, b in per_source.items()},
-        "per_k":      {k: _bucket_metrics(b, thr=threshold) for k, b in per_k.items()},
+    # Resolve threshold. "auto" ⇒ overall best_f1_threshold.
+    if isinstance(threshold, str):
+        if threshold.lower() != "auto":
+            raise ValueError(f"threshold must be float or 'auto', got {threshold!r}")
+        _, auto_thr = _best_f1(overall["score"], overall["is_present"])
+        thr_used = float(auto_thr)
+        thr_mode = "auto"
+    else:
+        thr_used = float(threshold)
+        thr_mode = "fixed"
+
+    out: dict[str, Any] = {
+        "overall":    _bucket_metrics(overall, thr=thr_used),
+        "per_source": {s: _bucket_metrics(b, thr=thr_used) for s, b in per_source.items()},
+        "per_k":      {k: _bucket_metrics(b, thr=thr_used) for k, b in per_k.items()},
+        "threshold_used": thr_used,
+        "threshold_mode": thr_mode,
     }
+    if save_scores:
+        out["confusion_matrix"] = {
+            "threshold": thr_used,
+            "tp": out["overall"].get("tp", 0),
+            "fp": out["overall"].get("fp", 0),
+            "fn": out["overall"].get("fn", 0),
+            "tn": out["overall"].get("tn", 0),
+            "n": out["overall"].get("n", 0),
+            "n_pos": out["overall"].get("n_pos", 0),
+            "n_neg": out["overall"].get("n_neg", 0),
+            # Raw per-episode records for offline curve / threshold sweeps.
+            "records": cm_records,
+        }
+    return out

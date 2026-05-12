@@ -1,15 +1,22 @@
 """Localizer-only inference.
 
 CLI:
-    python inference_localizer.py \
-        --checkpoint checkpoints/localizer/L3/stage_complete.pt \
-        --supports s1.jpg s2.jpg s3.jpg s4.jpg \
+    python inference_localizer.py \\
+        --checkpoint checkpoints/localizer/L3/stage_complete.pt \\
+        --supports s1.jpg s2.jpg s3.jpg s4.jpg \\
         --query    scene.jpg
 
 Public API:
     run_localize(checkpoint, support_paths, query_path, *, img_size=768,
-                 device=None, out_root="inference/localizer", smoke=False)
-        -> dict with predicted bbox in {cxcywh_norm, xyxy_native} forms.
+                 device=None, out_root="inference/localizer", smoke=False,
+                 abstain_threshold=0.5, top_k=5)
+
+Outputs:
+    - ``result.json`` with the **top-K** highest-confidence boxes (each with
+      box + score + bg_prob + abstain decision), the global ``bg_prob`` for
+      the query, and an explicit ``abstain`` flag.
+    - ``result.png`` annotated with the top-1 box (red if abstained, green
+      otherwise) and a footer "abstain (bg=X.XX)" / "score=X.XX".
 """
 
 from __future__ import annotations
@@ -81,6 +88,26 @@ def _build_model_from_ckpt(
     return m
 
 
+def _unletterbox_box(
+    cx: float, cy: float, w: float, h: float, *,
+    img_size: int, scale: float, pad_left: int, pad_top: int,
+    native_w: int, native_h: int,
+) -> tuple[float, float, float, float]:
+    x1_lb = (cx - w / 2) * img_size
+    y1_lb = (cy - h / 2) * img_size
+    x2_lb = (cx + w / 2) * img_size
+    y2_lb = (cy + h / 2) * img_size
+    x1_n = (x1_lb - pad_left) / scale
+    y1_n = (y1_lb - pad_top) / scale
+    x2_n = (x2_lb - pad_left) / scale
+    y2_n = (y2_lb - pad_top) / scale
+    x1_n = max(0.0, min(native_w, x1_n))
+    y1_n = max(0.0, min(native_h, y1_n))
+    x2_n = max(0.0, min(native_w, x2_n))
+    y2_n = max(0.0, min(native_h, y2_n))
+    return x1_n, y1_n, x2_n, y2_n
+
+
 @torch.no_grad()
 def run_localize(
     checkpoint: str | Path,
@@ -90,8 +117,11 @@ def run_localize(
     img_size: int = 768,
     device: str | None = None,
     out_root: str | Path = "inference/localizer",
-    bbox_color: tuple[int, int, int] = (0, 255, 0),
+    bbox_color_present: tuple[int, int, int] = (0, 255, 0),
+    bbox_color_abstain: tuple[int, int, int] = (255, 50, 50),
     bbox_thickness: int = 4,
+    abstain_threshold: float = 0.5,
+    top_k: int = 5,
     smoke: bool = False,
 ) -> dict[str, Any]:
     if smoke:
@@ -117,7 +147,6 @@ def run_localize(
     model = _build_model_from_ckpt(ckpt, k_max=cfg_k_max, img_size=img_size).to(device_t)
     model.eval()
 
-    # Load images.
     sup_pils = [_load_image(p) for p in support_paths]
     sup_tensors = []
     for s in sup_pils:
@@ -125,7 +154,7 @@ def run_localize(
         sup_tensors.append(TF.to_tensor(lb))
     while len(sup_tensors) < cfg_k_max:
         sup_tensors.append(torch.zeros(3, img_size, img_size))
-    sup_t = torch.stack(sup_tensors, dim=0).unsqueeze(0).to(device_t)        # (1, K_max, 3, S, S)
+    sup_t = torch.stack(sup_tensors, dim=0).unsqueeze(0).to(device_t)
     mask = torch.zeros(1, cfg_k_max, dtype=torch.bool, device=device_t)
     mask[0, :K] = True
 
@@ -135,32 +164,55 @@ def run_localize(
     qry_t = TF.to_tensor(qry_lb).unsqueeze(0).to(device_t)
 
     out = model(sup_t, mask, qry_t)
-    cx, cy, w, h = out["best_box"][0].cpu().tolist()
-    score = float(out["best_score"][0].cpu().item())
+    fg_logits = out["pred_logits_fg"][0]                                  # (P,)
+    bg_logit  = out["bg_logit"][0]                                        # ()
+    joint = torch.cat([fg_logits, bg_logit.unsqueeze(0)], dim=-1)
+    joint_prob = joint.softmax(dim=-1)
+    fg_prob = joint_prob[:-1]
+    bg_prob = float(joint_prob[-1].item())
 
-    # Map back to native query coords.
-    x1_lb = (cx - w / 2) * img_size
-    y1_lb = (cy - h / 2) * img_size
-    x2_lb = (cx + w / 2) * img_size
-    y2_lb = (cy + h / 2) * img_size
-    x1_n = (x1_lb - q_pad_left) / q_scale
-    y1_n = (y1_lb - q_pad_top) / q_scale
-    x2_n = (x2_lb - q_pad_left) / q_scale
-    y2_n = (y2_lb - q_pad_top) / q_scale
-    x1_n = max(0.0, min(nw, x1_n))
-    y1_n = max(0.0, min(nh, y1_n))
-    x2_n = max(0.0, min(nw, x2_n))
-    y2_n = max(0.0, min(nh, y2_n))
+    top_k_eff = max(1, min(int(top_k), fg_prob.numel()))
+    top_vals, top_idx = fg_prob.topk(top_k_eff)
+    pred_boxes_q = out["pred_boxes"][0]                                   # (P, 4)
+
+    candidates: list[dict[str, Any]] = []
+    for rank, (val, idx) in enumerate(zip(top_vals.tolist(), top_idx.tolist())):
+        cx, cy, w, h = pred_boxes_q[idx].cpu().tolist()
+        x1n, y1n, x2n, y2n = _unletterbox_box(
+            cx, cy, w, h,
+            img_size=img_size, scale=q_scale, pad_left=q_pad_left, pad_top=q_pad_top,
+            native_w=nw, native_h=nh,
+        )
+        candidates.append({
+            "rank": rank + 1,
+            "patch_idx": int(idx),
+            "cxcywh_norm": [cx, cy, w, h],
+            "xyxy_native": [x1n, y1n, x2n, y2n],
+            "score": float(val),
+        })
+
+    best = candidates[0]
+    # Abstain if the bg column won OR if the best fg score is below the
+    # detection threshold derived from the bg probability.
+    # We treat ``bg_prob > abstain_threshold`` as the primary abstain signal,
+    # AND require the best fg score to clear a reciprocal threshold so the
+    # two decisions stay consistent.
+    abstain = bool(bg_prob >= abstain_threshold) or bool(best["score"] < (1.0 - abstain_threshold) * 0.5)
 
     out_dir = _next_run_dir(Path(out_root))
-    # Save inputs unchanged.
     for idx, sp in enumerate(support_paths, start=1):
         shutil.copy2(str(sp), str(out_dir / f"support_{idx:02d}{Path(sp).suffix}"))
     shutil.copy2(str(query_path), str(out_dir / f"query{Path(query_path).suffix}"))
+
+    color = bbox_color_abstain if abstain else bbox_color_present
+    caption = (
+        f"abstain (bg={bg_prob:.2f}, top1={best['score']:.2f})"
+        if abstain
+        else f"score={best['score']:.2f} bg={bg_prob:.2f}"
+    )
     annotated = _draw_bbox(
-        qry_pil, (x1_n, y1_n, x2_n, y2_n),
-        color=bbox_color, thickness=bbox_thickness,
-        caption=f"score={score:.2f}",
+        qry_pil, tuple(best["xyxy_native"]),
+        color=color, thickness=bbox_thickness, caption=caption,
     )
     annotated.save(str(out_dir / "result.png"))
 
@@ -170,14 +222,20 @@ def run_localize(
         "model_kind": "localizer",
         "n_support": K, "k_max": cfg_k_max,
         "img_size": img_size,
-        "best_box_cxcywh_norm": [cx, cy, w, h],
-        "best_box_xyxy_native": [x1_n, y1_n, x2_n, y2_n],
-        "best_score": score,
+        "best_box_cxcywh_norm": best["cxcywh_norm"],
+        "best_box_xyxy_native": best["xyxy_native"],
+        "best_score": best["score"],
+        "bg_prob": bg_prob,
+        "abstain": abstain,
+        "abstain_threshold": float(abstain_threshold),
+        "top_k": top_k_eff,
+        "candidates": candidates,
         "native_size": [nw, nh],
     }
     with open(out_dir / "result.json", "w") as f:
         json.dump(payload, f, indent=2)
-    print(f"[localizer] result → {out_dir}")
+    print(f"[localizer] result → {out_dir}  "
+          f"(abstain={abstain}, top1={best['score']:.3f}, bg={bg_prob:.3f})")
     return payload
 
 
@@ -189,6 +247,8 @@ def main() -> None:
     parser.add_argument("--img-size", type=int, default=768)
     parser.add_argument("--device", default=None)
     parser.add_argument("--out-root", default="inference/localizer")
+    parser.add_argument("--abstain-threshold", type=float, default=0.5)
+    parser.add_argument("--top-k", type=int, default=5)
     args = parser.parse_args()
     run_localize(
         checkpoint=args.checkpoint,
@@ -197,6 +257,8 @@ def main() -> None:
         img_size=args.img_size,
         device=args.device,
         out_root=args.out_root,
+        abstain_threshold=args.abstain_threshold,
+        top_k=args.top_k,
     )
 
 

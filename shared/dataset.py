@@ -114,7 +114,14 @@ def _letterbox_bbox(
 
 
 class _SupportAugment:
-    """Per-view stochastic augmentation for support images. No bbox crop."""
+    """Per-view stochastic augmentation for support images.
+
+    NOTE (manifest v5): every support image on disk is already object-only.
+    HOTS supports were object-centred in the source dataset; InsDet supports
+    were physically cropped to bbox + 20%% pad by the aggregator. So this
+    class does NO runtime bbox-cropping. It just letterboxes + applies
+    photometric / random-erase augmentations at train time.
+    """
 
     def __init__(self, img_size: int, train: bool, *,
                  color_jitter: float = 0.4, hue: float = 0.1,
@@ -122,7 +129,7 @@ class _SupportAugment:
                  blur_sigma: tuple[float, float] = (0.5, 2.0),
                  erase_prob: float = 0.3,
                  erase_scale: tuple[float, float] = (0.05, 0.20),
-                 rrc_scale: tuple[float, float] = (0.5, 1.0),
+                 rrc_scale: tuple[float, float] = (0.85, 1.0),
                  hflip_prob: float = 0.5):
         self.img_size = img_size
         self.train = train
@@ -133,15 +140,20 @@ class _SupportAugment:
         self.blur_sigma = blur_sigma
         self.erase_prob = erase_prob
         self.erase_scale = erase_scale
+        # RRC scale is now mild by default (0.85..1.0): the support image
+        # IS the object, so we don't want to crop large slices out of it.
         self.rrc_scale = rrc_scale
         self.hflip_prob = hflip_prob
 
-    def __call__(self, img: Image.Image, rng: random.Random) -> torch.Tensor:
+    def __call__(
+        self, img: Image.Image, rng: random.Random,
+    ) -> torch.Tensor:
         if self.train:
             # 1) Random horizontal flip.
             if rng.random() < self.hflip_prob:
                 img = ImageOps.mirror(img)
-            # 2) Random resized crop (acts as implicit weak crop).
+            # 2) Mild random resized crop (no bbox crop — supports are
+            #    already object-only on disk).
             w, h = img.size
             scale = rng.uniform(*self.rrc_scale)
             cw = max(8, int(w * scale))
@@ -161,7 +173,9 @@ class _SupportAugment:
                 img = img.filter(ImageFilter.GaussianBlur(
                     radius=rng.uniform(*self.blur_sigma)))
             t = TF.to_tensor(img)  # (3, S, S) in [0, 1]
-            # 7) Random erasing on tensor.
+            # 7) Random erasing on tensor. With supports already object-only,
+            #    erase is a useful regulariser (it forces the model to use
+            #    multiple object regions, not just one patch).
             if rng.random() < self.erase_prob:
                 t = _random_erase(t, self.erase_scale, rng)
             return t
@@ -264,7 +278,7 @@ class EpisodeDataset(Dataset):
         aug_blur_sigma: tuple[float, float] = (0.5, 2.0),
         aug_erase_prob: float = 0.3,
         aug_erase_scale: tuple[float, float] = (0.05, 0.20),
-        aug_rrc_scale: tuple[float, float] = (0.5, 1.0),
+        aug_rrc_scale: tuple[float, float] = (0.85, 1.0),
         aug_hflip_prob: float = 0.5,
         aug_query_color_jitter: float = 0.2,
     ) -> None:
@@ -386,8 +400,14 @@ class EpisodeDataset(Dataset):
         k = max(1, min(k, self.k_max))
 
         # --- supports ---------------------------------------------------
+        # Supports are already object-only on disk (see manifest v5), so we
+        # don't need to pass bbox_xyxy here — _SupportAugment letterboxes +
+        # photometric-augments only.
         sup_entries = self._sample_supports(instance, rng, k)
-        sup_imgs = [self._support_aug(self._load(s["path"]), rng) for s in sup_entries]
+        sup_imgs = [
+            self._support_aug(self._load(s["path"]), rng)
+            for s in sup_entries
+        ]
         # Pad to k_max.
         if len(sup_imgs) < self.k_max:
             pad = torch.zeros(3, self.img_size, self.img_size)
