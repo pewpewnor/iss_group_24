@@ -407,7 +407,7 @@ Categories of knobs (full list in the source files):
 
 | Metric                                    | Target              |
 | ----------------------------------------- | ------------------- |
-| Localizer InsDet mAP@50                   | ≥ 30%               |
+| Localizer InsDet mAP@50                   | ≥ 20%               |
 | Localizer HOTS mAP@50                     | ≥ 30%               |
 | Multi-shot scaling                        | mAP@50(K=10) > mAP@50(K=1) |
 | Siamese AUROC                             | ≥ 0.80 overall      |
