@@ -14,5 +14,4 @@ dependencies = [
     "peft>=0.10",
     "huggingface_hub>=0.23",
     "matplotlib>=3.7",
-    "rembg",
 ]

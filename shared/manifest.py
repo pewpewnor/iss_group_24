@@ -29,8 +29,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def load_manifest(manifest_path: str | Path) -> dict[str, Any]:
