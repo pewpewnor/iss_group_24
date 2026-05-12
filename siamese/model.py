@@ -125,6 +125,26 @@ class MultiShotSiamese(nn.Module):
         self, *, r: int = 8, alpha: int = 16, dropout: float = 0.1, last_n_layers: int = 4,
         target_modules: tuple[str, ...] = ("query", "value"),
     ) -> list[nn.Parameter]:
+        """Inject LoRA on query/value of the last N DINOv2 encoder layers.
+
+        Idempotent: if LoRA is already attached, returns the existing LoRA
+        parameter list without re-wrapping. Without this guard, on resume
+        the model gets wrapped by PEFT twice (once in ``_build_model``,
+        again here in the optimizer factory), which stacks adapters and
+        emits PEFT's "second time" / "Already found a peft_config attribute"
+        warnings.
+        """
+        if self._lora_attached:
+            lora_params = [
+                p for n, p in self.dinov2.named_parameters()
+                if "lora_" in n and p.requires_grad
+            ]
+            if not lora_params:
+                lora_params = [
+                    p for n, p in self.dinov2.named_parameters() if "lora_" in n
+                ]
+            return lora_params
+
         from peft import LoraConfig, get_peft_model
 
         layers = self.dinov2.encoder.layer

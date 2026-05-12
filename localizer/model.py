@@ -149,7 +149,29 @@ class MultiShotLocalizer(nn.Module):
         self, *, r: int = 8, alpha: int = 16, dropout: float = 0.1, last_n_layers: int = 4,
         target_modules: tuple[str, ...] = ("q_proj", "v_proj"),
     ) -> list[nn.Parameter]:
-        """Inject LoRA on q_proj/v_proj of the last N vision blocks."""
+        """Inject LoRA on q_proj/v_proj of the last N vision blocks.
+
+        Idempotent: if LoRA is already attached (e.g. on resume after
+        ``_build_model`` was called with ``lora_active=True``), this returns
+        the existing LoRA parameter list without re-wrapping. Re-wrapping a
+        PEFT model triggers PEFT warnings ("modify a model with PEFT for a
+        second time", "Already found a `peft_config` attribute") AND stacks
+        a second adapter on top, which would silently corrupt the architecture.
+        """
+        if self._lora_attached:
+            lora_params = [
+                p for n, p in self.owlv2.named_parameters()
+                if "lora_" in n and p.requires_grad
+            ]
+            # If the freeze sweep before this call cleared requires_grad on
+            # the lora params, fall back to a name-based filter so callers
+            # always get a non-empty list when LoRA is in fact attached.
+            if not lora_params:
+                lora_params = [
+                    p for n, p in self.owlv2.named_parameters() if "lora_" in n
+                ]
+            return lora_params
+
         from peft import LoraConfig, get_peft_model
 
         encoder_layers = self.owlv2.owlv2.vision_model.encoder.layers
