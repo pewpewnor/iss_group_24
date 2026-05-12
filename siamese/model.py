@@ -180,20 +180,53 @@ class MultiShotSiamese(nn.Module):
         sup_cls_mean: torch.Tensor,  # (B, D)
         q_cls: torch.Tensor,       # (B, D)
     ) -> torch.Tensor:
-        """Return (B, N_SCALAR) feature tensor."""
+        """Return (B, N_SCALAR) feature tensor.
+
+        Memory note: computing the full ``(B, P, K*P)`` cosine-sim tensor at
+        once is the second-largest VRAM hot-spot in this model after the
+        cross-attention itself. For img=518, K_max=10 the materialised tensor
+        is ~150 MB in fp16 and PyTorch needs ~3× that for the masked_fill +
+        topk + intermediate copies during backward. We therefore loop over
+        the support axis K in chunks of one support at a time and only keep a
+        running per-query max / top-5 across all supports. The output of this
+        function is identical to the original implementation.
+        """
         B, KP, D = flat_sup.shape
         P = q_pat.shape[1]
-        # Cosine sims between every q_pat token and every flat_sup token.
+        K_max = KP // P
+        TOPK = min(5, KP)
+
         q_n = F.normalize(q_pat, dim=-1)                     # (B, P, D)
-        s_n = F.normalize(flat_sup, dim=-1)                  # (B, K*P, D)
-        sims = torch.einsum("bpd,bkd->bpk", q_n, s_n)        # (B, P, K*P)
-        # Mask invalid support tokens.
-        mask = flat_mask.unsqueeze(1).expand(-1, P, -1)      # (B, P, K*P)
-        sims = sims.masked_fill(mask, -1e4)
-        # Per-(B, P) max over support tokens.
-        per_query_max, _ = sims.max(dim=-1)                  # (B, P)
-        per_query_top5_vals, _ = sims.topk(min(5, KP), dim=-1)  # (B, P, k)
-        # Now reduce over query patches.
+
+        # Reshape flat_sup back to (B, K, P, D) for per-support chunking.
+        sup_3d = flat_sup.view(B, K_max, P, D)
+        mask_2d = flat_mask.view(B, K_max, P)                # True ⇒ padded
+
+        running_max = torch.full(                            # (B, P)
+            (B, P), -1e4, dtype=q_pat.dtype, device=q_pat.device,
+        )
+        # Running top-TOPK values across all visited support tokens, expressed
+        # as a (B, P, TOPK) buffer that we merge with each new chunk.
+        running_top = torch.full(
+            (B, P, TOPK), -1e4, dtype=q_pat.dtype, device=q_pat.device,
+        )
+
+        for k in range(K_max):
+            s_n_k = F.normalize(sup_3d[:, k], dim=-1)        # (B, P, D)
+            sims_k = torch.einsum("bpd,bqd->bpq", q_n, s_n_k)  # (B, P, P)
+            sims_k = sims_k.masked_fill(mask_2d[:, k:k+1].expand(-1, P, -1), -1e4)
+
+            # Update running max.
+            chunk_max = sims_k.max(dim=-1).values            # (B, P)
+            running_max = torch.maximum(running_max, chunk_max)
+
+            # Merge top-TOPK: concat (B, P, TOPK + P) → topk again to TOPK.
+            merged = torch.cat([running_top, sims_k], dim=-1)
+            running_top = merged.topk(TOPK, dim=-1).values   # (B, P, TOPK)
+
+        per_query_max = running_max                          # (B, P)
+        per_query_top5_vals = running_top                    # (B, P, TOPK)
+
         s1 = per_query_max.max(dim=-1).values                # (B,)
         s2 = per_query_top5_vals.mean(dim=(-1, -2))          # (B,)
         s3 = per_query_top5_vals.std(dim=(-1, -2), unbiased=False)
@@ -269,7 +302,16 @@ class MultiShotSiamese(nn.Module):
         # Pre-LN.
         q_in = self.cross_norm_q(q_pat)
         kv_in = self.cross_norm_kv(flat_sup)
-        attended, _ = self.cross_attn(q_in, kv_in, kv_in, key_padding_mask=kp_mask)
+        # need_weights=False lets nn.MultiheadAttention dispatch to PyTorch's
+        # fused scaled_dot_product_attention (Flash / memory-efficient SDPA)
+        # which never materialises the full (B, H, Q, K*P) attention matrix.
+        # For img=518, K_max=10, B=4 the materialised weight tensor is
+        # ~860 MB in fp16 and is the proximate cause of the S1 OOM at
+        # torch.bmm(attn_output_weights, v) in the slow path.
+        attended, _ = self.cross_attn(
+            q_in, kv_in, kv_in, key_padding_mask=kp_mask,
+            need_weights=False,
+        )
         pooled = attended.mean(dim=1)                        # (B, D)
 
         scalars = self._compute_scalars(

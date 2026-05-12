@@ -43,6 +43,13 @@ def train_one_pass(
             pass
 
     running = {k: 0.0 for k in _RUNNING_KEYS}
+    # ``grad_norm`` is averaged over OPTIMIZER STEPS (= n_batches / accum_steps),
+    # not raw batches. AMP can return nan from ``clip_grad_norm_`` when a step
+    # overflows; the scaler then skips ``optimizer.step()`` automatically and
+    # the displayed grad_norm should ignore those nan reads rather than poison
+    # the running sum. We track step count and nan-step count separately.
+    grad_steps = 0
+    grad_nan_steps = 0
     n_batches = 0
     accum_steps = max(1, int(cfg.get("grad_accum_steps", 1)))
     grad_clip = float(cfg.get("grad_clip", 1.0))
@@ -98,7 +105,13 @@ def train_one_pass(
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             accum_count = 0
-            running["grad_norm"] += float(gn)
+            grad_steps += 1
+            gn_f = float(gn)
+            if gn_f != gn_f or gn_f == float("inf") or gn_f == float("-inf"):
+                # AMP overflow on this step; scaler skipped optimizer.step().
+                grad_nan_steps += 1
+            else:
+                running["grad_norm"] += gn_f
 
         running["loss"] += float(losses["loss"].detach().item())
         running["focal"] += float(losses["focal"].detach().item())
@@ -106,20 +119,23 @@ def train_one_pass(
         running["decorrelation"] += float(losses["decorrelation"].detach().item())
 
         # Hard-negative recording: for each negative episode where pred>0.5,
-        # log the (instance_id, query_path-equivalent) pair.
+        # log the (anchor_instance_id, negative_query_path) pair. The dataset's
+        # negative sampler will draw from this cache at rate ``hard_neg_frac``.
+        # The literal negative path is surfaced by EpisodeDataset as
+        # ``batch["query_path"]`` (empty string for positives).
         if hard_neg_recorder is not None:
-            with torch.no_grad():
-                preds = out["existence_prob"].detach().cpu()
-                for i in range(preds.size(0)):
-                    if (not bool(is_present[i].item())) and float(preds[i]) > 0.5:
-                        # We don't have the literal path here (the dataset constructed it).
-                        # We record the instance_id; the dataset's negative sampler will
-                        # consult the cache via that key.
-                        iid = instance_ids[i]
-                        # Cache stores generic flag: a non-empty list signals "this anchor
-                        # has had hard negatives". The dataset draws same-source negatives
-                        # at higher rate from this set.
-                        hard_neg_recorder.setdefault(iid, []).append({"path": ""})
+            query_paths = batch.get("query_path")
+            if query_paths is not None:
+                with torch.no_grad():
+                    preds = out["existence_prob"].detach().cpu()
+                    for i in range(preds.size(0)):
+                        if (not bool(is_present[i].item())) and float(preds[i]) > 0.5:
+                            iid = instance_ids[i]
+                            qpath = query_paths[i] if i < len(query_paths) else ""
+                            if qpath:
+                                hard_neg_recorder.setdefault(iid, []).append(
+                                    {"path": qpath}
+                                )
 
         n_batches += 1
         if progress and (n_batches % progress_every == 0
@@ -138,7 +154,17 @@ def train_one_pass(
                       f"rate={rate:.2f}b/s  loss={avg_loss:.4f}", flush=True)
 
     if n_batches > 0:
+        # All keys except ``grad_norm`` are per-batch averages.
         for k in running:
+            if k == "grad_norm":
+                continue
             running[k] /= max(n_batches, 1)
+        # ``grad_norm`` is a per-optimizer-step average over finite reads only.
+        finite_steps = grad_steps - grad_nan_steps
+        running["grad_norm"] = (
+            running["grad_norm"] / finite_steps if finite_steps > 0 else 0.0
+        )
     running["n_steps"] = n_batches
+    running["grad_steps"] = grad_steps
+    running["grad_nan_steps"] = grad_nan_steps
     return running

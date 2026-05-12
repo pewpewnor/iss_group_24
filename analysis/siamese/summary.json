@@ -1,0 +1,20 @@
+{
+  "best_by": {
+    "S1.val.auroc_mean": {
+      "epoch": 9,
+      "value": 0.7761495906688842
+    },
+    "S1.val.fpr_mean": {
+      "epoch": 1,
+      "value": -0.0
+    },
+    "S2.val.auroc_mean": {
+      "epoch": 1,
+      "value": 0.795772456698861
+    },
+    "S2.val.fpr_mean": {
+      "epoch": 1,
+      "value": -0.0
+    }
+  }
+}

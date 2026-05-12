@@ -345,13 +345,24 @@ class EpisodeDataset(Dataset):
         q = rng.choice(instance["query_images"])
         return self._load(q["path"]), list(q["bbox"])
 
-    def _sample_query_negative(self, instance: dict, rng: random.Random) -> Image.Image:
+    def _sample_query_negative(
+        self, instance: dict, rng: random.Random,
+    ) -> tuple[Image.Image, str]:
+        """Return (image, path_used) for a negative query.
+
+        The returned path lets the trainer record actually-misclassified
+        negative paths back into ``hard_neg_cache``, so the next epoch can
+        oversample these. We skip any cache entries with an empty ``path``
+        (these are stale sentinels from older recorders that did not yet
+        thread the literal path through).
+        """
         # Hard negative branch.
         if self.hard_neg_frac > 0.0 and self.hard_neg_cache and rng.random() < self.hard_neg_frac:
             cache = self.hard_neg_cache.get(instance["instance_id"], [])
-            if cache:
-                hn = rng.choice(cache)
-                return self._load(hn["path"])
+            valid = [hn for hn in cache if hn.get("path")]
+            if valid:
+                hn = rng.choice(valid)
+                return self._load(hn["path"]), hn["path"]
         # Same-source other-instance.
         same_source = [
             i for i in self.instances
@@ -362,10 +373,10 @@ class EpisodeDataset(Dataset):
             same_source = [i for i in self.instances if i["instance_id"] != instance["instance_id"]]
         if not same_source:
             other = rng.choice(instance["support_images"])
-            return self._load(other["path"])
+            return self._load(other["path"]), other["path"]
         other = rng.choice(same_source)
         q = rng.choice(other["query_images"])
-        return self._load(q["path"])
+        return self._load(q["path"]), q["path"]
 
     def _build_episode(
         self, instance: dict, rng: random.Random, force_k: int | None = None,
@@ -404,13 +415,16 @@ class EpisodeDataset(Dataset):
                 "source": instance.get("source", ""),
                 "native_size": torch.tensor([native_w, native_h], dtype=torch.int32),
                 "native_bbox": torch.tensor(q_bbox_native, dtype=torch.float32),
+                # Positives have no negative path to surface; keep the key
+                # so the collate function sees a homogeneous schema.
+                "query_path": "",
             }
             if self.return_native:
                 episode["query_native"] = q_img
             return episode
 
         # Negative.
-        q_img = self._sample_query_negative(instance, rng)
+        q_img, q_path = self._sample_query_negative(instance, rng)
         native_w, native_h = q_img.size
         q_t, _, _, _, _ = self._query_tf(q_img, None, rng if self.train else None)
         episode = {
@@ -424,6 +438,11 @@ class EpisodeDataset(Dataset):
             "source": instance.get("source", ""),
             "native_size": torch.tensor([native_w, native_h], dtype=torch.int32),
             "native_bbox": torch.zeros(4, dtype=torch.float32),
+            # ``query_path`` is the literal manifest-relative path of the
+            # image that was loaded as the negative query. Negatives only —
+            # positives leave this empty. Surfaced so the trainer can record
+            # misclassified negative paths into ``hard_neg_cache``.
+            "query_path": q_path,
         }
         if self.return_native:
             episode["query_native"] = q_img
@@ -471,6 +490,8 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         out["native_bbox"] = torch.stack([b["native_bbox"] for b in batch], dim=0)
     if "query_native" in batch[0]:
         out["query_native"] = [b["query_native"] for b in batch]
+    if "query_path" in batch[0]:
+        out["query_path"] = [b["query_path"] for b in batch]
     return out
 
 

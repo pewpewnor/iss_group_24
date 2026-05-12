@@ -43,6 +43,11 @@ def train_one_pass(
             pass
 
     running = {k: 0.0 for k in _RUNNING_KEYS}
+    # ``grad_norm`` is averaged over OPTIMIZER STEPS, not raw batches. Skip
+    # the contribution of AMP-overflow steps (where ``clip_grad_norm_``
+    # returns nan/inf and the GradScaler will skip ``optimizer.step``).
+    grad_steps = 0
+    grad_nan_steps = 0
     n_batches = 0
     accum_steps = max(1, int(cfg.get("grad_accum_steps", 1)))
     grad_clip = float(cfg.get("grad_clip", 1.0))
@@ -99,7 +104,12 @@ def train_one_pass(
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             accum_count = 0
-            running["grad_norm"] += float(gn)
+            grad_steps += 1
+            gn_f = float(gn)
+            if gn_f != gn_f or gn_f == float("inf") or gn_f == float("-inf"):
+                grad_nan_steps += 1
+            else:
+                running["grad_norm"] += gn_f
 
         running["loss"]     += float(losses["loss"].detach().item())
         running["patch_ce"] += float(losses["patch_ce"].detach().item())
@@ -127,8 +137,16 @@ def train_one_pass(
 
     if n_batches > 0:
         for k in running:
+            if k == "grad_norm":
+                continue
             running[k] /= max(n_batches, 1)
+        finite_steps = grad_steps - grad_nan_steps
+        running["grad_norm"] = (
+            running["grad_norm"] / finite_steps if finite_steps > 0 else 0.0
+        )
     running["n_steps"] = n_batches
+    running["grad_steps"] = grad_steps
+    running["grad_nan_steps"] = grad_nan_steps
     # Snapshot the residual gate scalar at end-of-pass. alpha=0 ⇒ prototype
     # is the zero-shot baseline; alpha>0 ⇒ fusion is contributing.
     try:
