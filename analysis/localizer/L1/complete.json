@@ -1,0 +1,21 @@
+{
+  "stage_completed": true,
+  "epochs_run": 4,
+  "best_val_map_50_mean": 0.28284805455991785,
+  "best_epoch": 4,
+  "best_phase": "mixed",
+  "curriculum": [
+    [
+      "insdet",
+      1
+    ],
+    [
+      "hots",
+      1
+    ],
+    [
+      "mixed",
+      2
+    ]
+  ]
+}
