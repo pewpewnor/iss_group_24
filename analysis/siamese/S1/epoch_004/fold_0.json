@@ -1,0 +1,1645 @@
+{
+  "stage": "S1",
+  "phase": "hots",
+  "epoch": 4,
+  "fold": 0,
+  "wall_clock_seconds": 148.27,
+  "lr": {
+    "head": 0.0007961380145698563
+  },
+  "train": {
+    "loss": 0.10209936791658401,
+    "focal": 0.08852739584445954,
+    "variance": 0.008449783325195312,
+    "decorrelation": 0.6574743056297302,
+    "grad_norm": 0.2880586873619787,
+    "n_steps": 125,
+    "grad_steps": 62,
+    "grad_nan_steps": 0
+  },
+  "val": {
+    "overall": {
+      "n": 200,
+      "n_pos": 105,
+      "n_neg": 95,
+      "threshold": 0.49183061718940735,
+      "tp": 104,
+      "fp": 88,
+      "fn": 1,
+      "tn": 7,
+      "accuracy": 0.555,
+      "acc_pos": 0.9904761904761905,
+      "acc_neg": 0.07368421052631578,
+      "precision": 0.5416666666666666,
+      "recall": 0.9904761904761905,
+      "f1": 0.7003367003367004,
+      "fpr": 0.9263157894736842,
+      "fnr": 0.009523809523809525,
+      "tpr": 0.9904761904761905,
+      "tnr": 0.0736842105263158,
+      "youden_j": 0.0641604010025063,
+      "mcc": 0.16350382386265755,
+      "auroc": 0.608922305764411,
+      "pr_auc": 0.6372360973987785,
+      "avg_precision": 0.6500919892197015,
+      "brier": 0.24851811416159741,
+      "best_f1": 0.7046979865771812,
+      "best_f1_threshold": 0.49183061718940735,
+      "fpr_at_recall_95": 0.8631578947368421,
+      "recall_at_fpr_05": 0.13333333333333333,
+      "recall_at_fpr_10": 0.22857142857142856,
+      "mean_score_pos": 0.5033615895680019,
+      "mean_score_neg": 0.5004798983272754,
+      "std_score_pos": 0.007228949901786443,
+      "std_score_neg": 0.006807524576352314,
+      "score_gap": 0.0028816912407265693,
+      "median_score_pos": 0.500957190990448,
+      "median_score_neg": 0.4990081191062927,
+      "frac_high_score": 0.0,
+      "frac_low_score": 0.0,
+      "frac_uncertain": 1.0
+    },
+    "per_source": {
+      "hots": {
+        "n": 200,
+        "n_pos": 105,
+        "n_neg": 95,
+        "threshold": 0.49183061718940735,
+        "tp": 104,
+        "fp": 88,
+        "fn": 1,
+        "tn": 7,
+        "accuracy": 0.555,
+        "acc_pos": 0.9904761904761905,
+        "acc_neg": 0.07368421052631578,
+        "precision": 0.5416666666666666,
+        "recall": 0.9904761904761905,
+        "f1": 0.7003367003367004,
+        "fpr": 0.9263157894736842,
+        "fnr": 0.009523809523809525,
+        "tpr": 0.9904761904761905,
+        "tnr": 0.0736842105263158,
+        "youden_j": 0.0641604010025063,
+        "mcc": 0.16350382386265755,
+        "auroc": 0.608922305764411,
+        "pr_auc": 0.6372360973987785,
+        "avg_precision": 0.6500919892197015,
+        "brier": 0.24851811416159741,
+        "best_f1": 0.7046979865771812,
+        "best_f1_threshold": 0.49183061718940735,
+        "fpr_at_recall_95": 0.8631578947368421,
+        "recall_at_fpr_05": 0.13333333333333333,
+        "recall_at_fpr_10": 0.22857142857142856,
+        "mean_score_pos": 0.5033615895680019,
+        "mean_score_neg": 0.5004798983272754,
+        "std_score_pos": 0.007228949901786443,
+        "std_score_neg": 0.006807524576352314,
+        "score_gap": 0.0028816912407265693,
+        "median_score_pos": 0.500957190990448,
+        "median_score_neg": 0.4990081191062927,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.0,
+        "frac_uncertain": 1.0
+      }
+    },
+    "per_k": {
+      "k1": {
+        "n": 67,
+        "n_pos": 42,
+        "n_neg": 25,
+        "threshold": 0.49183061718940735,
+        "tp": 42,
+        "fp": 21,
+        "fn": 0,
+        "tn": 4,
+        "accuracy": 0.6865671641791045,
+        "acc_pos": 1.0,
+        "acc_neg": 0.16,
+        "precision": 0.6666666666666666,
+        "recall": 1.0,
+        "f1": 0.8,
+        "fpr": 0.84,
+        "fnr": 0.0,
+        "tpr": 1.0,
+        "tnr": 0.16000000000000003,
+        "youden_j": 0.16000000000000003,
+        "mcc": 0.32659863237109044,
+        "auroc": 0.6904761904761905,
+        "pr_auc": 0.7814045703985422,
+        "avg_precision": 0.799145190331761,
+        "brier": 0.24732055979407147,
+        "best_f1": 0.8,
+        "best_f1_threshold": 0.4927423298358917,
+        "fpr_at_recall_95": 0.8,
+        "recall_at_fpr_05": 0.14285714285714285,
+        "recall_at_fpr_10": 0.2857142857142857,
+        "mean_score_pos": 0.5038511043503171,
+        "mean_score_neg": 0.49912983894348145,
+        "std_score_pos": 0.006895439196207095,
+        "std_score_neg": 0.007601132794677467,
+        "score_gap": 0.004721265406835651,
+        "median_score_pos": 0.5034127533435822,
+        "median_score_neg": 0.4973243772983551,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.0,
+        "frac_uncertain": 1.0
+      },
+      "k4": {
+        "n": 67,
+        "n_pos": 32,
+        "n_neg": 35,
+        "threshold": 0.49183061718940735,
+        "tp": 32,
+        "fp": 33,
+        "fn": 0,
+        "tn": 2,
+        "accuracy": 0.5074626865671642,
+        "acc_pos": 1.0,
+        "acc_neg": 0.05714285714285714,
+        "precision": 0.49230769230769234,
+        "recall": 1.0,
+        "f1": 0.6597938144329897,
+        "fpr": 0.9428571428571428,
+        "fnr": 0.0,
+        "tpr": 1.0,
+        "tnr": 0.05714285714285716,
+        "youden_j": 0.05714285714285716,
+        "mcc": 0.16772557387550693,
+        "auroc": 0.6375,
+        "pr_auc": 0.6565922560060662,
+        "avg_precision": 0.6686410659237506,
+        "brier": 0.2484156128029895,
+        "best_f1": 0.6744186046511628,
+        "best_f1_threshold": 0.496172159910202,
+        "fpr_at_recall_95": 0.8571428571428571,
+        "recall_at_fpr_05": 0.21875,
+        "recall_at_fpr_10": 0.28125,
+        "mean_score_pos": 0.5038235587999225,
+        "mean_score_neg": 0.500372656754085,
+        "std_score_pos": 0.007068556034079985,
+        "std_score_neg": 0.0057786782799981165,
+        "score_gap": 0.003450902045837423,
+        "median_score_pos": 0.5011326968669891,
+        "median_score_neg": 0.499443918466568,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.0,
+        "frac_uncertain": 1.0
+      },
+      "k10": {
+        "n": 66,
+        "n_pos": 31,
+        "n_neg": 35,
+        "threshold": 0.49183061718940735,
+        "tp": 30,
+        "fp": 34,
+        "fn": 1,
+        "tn": 1,
+        "accuracy": 0.4696969696969697,
+        "acc_pos": 0.967741935483871,
+        "acc_neg": 0.02857142857142857,
+        "precision": 0.46875,
+        "recall": 0.967741935483871,
+        "f1": 0.631578947368421,
+        "fpr": 0.9714285714285714,
+        "fnr": 0.03225806451612903,
+        "tpr": 0.967741935483871,
+        "tnr": 0.02857142857142858,
+        "youden_j": -0.0036866359447004227,
+        "mcc": -0.010733469768527296,
+        "auroc": 0.5124423963133641,
+        "pr_auc": 0.5140117780510668,
+        "avg_precision": 0.5351138352701669,
+        "brier": 0.24983786770176356,
+        "best_f1": 0.6458333333333334,
+        "best_f1_threshold": 0.49183061718940735,
+        "fpr_at_recall_95": 0.9714285714285714,
+        "recall_at_fpr_05": 0.06451612903225806,
+        "recall_at_fpr_10": 0.16129032258064516,
+        "mean_score_pos": 0.5022215045267536,
+        "mean_score_neg": 0.501551468031747,
+        "std_score_pos": 0.007914724717826635,
+        "std_score_neg": 0.007170214337045877,
+        "score_gap": 0.0006700364950066318,
+        "median_score_pos": 0.49836787581443787,
+        "median_score_neg": 0.5001212954521179,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.0,
+        "frac_uncertain": 1.0
+      }
+    },
+    "threshold_used": 0.49183061718940735,
+    "threshold_mode": "auto",
+    "confusion_matrix": {
+      "threshold": 0.49183061718940735,
+      "tp": 104,
+      "fp": 88,
+      "fn": 1,
+      "tn": 7,
+      "n": 200,
+      "n_pos": 105,
+      "n_neg": 95,
+      "records": [
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4954809248447418,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5130589604377747,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49421030282974243,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 1,
+          "score": 0.514721691608429,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.501419723033905,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4950849711894989,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49772313237190247,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49827882647514343,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5044354200363159,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4997306168079376,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5017392039299011,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49486249685287476,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.506456196308136,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5048766732215881,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5127524137496948,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5039658546447754,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5095954537391663,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5185258984565735,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49640506505966187,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5001306533813477,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49801817536354065,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5072168111801147,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4997296631336212,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5129246711730957,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4956364929676056,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4999127686023712,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 10,
+          "score": 0.48877251148223877,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5066514015197754,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4954436421394348,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5137466192245483,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4991125166416168,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4974777400493622,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5174217224121094,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49940958619117737,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5054322481155396,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49738577008247375,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5154447555541992,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4951799511909485,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4948125183582306,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 1,
+          "score": 0.48394468426704407,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5082756876945496,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4940829277038574,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5068342089653015,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5153727531433105,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4957291781902313,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5031856894493103,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5002246499061584,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5003811717033386,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4997306168079376,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49984878301620483,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4956579804420471,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5085275769233704,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4950580298900604,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5077233910560608,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4982759952545166,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5049319863319397,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49183061718940735,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5001574158668518,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5002463459968567,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5006179213523865,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5060970187187195,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49411672353744507,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5122418999671936,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49798232316970825,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5151991248130798,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5004738569259644,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5072668194770813,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4905223548412323,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5151975750923157,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5174814462661743,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49529364705085754,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5087399482727051,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5020053386688232,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5089517831802368,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5001212954521179,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49447423219680786,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 4,
+          "score": 0.496172159910202,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5052199363708496,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4896930158138275,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5091181397438049,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49753811955451965,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 1,
+          "score": 0.510428786277771,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5142744183540344,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4946823716163635,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4981873333454132,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4968458414077759,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5075961947441101,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4996381103992462,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4946838915348053,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49521416425704956,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.514528751373291,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5054984092712402,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5149393677711487,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49833497405052185,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5019101500511169,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5119915008544922,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4979722797870636,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4982313811779022,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49875831604003906,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5075066685676575,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49848446249961853,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4970519244670868,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49179211258888245,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5061123371124268,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4972173273563385,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5084325075149536,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49588459730148315,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 10,
+          "score": 0.503544807434082,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49857333302497864,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4953364431858063,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4948561191558838,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4973243772983551,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5096215605735779,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49275362491607666,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5069359540939331,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4937818944454193,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5093292593955994,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4988172650337219,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5098129510879517,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4921165108680725,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5141718983650208,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.504328727722168,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49648213386535645,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4960052967071533,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5008760690689087,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 10,
+          "score": 0.513158917427063,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 1,
+          "score": 0.500530481338501,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5079972743988037,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4955986738204956,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5088552832603455,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 4,
+          "score": 0.504939615726471,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5062629580497742,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4956936538219452,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5196624994277954,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5000411868095398,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.48931950330734253,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5062468647956848,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 10,
+          "score": 0.50191730260849,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5068642497062683,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4981341063976288,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49548134207725525,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49647390842437744,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49824830889701843,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5054823160171509,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5128836631774902,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4946841299533844,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5070050358772278,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5068920254707336,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4972195029258728,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49800774455070496,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49694955348968506,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4985336363315582,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4981628358364105,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4958910346031189,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49343058466911316,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5008228421211243,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4929860234260559,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5121919512748718,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5001114010810852,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5134633183479309,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5097985863685608,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.500957190990448,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5038313865661621,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49937114119529724,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4979812800884247,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49650248885154724,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 4,
+          "score": 0.499443918466568,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4921290874481201,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5048120021820068,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4990081191062927,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5073472857475281,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4944297671318054,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5049927830696106,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.506557285785675,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4939523935317993,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5013893246650696,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49471959471702576,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 1,
+          "score": 0.511860728263855,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49819645285606384,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 10,
+          "score": 0.508577287197113,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4963967204093933,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5025177597999573,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5077962875366211,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5141351222991943,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5008655786514282,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5165374875068665,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4927423298358917,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_red",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4965302348136902,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_stapler",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49836787581443787,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_orange",
+          "source": "hots",
+          "k": 1,
+          "score": 0.49568071961402893,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_milk_small",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5077329277992249,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_lemon",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4954175353050232,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_hot",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5145428776741028,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_apple",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4975584149360657,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_cup_red",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5036235451698303,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_can_jumbo",
+          "source": "hots",
+          "k": 1,
+          "score": 0.503639817237854,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_plate_wide",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5147724151611328,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_scissors_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4960607886314392,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_milk_big",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5084022283554077,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_cup_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49063992500305176,
+          "is_present": false
+        }
+      ]
+    }
+  }
+}

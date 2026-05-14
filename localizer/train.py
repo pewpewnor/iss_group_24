@@ -407,6 +407,19 @@ def evaluate_phase0(**user_kwargs) -> dict:
         release_gpu_memory(verbose=False)
 
 
+def evaluate_phase0_final_style(**user_kwargs) -> dict:
+    """Phase 0 baseline evaluated under the same loader regime as the final
+    (L3) eval: full K range and mixed positives + negatives at
+    ``cfg['L3_neg_prob']``. Lets abstain / FP-rate / TN-rate / score-IoU
+    metrics be compared apples-to-apples against the trained pipeline.
+    """
+    try:
+        with gpu_cleanup_on_exit():
+            return _evaluate_phase0_final_style_inner(user_kwargs)
+    finally:
+        release_gpu_memory(verbose=False)
+
+
 def train_phase0(**user_kwargs) -> dict:
     """Alias for evaluate_phase0 — no training happens at Phase 0."""
     return evaluate_phase0(**user_kwargs)
@@ -455,6 +468,71 @@ def _evaluate_phase0_inner(user_kwargs: dict) -> dict:
         f"mAP@50:95={o.get('map_5095', 0.0):.4f}  "
         f"IoU={o.get('iou_mean', 0.0):.4f}  "
         f"contain>=.9={o.get('frac_containment_90', 0.0):.4f}"
+    )
+    return metrics
+
+
+def _evaluate_phase0_final_style_inner(user_kwargs: dict) -> dict:
+    """Phase 0 baseline under the L3 eval loader regime (mixed pos+neg, full K).
+
+    Same model as ``_evaluate_phase0_inner`` (vanilla OWLv2, no fusion / LoRA /
+    trained heads) but mirrors the loader of ``_evaluate_run_inner`` for L3:
+    ``neg_prob = cfg['L3_neg_prob']`` (default 0.30) and full
+    ``k_min..k_max``. Saved under ``phase0/test_eval_final_style.json`` so the
+    existing one-shot positive-only baseline is preserved.
+    """
+    cfg = _merge_cfg(user_kwargs)
+    device = _resolve_device(cfg)
+    out_dir, analysis_dir = _stage_dirs(cfg, "phase0")
+    neg_prob = float(cfg.get("L3_neg_prob", 0.30))
+    force_positive = (neg_prob <= 0.0)
+    print(
+        f"=== [localizer] Phase 0 final-style evaluation: vanilla OWLv2 "
+        f"@ neg_prob={neg_prob:.2f}, K={cfg['k_min']}..{cfg['k_max']} ({device}) ==="
+    )
+    _set_seed(int(cfg["seed"]))
+    model = _build_model(cfg, lora_active=False).to(device)
+    test_eps = int(cfg.get("test_episodes", 400))
+    _, test_loader = build_val_loader(
+        manifest=cfg["manifest"], data_root=cfg["data_root"],
+        split="test", sources=None, val_episodes=test_eps,
+        batch_size=int(cfg["batch_size"]),
+        num_workers=int(cfg["num_workers"]),
+        img_size=int(cfg["img_size"]), seed=int(cfg["seed"]),
+        k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
+        force_positive=force_positive, neg_prob=neg_prob,
+    )
+    t0 = time.time()
+    metrics = evaluate(
+        model, test_loader, device, phase0=True,
+        abstain_threshold=float(cfg.get("abstain_threshold", 0.5)),
+    )
+    metrics["wall_clock_seconds"] = round(time.time() - t0, 2)
+    metrics["baseline_kind"] = "phase0_final_style_mixed_neg"
+    metrics["neg_prob"] = neg_prob
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    payload = {
+        "stage": "phase0",
+        "variant": "final_style",
+        "split": "test",
+        "test_episodes": test_eps,
+        "neg_prob": neg_prob,
+        "k_min": int(cfg["k_min"]), "k_max": int(cfg["k_max"]),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config": cfg, "metrics": metrics,
+    }
+    write_json(out_dir / "test_eval_final_style.json", payload)
+    write_json(analysis_dir / f"test_eval_final_style_{ts}.json", payload)
+    o = metrics["overall"]
+    print(
+        f"[localizer phase0 final-style] test  "
+        f"mAP@50={o.get('map_50', 0.0):.4f}  "
+        f"mAP@5095={o.get('map_5095', 0.0):.4f}  "
+        f"IoU={o.get('iou_mean', 0.0):.4f}  "
+        f"abstain_pos={o.get('abstain_rate_pos', 0.0):.3f}  "
+        f"abstain_neg={o.get('abstain_rate_neg', 0.0):.3f}  "
+        f"sc↔iou={o.get('score_iou_correlation', 0.0):.3f}  "
+        f"({metrics['wall_clock_seconds']:.1f}s)"
     )
     return metrics
 

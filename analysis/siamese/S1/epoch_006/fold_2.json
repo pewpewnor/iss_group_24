@@ -1,0 +1,1686 @@
+{
+  "stage": "S1",
+  "phase": "mixed",
+  "epoch": 6,
+  "fold": 2,
+  "wall_clock_seconds": 247.8,
+  "lr": {
+    "head": 0.0003773195307039576
+  },
+  "train": {
+    "loss": 0.09322200155258178,
+    "focal": 0.08025606733560563,
+    "variance": 0.004464675903320312,
+    "decorrelation": 0.6371352801322937,
+    "grad_norm": 0.2860787462803625,
+    "n_steps": 125,
+    "grad_steps": 62,
+    "grad_nan_steps": 0
+  },
+  "val": {
+    "overall": {
+      "n": 200,
+      "n_pos": 99,
+      "n_neg": 101,
+      "threshold": 0.4985760450363159,
+      "tp": 82,
+      "fp": 35,
+      "fn": 17,
+      "tn": 66,
+      "accuracy": 0.74,
+      "acc_pos": 0.8282828282828283,
+      "acc_neg": 0.6534653465346535,
+      "precision": 0.7008547008547008,
+      "recall": 0.8282828282828283,
+      "f1": 0.7592592592592592,
+      "fpr": 0.3465346534653465,
+      "fnr": 0.1717171717171717,
+      "tpr": 0.8282828282828283,
+      "tnr": 0.6534653465346535,
+      "youden_j": 0.4817481748174818,
+      "mcc": 0.4888396056321341,
+      "auroc": 0.8014801480148015,
+      "pr_auc": 0.7898948859736117,
+      "avg_precision": 0.7977361856754358,
+      "brier": 0.2129396188224897,
+      "best_f1": 0.7649769585253456,
+      "best_f1_threshold": 0.4985760450363159,
+      "fpr_at_recall_95": 0.6138613861386139,
+      "recall_at_fpr_05": 0.30303030303030304,
+      "recall_at_fpr_10": 0.40404040404040403,
+      "mean_score_pos": 0.5258125665813985,
+      "mean_score_neg": 0.4303196781490109,
+      "std_score_pos": 0.03649670699297577,
+      "std_score_neg": 0.12223709652877296,
+      "score_gap": 0.09549288843238762,
+      "median_score_pos": 0.5233924388885498,
+      "median_score_neg": 0.4787251055240631,
+      "frac_high_score": 0.0,
+      "frac_low_score": 0.01,
+      "frac_uncertain": 0.84
+    },
+    "per_source": {
+      "hots": {
+        "n": 70,
+        "n_pos": 32,
+        "n_neg": 38,
+        "threshold": 0.4985760450363159,
+        "tp": 23,
+        "fp": 9,
+        "fn": 9,
+        "tn": 29,
+        "accuracy": 0.7428571428571429,
+        "acc_pos": 0.71875,
+        "acc_neg": 0.7631578947368421,
+        "precision": 0.71875,
+        "recall": 0.71875,
+        "f1": 0.71875,
+        "fpr": 0.23684210526315788,
+        "fnr": 0.28125,
+        "tpr": 0.71875,
+        "tnr": 0.7631578947368421,
+        "youden_j": 0.48190789473684215,
+        "mcc": 0.4819078947368421,
+        "auroc": 0.7763157894736842,
+        "pr_auc": 0.762375533047621,
+        "avg_precision": 0.7723899045972431,
+        "brier": 0.21407984281097467,
+        "best_f1": 0.7384615384615384,
+        "best_f1_threshold": 0.4985760450363159,
+        "fpr_at_recall_95": 0.6578947368421053,
+        "recall_at_fpr_05": 0.28125,
+        "recall_at_fpr_10": 0.375,
+        "mean_score_pos": 0.5161635223776102,
+        "mean_score_neg": 0.4242983638848129,
+        "std_score_pos": 0.04199549896941963,
+        "std_score_neg": 0.1272031010271319,
+        "score_gap": 0.0918651584927973,
+        "median_score_pos": 0.5100666880607605,
+        "median_score_neg": 0.47850270569324493,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.02857142857142857,
+        "frac_uncertain": 0.8428571428571429
+      },
+      "insdet": {
+        "n": 130,
+        "n_pos": 67,
+        "n_neg": 63,
+        "threshold": 0.4985760450363159,
+        "tp": 59,
+        "fp": 26,
+        "fn": 8,
+        "tn": 37,
+        "accuracy": 0.7384615384615385,
+        "acc_pos": 0.8805970149253731,
+        "acc_neg": 0.5873015873015873,
+        "precision": 0.6941176470588235,
+        "recall": 0.8805970149253731,
+        "f1": 0.7763157894736843,
+        "fpr": 0.4126984126984127,
+        "fnr": 0.11940298507462686,
+        "tpr": 0.8805970149253731,
+        "tnr": 0.5873015873015873,
+        "youden_j": 0.46789860222696045,
+        "mcc": 0.49152284088397435,
+        "auroc": 0.8078654347311064,
+        "pr_auc": 0.7982679525170667,
+        "avg_precision": 0.8097814976619795,
+        "brier": 0.21232565205945936,
+        "best_f1": 0.7866666666666666,
+        "best_f1_threshold": 0.502376139163971,
+        "fpr_at_recall_95": 0.5238095238095238,
+        "recall_at_fpr_05": 0.29850746268656714,
+        "recall_at_fpr_10": 0.43283582089552236,
+        "mean_score_pos": 0.530421065305596,
+        "mean_score_neg": 0.43395158199090805,
+        "std_score_pos": 0.03290536701265088,
+        "std_score_neg": 0.12003351378779074,
+        "score_gap": 0.09646948331468791,
+        "median_score_pos": 0.5268847346305847,
+        "median_score_neg": 0.48173877596855164,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.0,
+        "frac_uncertain": 0.8384615384615385
+      }
+    },
+    "per_k": {
+      "k1": {
+        "n": 67,
+        "n_pos": 32,
+        "n_neg": 35,
+        "threshold": 0.4985760450363159,
+        "tp": 25,
+        "fp": 11,
+        "fn": 7,
+        "tn": 24,
+        "accuracy": 0.7313432835820896,
+        "acc_pos": 0.78125,
+        "acc_neg": 0.6857142857142857,
+        "precision": 0.6944444444444444,
+        "recall": 0.78125,
+        "f1": 0.7352941176470588,
+        "fpr": 0.3142857142857143,
+        "fnr": 0.21875,
+        "tpr": 0.78125,
+        "tnr": 0.6857142857142857,
+        "youden_j": 0.4669642857142857,
+        "mcc": 0.4678003907449813,
+        "auroc": 0.7946428571428571,
+        "pr_auc": 0.7747588032325321,
+        "avg_precision": 0.784543069810673,
+        "brier": 0.205392377223063,
+        "best_f1": 0.7804878048780487,
+        "best_f1_threshold": 0.44620683789253235,
+        "fpr_at_recall_95": 0.5142857142857142,
+        "recall_at_fpr_05": 0.25,
+        "recall_at_fpr_10": 0.28125,
+        "mean_score_pos": 0.5197380511090159,
+        "mean_score_neg": 0.4015269841466631,
+        "std_score_pos": 0.0392583316629399,
+        "std_score_neg": 0.14243937085676472,
+        "score_gap": 0.11821106696235284,
+        "median_score_pos": 0.5239543616771698,
+        "median_score_neg": 0.458644300699234,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.014925373134328358,
+        "frac_uncertain": 0.7910447761194029
+      },
+      "k4": {
+        "n": 67,
+        "n_pos": 27,
+        "n_neg": 40,
+        "threshold": 0.4985760450363159,
+        "tp": 24,
+        "fp": 15,
+        "fn": 3,
+        "tn": 25,
+        "accuracy": 0.7313432835820896,
+        "acc_pos": 0.8888888888888888,
+        "acc_neg": 0.625,
+        "precision": 0.6153846153846154,
+        "recall": 0.8888888888888888,
+        "f1": 0.7272727272727274,
+        "fpr": 0.375,
+        "fnr": 0.1111111111111111,
+        "tpr": 0.8888888888888888,
+        "tnr": 0.625,
+        "youden_j": 0.5138888888888888,
+        "mcc": 0.5110575236015927,
+        "auroc": 0.7824074074074074,
+        "pr_auc": 0.7301002214834124,
+        "avg_precision": 0.7396741212582785,
+        "brier": 0.2131910351901002,
+        "best_f1": 0.7272727272727274,
+        "best_f1_threshold": 0.4990645945072174,
+        "fpr_at_recall_95": 0.6,
+        "recall_at_fpr_05": 0.37037037037037035,
+        "recall_at_fpr_10": 0.4074074074074074,
+        "mean_score_pos": 0.5312974177024983,
+        "mean_score_neg": 0.43971716444939374,
+        "std_score_pos": 0.04010501657511642,
+        "std_score_neg": 0.12158317406889317,
+        "score_gap": 0.09158025325310454,
+        "median_score_pos": 0.523047924041748,
+        "median_score_neg": 0.484830379486084,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.014925373134328358,
+        "frac_uncertain": 0.8208955223880597
+      },
+      "k10": {
+        "n": 66,
+        "n_pos": 40,
+        "n_neg": 26,
+        "threshold": 0.4985760450363159,
+        "tp": 33,
+        "fp": 9,
+        "fn": 7,
+        "tn": 17,
+        "accuracy": 0.7575757575757576,
+        "acc_pos": 0.825,
+        "acc_neg": 0.6538461538461539,
+        "precision": 0.7857142857142857,
+        "recall": 0.825,
+        "f1": 0.8048780487804876,
+        "fpr": 0.34615384615384615,
+        "fnr": 0.175,
+        "tpr": 0.825,
+        "tnr": 0.6538461538461539,
+        "youden_j": 0.4788461538461538,
+        "mcc": 0.486387502098689,
+        "auroc": 0.8413461538461539,
+        "pr_auc": 0.8647459954159582,
+        "avg_precision": 0.8895405794181235,
+        "brier": 0.2203459868608486,
+        "best_f1": 0.8372093023255814,
+        "best_f1_threshold": 0.48671647906303406,
+        "fpr_at_recall_95": 0.5,
+        "recall_at_fpr_05": 0.425,
+        "recall_at_fpr_10": 0.625,
+        "mean_score_pos": 0.5269699044525623,
+        "mean_score_neg": 0.4546214026900438,
+        "std_score_pos": 0.031579724540365346,
+        "std_score_neg": 0.08484015219483755,
+        "score_gap": 0.0723485017625185,
+        "median_score_pos": 0.5241867303848267,
+        "median_score_neg": 0.48019011318683624,
+        "frac_high_score": 0.0,
+        "frac_low_score": 0.0,
+        "frac_uncertain": 0.9090909090909091
+      }
+    },
+    "threshold_used": 0.4985760450363159,
+    "threshold_mode": "auto",
+    "confusion_matrix": {
+      "threshold": 0.4985760450363159,
+      "tp": 82,
+      "fp": 35,
+      "fn": 17,
+      "tn": 66,
+      "n": 200,
+      "n_pos": 99,
+      "n_neg": 101,
+      "records": [
+        {
+          "instance_id": "hots_juice_box_pink",
+          "source": "hots",
+          "k": 1,
+          "score": 0.540874183177948,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_laptop",
+          "source": "hots",
+          "k": 4,
+          "score": 0.598034143447876,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_marker_blue",
+          "source": "hots",
+          "k": 10,
+          "score": 0.36306893825531006,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5240271687507629,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_book_yellow",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5003511309623718,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pear",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4797285497188568,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_purple",
+          "source": "hots",
+          "k": 1,
+          "score": 0.565139889717102,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_peach",
+          "source": "hots",
+          "k": 4,
+          "score": 0.44214606285095215,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_knife",
+          "source": "hots",
+          "k": 10,
+          "score": 0.49671250581741333,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_keyboard",
+          "source": "hots",
+          "k": 1,
+          "score": 0.09063305705785751,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_spoon_blue",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5311269760131836,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_book_blue",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4825550615787506,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_018_kerastase_shampoo",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5143784284591675,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_087_thermos_flask_purple",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5143885016441345,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_030_sour_lemon_drops",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5249810218811035,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_096_lays_chip_bag_green",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5488394498825073,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_042_baseball_cap_pink",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.18499116599559784,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_057_danisa_butter_cookies",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5123578906059265,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_052_acnes_cream",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.44359374046325684,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_050_nabati_cheese_wafer",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5133389830589294,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_011_hb_calcium",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5092565417289734,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_095_lays_chip_bag_blue",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5469028353691101,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_085_sunscreen_blue",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.6081443428993225,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_069_korean_beef_marinade",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.4856146275997162,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_072_korean_ssamjang",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.44293856620788574,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_036_tragata_olive_oil",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.48735275864601135,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_013_hb_marine_collagen",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5062196850776672,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_004_bonne_maman_blueberry",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.39785435795783997,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_076_oatly_chocolate",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5273622870445251,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_003_bombik_bucket",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5460017919540405,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_049_instant_noodle_red",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.13083021342754364,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_053_aveda_conditioner",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.6093686819076538,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_043_bfe_facial_mask",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5599462389945984,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_065_hr_serum",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.16436050832271576,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_031_sticky_notes",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5197536945343018,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_047_geo_roast_charcoal",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5688241720199585,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_020_kiihne_balsamic",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5592864155769348,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_097_lays_chip_tube_auburn",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5471571683883667,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_juice_box_pink",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5252001285552979,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_laptop",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5428645610809326,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_marker_blue",
+          "source": "hots",
+          "k": 4,
+          "score": 0.504292368888855,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5067237019538879,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_book_yellow",
+          "source": "hots",
+          "k": 1,
+          "score": 0.44620683789253235,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pear",
+          "source": "hots",
+          "k": 4,
+          "score": 0.46324893832206726,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_purple",
+          "source": "hots",
+          "k": 10,
+          "score": 0.35356831550598145,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_peach",
+          "source": "hots",
+          "k": 1,
+          "score": 0.473720908164978,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_knife",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5134096741676331,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_keyboard",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5570699572563171,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_spoon_blue",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5333383679389954,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_book_blue",
+          "source": "hots",
+          "k": 4,
+          "score": 0.523047924041748,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_018_kerastase_shampoo",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.520738422870636,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_087_thermos_flask_purple",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.49938783049583435,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_030_sour_lemon_drops",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5142154693603516,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_096_lays_chip_bag_green",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5521462559700012,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_042_baseball_cap_pink",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.46813705563545227,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_057_danisa_butter_cookies",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5173141956329346,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_052_acnes_cream",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5119897723197937,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_050_nabati_cheese_wafer",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.16186688840389252,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_011_hb_calcium",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.48173877596855164,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_095_lays_chip_bag_blue",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.556310772895813,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_085_sunscreen_blue",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.47363558411598206,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_069_korean_beef_marinade",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.4905557930469513,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_072_korean_ssamjang",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5352078676223755,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_036_tragata_olive_oil",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.2126535177230835,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_013_hb_marine_collagen",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.3743007481098175,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_004_bonne_maman_blueberry",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.581915557384491,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_076_oatly_chocolate",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5250769257545471,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_003_bombik_bucket",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.515476644039154,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_049_instant_noodle_red",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.3747677206993103,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_053_aveda_conditioner",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.609056830406189,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_043_bfe_facial_mask",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5494297742843628,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_065_hr_serum",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.544809103012085,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_031_sticky_notes",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.39074796438217163,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_047_geo_roast_charcoal",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.3489977717399597,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_020_kiihne_balsamic",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5572584271430969,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_097_lays_chip_tube_auburn",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5460997223854065,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_juice_box_pink",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4931270480155945,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_laptop",
+          "source": "hots",
+          "k": 10,
+          "score": 0.142294242978096,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_marker_blue",
+          "source": "hots",
+          "k": 1,
+          "score": 0.31721895933151245,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4860170781612396,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_book_yellow",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4985760450363159,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pear",
+          "source": "hots",
+          "k": 1,
+          "score": 0.40929993987083435,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pringles_purple",
+          "source": "hots",
+          "k": 4,
+          "score": 0.48192521929740906,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_peach",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4633922278881073,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_knife",
+          "source": "hots",
+          "k": 1,
+          "score": 0.48222672939300537,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_keyboard",
+          "source": "hots",
+          "k": 4,
+          "score": 0.07806365936994553,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_spoon_blue",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5081612467765808,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_book_blue",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5029075741767883,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_018_kerastase_shampoo",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.472503125667572,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_087_thermos_flask_purple",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5233924388885498,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_030_sour_lemon_drops",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5074032545089722,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_096_lays_chip_bag_green",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.44947782158851624,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_042_baseball_cap_pink",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.424966961145401,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_057_danisa_butter_cookies",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.526454508304596,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_052_acnes_cream",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.513687252998352,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_050_nabati_cheese_wafer",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.522763192653656,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_011_hb_calcium",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.4954758286476135,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_095_lays_chip_bag_blue",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.455716073513031,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_085_sunscreen_blue",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.48450028896331787,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_069_korean_beef_marinade",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5101456046104431,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_072_korean_ssamjang",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5236600637435913,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_036_tragata_olive_oil",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5108670592308044,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_013_hb_marine_collagen",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5188924670219421,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_004_bonne_maman_blueberry",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5773869752883911,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_076_oatly_chocolate",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.528647780418396,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_003_bombik_bucket",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5536770224571228,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_049_instant_noodle_red",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5368035435676575,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_053_aveda_conditioner",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5843988060951233,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_043_bfe_facial_mask",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5378921031951904,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_065_hr_serum",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.48364368081092834,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_031_sticky_notes",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5395075082778931,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_047_geo_roast_charcoal",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.458644300699234,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_020_kiihne_balsamic",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5028700232505798,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_097_lays_chip_tube_auburn",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.4647183120250702,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_juice_box_pink",
+          "source": "hots",
+          "k": 1,
+          "score": 0.504829466342926,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_laptop",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5970214605331421,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_marker_blue",
+          "source": "hots",
+          "k": 10,
+          "score": 0.425749808549881,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_black",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4515502452850342,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_book_yellow",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5478945970535278,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pear",
+          "source": "hots",
+          "k": 10,
+          "score": 0.48671647906303406,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_purple",
+          "source": "hots",
+          "k": 1,
+          "score": 0.46263056993484497,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_peach",
+          "source": "hots",
+          "k": 4,
+          "score": 0.36767736077308655,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_knife",
+          "source": "hots",
+          "k": 10,
+          "score": 0.47729453444480896,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_keyboard",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5374938249588013,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_spoon_blue",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5180658102035522,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_book_blue",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5029112696647644,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_018_kerastase_shampoo",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.4632520079612732,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_087_thermos_flask_purple",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5230407118797302,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_030_sour_lemon_drops",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5015057921409607,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_096_lays_chip_bag_green",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5501194000244141,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_042_baseball_cap_pink",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.17397649586200714,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_057_danisa_butter_cookies",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5071730613708496,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_052_acnes_cream",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.528353750705719,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_050_nabati_cheese_wafer",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5055204629898071,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_011_hb_calcium",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.4323306679725647,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_095_lays_chip_bag_blue",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5489864945411682,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_085_sunscreen_blue",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.47697147727012634,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_069_korean_beef_marinade",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.49008211493492126,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_072_korean_ssamjang",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5204108357429504,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_036_tragata_olive_oil",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.46906229853630066,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_013_hb_marine_collagen",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5069907307624817,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_004_bonne_maman_blueberry",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.37504279613494873,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_076_oatly_chocolate",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5373015403747559,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_003_bombik_bucket",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5148062705993652,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_049_instant_noodle_red",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5423531532287598,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_053_aveda_conditioner",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.29944708943367004,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_043_bfe_facial_mask",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.512747049331665,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_065_hr_serum",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5660332441329956,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_031_sticky_notes",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5370182991027832,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_047_geo_roast_charcoal",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.4111621677875519,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_020_kiihne_balsamic",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5228317975997925,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_097_lays_chip_tube_auburn",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5252159237861633,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_juice_box_pink",
+          "source": "hots",
+          "k": 10,
+          "score": 0.48660609126091003,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_laptop",
+          "source": "hots",
+          "k": 1,
+          "score": 0.11066796630620956,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_marker_blue",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5148466229438782,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pen_black",
+          "source": "hots",
+          "k": 10,
+          "score": 0.3811499774456024,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_book_yellow",
+          "source": "hots",
+          "k": 1,
+          "score": 0.2616632878780365,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pear",
+          "source": "hots",
+          "k": 4,
+          "score": 0.4990645945072174,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_purple",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5053951144218445,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_peach",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4598690867424011,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_knife",
+          "source": "hots",
+          "k": 4,
+          "score": 0.49107545614242554,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_keyboard",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5300989151000977,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_spoon_blue",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4787251055240631,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_book_blue",
+          "source": "hots",
+          "k": 4,
+          "score": 0.47455981373786926,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_018_kerastase_shampoo",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5059395432472229,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_087_thermos_flask_purple",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5351175665855408,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_030_sour_lemon_drops",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5254785418510437,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_096_lays_chip_bag_green",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.4727762043476105,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_042_baseball_cap_pink",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.502376139163971,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_057_danisa_butter_cookies",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5309566259384155,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_052_acnes_cream",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5206676721572876,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_050_nabati_cheese_wafer",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5304414629936218,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_011_hb_calcium",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.2322344183921814,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_095_lays_chip_bag_blue",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.47143420577049255,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_085_sunscreen_blue",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.37757012248039246,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_069_korean_beef_marinade",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5211150646209717,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_072_korean_ssamjang",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5276885032653809,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_036_tragata_olive_oil",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.42005565762519836,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_013_hb_marine_collagen",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5268847346305847,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_004_bonne_maman_blueberry",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5709236264228821,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_076_oatly_chocolate",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.20892983675003052,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_003_bombik_bucket",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.13299384713172913,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_049_instant_noodle_red",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5527113676071167,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_053_aveda_conditioner",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5737850069999695,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_043_bfe_facial_mask",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.5346620082855225,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_065_hr_serum",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5622422099113464,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_031_sticky_notes",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.47510209679603577,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_047_geo_roast_charcoal",
+          "source": "insdet",
+          "k": 4,
+          "score": 0.3876761496067047,
+          "is_present": false
+        },
+        {
+          "instance_id": "insdet_020_kiihne_balsamic",
+          "source": "insdet",
+          "k": 10,
+          "score": 0.5316507816314697,
+          "is_present": true
+        },
+        {
+          "instance_id": "insdet_097_lays_chip_tube_auburn",
+          "source": "insdet",
+          "k": 1,
+          "score": 0.5080365538597107,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_juice_box_pink",
+          "source": "hots",
+          "k": 4,
+          "score": 0.47828030586242676,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_laptop",
+          "source": "hots",
+          "k": 10,
+          "score": 0.6088058352470398,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_marker_blue",
+          "source": "hots",
+          "k": 1,
+          "score": 0.4815898835659027,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pen_black",
+          "source": "hots",
+          "k": 4,
+          "score": 0.46763181686401367,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_book_yellow",
+          "source": "hots",
+          "k": 10,
+          "score": 0.5144083499908447,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_pear",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5138671398162842,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_pringles_purple",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5687277317047119,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_peach",
+          "source": "hots",
+          "k": 10,
+          "score": 0.4778251647949219,
+          "is_present": false
+        },
+        {
+          "instance_id": "hots_knife",
+          "source": "hots",
+          "k": 1,
+          "score": 0.5006874799728394,
+          "is_present": true
+        },
+        {
+          "instance_id": "hots_keyboard",
+          "source": "hots",
+          "k": 4,
+          "score": 0.5348900556564331,
+          "is_present": false
+        }
+      ]
+    }
+  }
+}

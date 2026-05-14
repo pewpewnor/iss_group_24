@@ -368,6 +368,21 @@ def evaluate_phase0(**user_kwargs) -> dict:
         release_gpu_memory(verbose=False)
 
 
+def evaluate_phase0_final_style(**user_kwargs) -> dict:
+    """Phase 0 baseline evaluated under the same threshold regime as the final
+    (S2) eval: a *fixed* threshold (``cfg['eval_threshold']``, default 0.5) is
+    used instead of the optimistic ``"auto"`` sweep on test. ``neg_prob`` is
+    already symmetric between baseline and final, so loader-side this matches
+    ``evaluate_run``. Lets accuracy / precision / recall / f1 / FPR / FNR be
+    compared apples-to-apples against the trained pipeline.
+    """
+    try:
+        with gpu_cleanup_on_exit():
+            return _evaluate_phase0_final_style_inner(user_kwargs)
+    finally:
+        release_gpu_memory(verbose=False)
+
+
 def _evaluate_phase0_inner(user_kwargs: dict) -> dict:
     cfg = _merge_cfg(user_kwargs)
     device = _resolve_device(cfg)
@@ -409,6 +424,75 @@ def _evaluate_phase0_inner(user_kwargs: dict) -> dict:
         f"({metrics['wall_clock_seconds']:.1f}s)"
     )
     print(f"[siamese] Phase 0 complete. Results: {out_dir / 'results.json'}")
+    return metrics
+
+
+def _evaluate_phase0_final_style_inner(user_kwargs: dict) -> dict:
+    """Phase 0 baseline under the final (S2) eval threshold regime.
+
+    Same model as ``_evaluate_phase0_inner`` (zero-shot DINOv2 cosine) and the
+    same loader (``neg_prob`` is already symmetric across baseline and final).
+    The single difference is the *threshold*: instead of ``"auto"`` (best-F1
+    swept on test, slightly optimistic), this variant uses a fixed threshold
+    pulled from ``cfg['eval_threshold']`` — exactly the convention
+    ``evaluate_run`` falls back to when a checkpoint has no
+    ``learned_threshold``. Results are saved under
+    ``phase0/test_eval_final_style.json`` so the existing baseline is
+    preserved.
+    """
+    cfg = _merge_cfg(user_kwargs)
+    device = _resolve_device(cfg)
+    out_dir, analysis_dir = _stage_dirs(cfg, "phase0")
+    threshold = float(cfg.get("eval_threshold", 0.5))
+    print(
+        f"=== [siamese] Phase 0 final-style evaluation (zero-shot DINOv2 "
+        f"cosine @ fixed thr={threshold:.3f}) on {device} ==="
+    )
+    _set_seed(int(cfg["seed"]))
+    model = _build_model(cfg).to(device)
+    test_eps = int(cfg.get("test_episodes", 400))
+    _, test_loader = build_val_loader(
+        manifest=cfg["manifest"], data_root=cfg["data_root"],
+        split="test", sources=None, val_episodes=test_eps,
+        batch_size=int(cfg["batch_size"]), num_workers=int(cfg["num_workers"]),
+        neg_prob=float(cfg["neg_prob"]),
+        img_size=int(cfg["img_size"]), seed=int(cfg["seed"]),
+        k_min=int(cfg["k_min"]), k_max=int(cfg["k_max"]),
+    )
+    t0 = time.time()
+    metrics = evaluate(
+        model, test_loader, device, threshold=threshold,
+        phase0=True,
+    )
+    metrics["wall_clock_seconds"] = round(time.time() - t0, 2)
+    metrics["eval_threshold"] = threshold
+    metrics["eval_threshold_source"] = "cfg default"
+    metrics["baseline_kind"] = "phase0_final_style_fixed_threshold"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    payload = {
+        "stage": "phase0",
+        "variant": "final_style",
+        "split": "test",
+        "test_episodes": test_eps,
+        "neg_prob": float(cfg["neg_prob"]),
+        "threshold": threshold,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config": cfg, "metrics": metrics,
+    }
+    write_json(out_dir / "test_eval_final_style.json", payload)
+    write_json(analysis_dir / f"test_eval_final_style_{ts}.json", payload)
+    o = metrics["overall"]
+    print(
+        f"[siamese phase0 final-style] test  "
+        f"AUROC={o.get('auroc', 0.0):.4f}  "
+        f"AP={o.get('avg_precision', 0.0):.4f}  "
+        f"acc={o.get('accuracy', 0.0):.4f}  "
+        f"f1={o.get('f1', 0.0):.4f}@thr={threshold:.3f}  "
+        f"best_f1={o.get('best_f1', 0.0):.4f}@bthr={o.get('best_f1_threshold', 0.0):.3f}  "
+        f"FPR={o.get('fpr', 0.0):.4f}  FNR={o.get('fnr', 0.0):.4f}  "
+        f"MCC={o.get('mcc', 0.0):.4f}  "
+        f"({metrics['wall_clock_seconds']:.1f}s)"
+    )
     return metrics
 
 

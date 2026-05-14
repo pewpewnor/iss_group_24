@@ -1,0 +1,22 @@
+{
+  "stage_completed": true,
+  "epochs_run": 6,
+  "best_value": 0.8174048902429497,
+  "best_epoch": 6,
+  "best_phase": "mixed",
+  "learned_threshold": 0.4597179889678955,
+  "curriculum": [
+    [
+      "insdet",
+      1
+    ],
+    [
+      "hots",
+      1
+    ],
+    [
+      "mixed",
+      4
+    ]
+  ]
+}

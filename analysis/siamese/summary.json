@@ -1,0 +1,28 @@
+{
+  "best_by": {
+    "S1.val.auroc_mean": {
+      "epoch": 9,
+      "value": 0.7995960502471321
+    },
+    "S1.val.best_f1_mean": {
+      "epoch": 6,
+      "value": 0.772593768497796
+    },
+    "S1.val.fpr_inv_mean": {
+      "epoch": 9,
+      "value": 0.5864605484535219
+    },
+    "S2.val.auroc_mean": {
+      "epoch": 6,
+      "value": 0.8363945344689755
+    },
+    "S2.val.best_f1_mean": {
+      "epoch": 6,
+      "value": 0.8174048902429497
+    },
+    "S2.val.fpr_inv_mean": {
+      "epoch": 6,
+      "value": 0.5563790396862236
+    }
+  }
+}
