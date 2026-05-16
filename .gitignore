@@ -6,5 +6,7 @@ __pycache__/
 
 dataset/
 checkpoints/
+exports/
+inference/
 
 *.backup
